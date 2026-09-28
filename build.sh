@@ -440,7 +440,14 @@ if [ "${#IBM_MAIN_SOURCES[@]}" -gt 0 ]; then
     # Pin the stubs to their committed expectation. This is what stops a stub being
     # quietly widened or renamed into an API that does not exist: the failure would
     # otherwise surface only on a machine that owns the proprietary JAR.
-    if [ -x "${IBM_STUB_DIR}/check-signatures.sh" ]; then
+    # The checker is invoked as `bash <script>`, so it does NOT need the executable bit to work - and
+    # requiring one was a real defect: this repository is developed on Windows, where git reports
+    # core.filemode=false and does not record the executable bit from the filesystem, so a file can be
+    # chmod +x in a working tree and still be committed 100644. A test on `-x` therefore passed on the
+    # developer's machine and failed only in CI, where a fresh checkout honours the committed mode - and
+    # it failed the whole build, before any test ran, for a script that would have run perfectly.
+    # The bit is committed correctly now; this check no longer depends on it.
+    if [ -f "${IBM_STUB_DIR}/check-signatures.sh" ]; then
       log_ok "checking the stub signatures against tests/ibm-stubs/EXPECTED_SIGNATURES.txt"
       # Distinguish the two failures, because they have completely different causes and
       # the checker's own message names only the second one. An empty classes directory
@@ -456,7 +463,7 @@ if [ "${#IBM_MAIN_SOURCES[@]}" -gt 0 ]; then
         fail "the IBM compile stubs no longer match tests/ibm-stubs/EXPECTED_SIGNATURES.txt. The stubs must mirror the real IBM CM 8.7 SDK; if the change was deliberate, re-run tests/ibm-stubs/check-signatures.sh --write and commit the result."
       fi
     else
-      fail "${IBM_STUB_DIR}/check-signatures.sh is missing or not executable; the stubs cannot be pinned to the committed expectation and a drifted stub would go unnoticed."
+      fail "${IBM_STUB_DIR}/check-signatures.sh is missing; the stubs cannot be pinned to the committed expectation and a drifted stub would go unnoticed."
     fi
     IBM_CP="${IBM_STUB_CLASSES_DIR}"
   fi
