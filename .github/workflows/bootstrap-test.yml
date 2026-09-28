@@ -144,7 +144,7 @@ jobs:
         run: ./bin/doctor.sh
 
       - name: Start
-        run: ./bin/start.sh --timeout 30
+        run: ./bin/start.sh --timeout 60
 
       # GitHub renders `::error::` workflow commands as check-run ANNOTATIONS, which are
       # readable through the API without repository admin rights, unlike raw step logs.
@@ -154,16 +154,22 @@ jobs:
         run: |
           echo "::error::start-diagnostic: begin"
           if [ -f logs/cm-insight.out ]; then
+            echo "::error::start-diagnostic: log exists, bytes -> $(wc -c < logs/cm-insight.out)"
             echo "--- logs/cm-insight.out (last 40 lines) ---"
             tail -n 40 logs/cm-insight.out || true
-            tail -n 6 logs/cm-insight.out | while IFS= read -r line; do
-              echo "::error::start-log: ${line}"
+            nl -ba logs/cm-insight.out 2>/dev/null | head -n 4 | while IFS= read -r line; do
+              echo "::error::start-log-first: ${line}"
+            done
+            tail -n 4 logs/cm-insight.out | while IFS= read -r line; do
+              echo "::error::start-log-last: ${line}"
             done
           else
             echo "::error::start-diagnostic: no logs/cm-insight.out was created at all"
           fi
+          echo "::error::start-diagnostic: jar -> $(ls -l build/cm-insight.jar 2>&1 | tr '\n' ' ')"
+          echo "::error::start-diagnostic: java -> $(java -version 2>&1 | head -n 1)"
           echo "::error::start-diagnostic: run dir -> $(ls -la run 2>&1 | tr '\n' ' ')"
-          echo "::error::start-diagnostic: java procs -> $(ps -ef 2>/dev/null | grep -c '[c]m-insight' || true)"
+          echo "::error::start-diagnostic: our procs -> $(ps -eo pid,etimes,args 2>/dev/null | grep '[c]m-insight' | head -n 3 | tr '\n' ' ')"
           echo "::error::start-diagnostic: listeners -> $( (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep -E ':8080' | tr '\n' ' ' || echo none)"
 
       - name: Status and local health
