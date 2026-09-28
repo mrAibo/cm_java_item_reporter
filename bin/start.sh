@@ -411,11 +411,19 @@ HEALTH_OK=false
 PROCESS_ONLY=false
 PROC_GONE=false
 RECYCLED=false
+GONE_STRIKES=0
 HEALTH_CONFIRMED_URL=""
 while : ; do
   # "Gone" is only ever concluded from BOTH nets (review finding H-3). The MSYS pid of a
   # process that exec'd native java.exe can vanish while the Windows process keeps
   # serving; trusting kill -0 alone made a healthy start report "exited during startup".
+  #
+  # A single negative observation is ALSO not proof on a loaded runner: between the fork
+  # that returns $! and the exec that makes the process inspectable, and before the
+  # application has bound its socket, BOTH nets can be transiently negative. Concluding
+  # "gone" on the first such observation is a race, so it now takes GONE_STRIKES
+  # consecutive negative observations (a genuinely dead process stays dead, so this
+  # delays the verdict without ever hiding a real failure).
   ALIVE_NOW=true
   if ! ci_process_exists "${PID}"; then
     if ci_pid_owns_serving_socket "${PID}" "${PORT}" "${BIND}"; then
@@ -424,7 +432,14 @@ while : ; do
       ALIVE_NOW=false
     fi
   fi
-  if [ "${ALIVE_NOW}" != true ]; then PROC_GONE=true; break; fi
+  if [ "${ALIVE_NOW}" != true ]; then
+    GONE_STRIKES=$((GONE_STRIKES + 1))
+    if [ "${GONE_STRIKES}" -ge 3 ]; then PROC_GONE=true; break; fi
+    sleep 1
+    WAITED=$((WAITED + 1))
+    continue
+  fi
+  GONE_STRIKES=0
 
   set +e
   ci_proc_identity "${PID}"

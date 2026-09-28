@@ -114,9 +114,24 @@ The Goal 01A goal itself was triggered by 5 blocking and 6 high findings from th
 
 The `b6efa75` failure is the pre-Goal-01A background-start defect (H-3) and it is intermittent, which is why some runs of the same tree succeed. Reproduced locally on the pre-01A scripts: **10 clean start/stop cycles → 8 OK, 2 FAILED** with the exact CI message ("the application exited before writing anything to the log"), versus **10 OK, 0 FAILED** on the Goal 01A scripts. The full CI step sequence (permissions, `bash -n`, `--help`, config preparation, `./build.sh`, doctor, `start.sh --timeout 30`, status, stop) was executed locally against a clean copy of this tree and passed every step.
 
-Goal 01A run for the commit above: `__CI_RESULT__`
+Goal 01A runs, observed via the GitHub API:
 
-CI is only claimed as passing where a run is named above with its conclusion.
+| Run | SHA | Event | Conclusion |
+|---|---|---|---|
+| 36441511118 | `093b088` | push | failure — step `Safety guards` (my own new step; see below) |
+| 36441516322 | `093b088` | pull_request | failure — step `Safety guards` |
+| **36441834046** | **`08d4f82`** | **push** | **success — every step green** |
+| 36441839844 | `08d4f82` | pull_request | failure — step `Start` |
+
+Two distinct facts, both recorded honestly:
+
+1. **The push gate is met.** Run `36441834046` for the pushed commit is green on every step, including the `Start` step that was red on `b6efa75`. The pre-01A cause is fixed: 10 clean start/stop cycles on the old scripts gave 8 OK / 2 FAILED with the exact CI message, versus 10 OK / 0 FAILED on these scripts.
+
+2. **The pre-existing `Start` flake is NOT yet eliminated on Linux, and I could not fully diagnose it.** For the same SHA `08d4f82`, the push run succeeded while the pull_request run failed at `Start` — the runs differ only in runner and timing. Job logs require a token I do not have, so the failing output itself was never read. What I did do: (a) the whole step sequence was replayed locally on a clean `git archive HEAD` checkout with **no `build/` directory**, in the workflow's own order, and every step passed; (b) `bin/start.sh` now requires **three consecutive negative liveness observations** before concluding the process is gone, so a transiently negative answer on the first iteration of a loaded runner can no longer produce a false "exited during startup"; 8/8 local start/stop cycles pass with it. That is a targeted robustness fix, not a diagnosis, and it is not proven to be the CI cause.
+
+Also fixed and pushed in a separate commit: my own new `Safety guards` step was initially red because it (i) ran **before** `./build.sh` while invoking `./bin/cm-insight`, which exits 2 ("build first") when the jar is absent, and (ii) asserted exit 3 for a configuration passed to `--validate-config`, whose contract is 1 (the runtime's is 3). Both are corrected, the guard config now sets a real user so the test isolates the plain-HTTP rule rather than the development-default rule, and the workflow step order is documented in the file.
+
+CI is claimed green only for run `36441834046` above. The pull_request run for the same commit is red, and that is stated rather than averaged away.
 
 ## Unresolved risks and accepted limitations
 
@@ -124,7 +139,7 @@ CI is only claimed as passing where a run is named above with its conclusion.
 - **Linux-only code paths are unexercised**: `ss -ltnp` parsing, `/proc/<pid>/cmdline`, Linux pid namespaces and systemd `WorkingDirectory=/`. All local runs were Windows 11 + Git Bash/MSYS + OpenJDK 17. The CI workflow runs on ubuntu-latest and is the only Linux coverage.
 - **A narrow identity residual, accepted as by-design but measured**: a POSITIONAL argument whose basename is exactly `cm-insight.jar` still counts as identity evidence. Tightening is under way; if it is not in this commit it is listed here deliberately.
 - **The shell-side guards are NOT covered by the committed test suite.** The exact health marker, structural argv identity, the `sibling` socket class and dual-namespace liveness are pinned only by the gitignored scenario suite under `.tools/goal01a-scripts/`. A committed artefact would not fail if one regressed. Moving a cheap subset (the static module checks) into `tests/` is a recommended follow-up.
-- **H-3 was intermittent**, so its fix is argued by mechanism plus a measured before/after (2/10 → 0/10), not by proof of impossibility.
+- **H-3 was intermittent and is NOT proven eliminated on Linux.** The mechanism is fixed (liveness needs both pid namespaces and the socket table, plus three consecutive negative observations) and the before/after is measured (2/10 → 0/10 locally, and the pushed commit's CI `push` run is green including `Start`), but a `pull_request` run of the SAME commit still failed at `Start`. The failing job log could not be read without a token, so this remains an open, intermittent risk rather than a closed one.
 - **The two-instance mixed-address-family wildcard state is unreachable on this host** (the second bind fails); the `sibling` class makes it non-authorizing if it ever becomes reachable elsewhere, but that is documentation, not construction proof.
 - **Documented, undetectable by any path test**: a HARD link inside `secrets.dir` (creating one already requires write access to that directory).
 - **No TLS.** Remote access requires a reverse proxy; when one proxy fronts the application all clients share one throttle key, and `X-Forwarded-For` is deliberately not trusted.
