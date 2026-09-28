@@ -58,7 +58,8 @@ public final class SelfTest {
             RepositorySwitchQuiescenceTest.class,
             StatisticsContractTest.class,
             RouterTest.class,
-            WebServerSocketTest.class);
+            WebServerSocketTest.class,
+            CmApiRoutesInstallTest.class);
 
     private SelfTest() {
     }

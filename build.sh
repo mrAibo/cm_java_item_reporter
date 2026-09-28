@@ -206,6 +206,37 @@ esac
 log_ok "toolchain (${TOOLCHAIN_SOURCE}): ${JAVAC_VERSION_LINE}; java ${JAVA_MAJOR}; class path separator '${CP_SEP}'"
 
 # ---------------------------------------------------------------------------
+# Single-writer lock.
+#
+# This build deletes and recreates its output directories, so two concurrent runs
+# in one tree destroy each other. Measured, while several people worked in this
+# repository at once: the stub signature check failing with a partial class
+# directory, "rm: cannot remove ... Permission denied" from the clean step, and a
+# suite that fails with NoClassDefFoundError for nested test classes while the
+# sources are untouched. Every one of those looks like a code defect and is not.
+#
+# The stub compile and its signature check were made atomic with a per-run
+# directory, but the output directories themselves cannot be: two runs genuinely
+# cannot share one build/ tree. So a second run now REFUSES and says why, which is
+# a clear message instead of a misleading red build. One run per working tree; for
+# parallel work, use a separate checkout or `git worktree`.
+#
+# The lock is inherited by the test JVMs (no close-on-exec), so it is held for the
+# whole run, and the kernel releases it when this process exits - including on a
+# kill, which is why no stale-lock cleanup is needed.
+# ---------------------------------------------------------------------------
+LOCK_FILE="${ROOT}/build/.build-lock"
+mkdir -p "${ROOT}/build"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"${LOCK_FILE}"
+  if ! flock -n 9; then
+    fail "another ./build.sh is already running in this working tree. This build deletes and recreates its output directories, so two concurrent runs corrupt each other with errors that look like code defects (a partial stub-signature check, \"Permission denied\" from the clean step, or NoClassDefFoundError in the suite). Wait for the other run, or build a separate checkout / git worktree for parallel work."
+  fi
+else
+  log_warn "flock is not available, so concurrent ./build.sh runs in this tree cannot be detected; run one build at a time."
+fi
+
+# ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 BUILD_DIR="${ROOT}/build"
@@ -218,6 +249,9 @@ JAR_FILE="${BUILD_DIR}/cm-insight.jar"
 # signature mismatch for stubs that were perfectly correct. That happened repeatedly while several
 # members built at once and cost real diagnosis time, so the fix is structural rather than a re-run:
 # nothing another build deletes lives under the path these artifacts use.
+#
+# IBM_STUB_CLASSES_DIR below is only a default and is REPLACED by a per-run mktemp directory at the point
+# of use, because even a shared target/ path could be deleted and recreated by a second build.
 OUT_DIR="${ROOT}/target"
 IBM_CLASSES_DIR="${OUT_DIR}/ibm-classes"
 IBM_TEST_CLASSES_DIR="${OUT_DIR}/ibm-test-classes"
@@ -310,7 +344,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. clean
 # ---------------------------------------------------------------------------
-rm -rf "${CLASSES_DIR}" "${TEST_CLASSES_DIR}" "${IBM_CLASSES_DIR}" "${IBM_TEST_CLASSES_DIR}" "${IBM_STUB_CLASSES_DIR}"
+rm -rf "${CLASSES_DIR}" "${TEST_CLASSES_DIR}" "${IBM_CLASSES_DIR}" "${IBM_TEST_CLASSES_DIR}"
 rm -f "${JAR_FILE}" "${BUILD_DIR}/.version" "${BUILD_DIR}/manifest.mf"
 mkdir -p "${CLASSES_DIR}" "${TEST_CLASSES_DIR}"
 log_ok "cleaned ${CLASSES_DIR} and ${TEST_CLASSES_DIR}"
@@ -377,8 +411,23 @@ if [ "${#IBM_MAIN_SOURCES[@]}" -gt 0 ]; then
     if [ "${#STUB_SOURCES[@]}" -eq 0 ]; then
       fail "${IBM_STUB_DIR} contains no .java file, so src/ibm/java has nothing to compile against. Restore the test-only stubs (see tests/ibm-stubs/README.md) or place the real SDK jars in lib/ibm."
     fi
-    rm -rf "${IBM_STUB_CLASSES_DIR}"
-    mkdir -p "${IBM_STUB_CLASSES_DIR}"
+    # The stub classes go into a PER-RUN directory, and that is the whole point of the mktemp.
+    #
+    # Compiling into a fixed shared path was still racy even after moving it out of build/: a second
+    # build's clean step deletes and recreates that path, so this build's stub classes could vanish
+    # between its javac and its signature check. The check then reported a signature mismatch whose diff
+    # showed 3 lines against an expected 57 - a partial directory, not drifted stubs - and the emptiness
+    # guard could not catch it because a partial directory is not an empty one. Measured, with the diff,
+    # by the member verifying this build.
+    #
+    # A unique directory per run makes the compile and its check atomic with respect to every other
+    # build: nothing else knows the path, so nothing else can delete it. It is created under target/
+    # rather than under /tmp because this host refuses javac writes to some temporary areas outside the
+    # repository, and it is removed on exit so a run leaves nothing behind.
+    IBM_STUB_CLASSES_DIR="$(mktemp -d "${OUT_DIR}/ibm-stub-classes.XXXXXX")" \
+      || fail "could not create a per-run stub classes directory under ${OUT_DIR}; check the directory permissions."
+    # shellcheck disable=SC2064  # expanded now on purpose: the path must be fixed at trap time
+    trap 'rm -rf "${IBM_STUB_CLASSES_DIR}"' EXIT
     log_ok "compiling ${#STUB_SOURCES[@]} IBM stub source file(s) into ${IBM_STUB_CLASSES_DIR} (test-only; never packaged)"
     "${JAVAC}" --release 17 -encoding UTF-8 -Xlint:all -d "${IBM_STUB_CLASSES_DIR}" "${STUB_SOURCES[@]}"
 
