@@ -7,118 +7,140 @@
 - Project: CM Insight
 - Repository: mrAibo/cm_java_item_reporter
 - Active branch: `bootstrap/cm-insight-architecture`
-- Reviewed remote HEAD before Goal 01B: `9c7168aa238633a004850ba658d546dd3177be52`
 - Goal 01 implementation commit: `fb42a0e55e69b551bffdcf0986714b8110dbdfb6`
-- Goal 01A review-hardening work completed through the reviewed HEAD above
-- Stage: **Goal 01A externally reviewed; Goal 01B correction is APPROVED**
+- Goal 01A review-hardening: completed through reviewed remote HEAD `9c7168aa238633a004850ba658d546dd3177be52`
+- **Goal 01B implementation/work commit (the commit this file describes):** `43a3c7035c8165548f8014d57e0f862a9b8e9f00`
+- Stage: **Goal 01B executed and pushed; awaiting architecture review before Goal 02**
 - Runtime target: Java 17 LTS / OpenJDK-compatible
-- Build/deployment: javac + jar + bash; single JVM
+- Build/deployment: javac + jar + bash; single JVM; no Maven/Gradle/Spring/containers
 - Product safety mode: read-only V1/V2
-- Current approved goal: `harness/GOAL_01B_LINUX_LIFECYCLE_AND_CLOSE_PROPAGATION.md`
+- Current approved goal: `harness/GOAL_01B_LINUX_LIFECYCLE_AND_CLOSE_PROPAGATION.md` (executed)
 - Goals 02-05: PROVISIONAL; do not execute
-- Next goal after 01B: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+- Next goal: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
 
-## Goal 01A review verdict
+## Checkpoint protocol (from Goal 01B section G)
 
-**MOST GOAL 01A CHANGES ACCEPTED, BUT THREE BLOCKING SEAMS REMAIN BEFORE IBM CM/JDBC INTEGRATION.**
+A commit cannot truthfully contain its own SHA. Therefore:
 
-### Accepted Goal 01A improvements
+- this file records the last completed **implementation/work** commit it describes, above;
+- the authoritative current branch head is read from Git: `git rev-parse HEAD` /
+  `git ls-remote origin refs/heads/bootstrap/cm-insight-architecture`;
+- the final handoff report records the exact local and verified remote HEAD after the STATUS
+  commit itself has been pushed;
+- no SHA field in this file is a placeholder or describes "the commit that follows".
 
-- BoundedPool no longer lends an in-flight created resource after close begins.
-- Failed physical close is quarantined and consumes capacity.
-- pool creation/close metrics are substantially more truthful.
-- usage accounting advances automatically.
-- RepositoryManager fails closed when RepositoryContext itself reports an uncertain close.
-- repository credentials have explicit env/file SecretRef sources.
-- secret-file confinement and path handling are substantially improved.
-- doctor delegates core credential/exposure decisions to Java.
-- non-loopback plaintext Basic Auth requires explicit insecure opt-in and default development credentials remain forbidden remotely.
-- Bash lifecycle logic is centralized and exact health-marker matching is used.
-- Goal 02 was not started.
-- no proprietary IBM/JDBC JARs or credentials were committed.
+## Goal 01B completion record
 
-## Remaining blockers found by external review
+- Branch: `bootstrap/cm-insight-architecture`
+- Work commit described here: `43a3c7035c8165548f8014d57e0f862a9b8e9f00`
+- Start checkpoint: `7bf9007761c50701296eb4910842e5e3118e06c9` (fast-forwarded, tree clean)
 
-### 1. Pool quarantine does not automatically propagate to RepositoryContext
+### Exact work completed
 
-BoundedPool can finish `close()` normally with `metrics().quarantined() > 0`. RepositoryContext only
-owns generic AutoCloseables and currently learns uncertainty from thrown close failures. Therefore a
-pool can have uncertain physical resources while RepositoryContext reports a clean close.
+All of sections A-G of `harness/GOAL_01B_LINUX_LIFECYCLE_AND_CLOSE_PROPAGATION.md`.
 
-This must be solved generically in core before adapters are attached. Goal 02 must not be responsible
-for remembering a manual metrics check.
+| Section | What was done |
+|---|---|
+| **A** (blocking) | New vendor-neutral core contract `com.mraibo.cminsight.core.CloseOutcomeAware` (reports the OUTCOME of a close; `close()` narrowed so it cannot throw a checked exception). `BoundedPool` implements it — quarantine is the ONLY source of uncertainty, so an ordinary clean shutdown is never turned into FAILED. `RepositoryContext` implements it as well, consults an owned close-aware resource **after** its `close()` returns normally (the case an exception-only check cannot see), keeps reports separate from failures on the new value-free `uncertainCloseReports()`, and treats an unreadable report as uncertain. `RepositoryManager` folds the reports into its `CloseOutcome` and still refuses the switch **before** the factory is called. |
+| **B** (blocking) | Linux startup identity race fixed with an explicit `provisional -> positive` identity STATE and a bounded 3 s grace, transition table in `ci_start_identity_next`. A single transient `different` while provisional is recorded as evidence, not acted on; one positive observation (structural argv identity, or existence + exact marker + **port ownership**) ends provisionality immediately; a LATER contradiction after a positive identity IS recycle; a contradiction outliving the grace IS recycle; `rc=2` never moves the state. New refusals `MARKER_UNTIED` and `IDENT_UNPROVEN` mean the grace can never publish a PID file for a pid whose identity was never shown. No new sleeps; stop-time ownership untouched. |
+| **C** (blocking) | IPv4-mapped IPv6 listener representations are normalized for **listener ownership only**: `::ffff:127.0.0.1` is `exact` for a configured `127.0.0.1`, `::ffff:127.0.0.5` matches `127.0.0.5`, bracketed and fully expanded spellings are handled, and a mapped non-loopback stays `foreign`. The web-exposure rule is deliberately unchanged. Secondary bug fixed: candidate lists were iterated with `$(...)`, which pathname-expanded the documented wildcard spelling `*` against the current directory. |
+| **D** | Ownership safety unchanged: exact marker only, structural identity only, no override flag, an unprovable target refused. `stop.sh` ties the marker to its socket row through the normalized form, demonstrated on a mapped row whose argv was **not** CM Insight, so only the marker↔socket tie could authorise the stop. |
+| **E** | CI is a real gate: the committed suite runs as a gate, 3 bounded lifecycle cycles run with the exact marker and port release, `tests/shell` is in the permission and syntax loops, `actions/setup-java` v5, job ceiling 20 min, and the final Stop is no longer swallowed by `|| true`. |
+| **F** | Shell regressions are COMMITTED under `tests/shell/` (not under gitignored `.tools/`): `run.sh`, `marker_identity_safety_test.sh` (42 assertions), `addr_socket_class_test.sh` (39), `lifecycle_identity_race_test.sh` (93 assertions, 10 real cycles), plus a README. |
+| **G** | This checkpoint protocol. |
 
-### 2. Linux startup identity race is reproduced on current exact SHA
+### Major files changed
 
-GitHub Actions for exact SHA `9c7168aa238633a004850ba658d546dd3177be52`:
+16 files, +2796 / -60.
 
-- pull_request run `36443456621`: **SUCCESS**
-- push run `36443449216`: **FAILURE**
-- failure step: `Start`
+- New: `src/main/java/com/mraibo/cminsight/core/CloseOutcomeAware.java`, `src/test/java/com/mraibo/cminsight/test/RepositoryClosePropagationTest.java`, `tests/shell/{run.sh,marker_identity_safety_test.sh,addr_socket_class_test.sh,lifecycle_identity_race_test.sh,README.md}`
+- Modified: `connection/BoundedPool.java`, `repository/{RepositoryContext,RepositoryManager}.java`, `bin/{start,stop}.sh`, `bin/lib/{cm-insight-addr,cm-insight-lifecycle}.sh`, `.github/workflows/bootstrap-test.yml`, `test/SelfTest.java`
 
-The failed job log was retrieved during this review. `start.sh` reported:
+### Commands actually run and results
 
-```text
-ERROR: PID 3451 was reused by a different process before the health check succeeded
-```
+Every number below comes from an executed command.
 
-But the diagnostic immediately afterwards showed the same PID alive as:
+- `./build.sh` → exit 0, **`Tests run: 173, failures: 0`**, jar packaged; `./tests/selftest.sh` → exit 0
+- `javac --release 17 -encoding UTF-8 -Xlint:all` over 50 main + 25 test sources → exit 0, **zero warnings**
+- **Committed shell suite on real Linux** (Ubuntu 24.04 LTS, WSL2 kernel 6.6.87.2, Temurin 17.0.20.1): `CI=true ./tests/shell/run.sh` → exit 0, **3 passed, 0 failed, 0 not run in 48s**; `lifecycle_identity_race_test.sh` alone → **93 assertions, 10 cycles, exit 0**; a 12-cycle run → 105 assertions, exit 0
+- **Full CI step sequence replayed on real Linux from a clean copy with NO `build/` directory** → every step passes: permissions (including `tests/shell/*.sh`), syntax, `--help`, `./build.sh` (173/0), the four safety guards, the committed suite, doctor, the 3-cycle lifecycle step, start/status/stop
+- Pre-fix gate proofs, so the new tests are genuinely regressive and not vacuous:
+  - `lifecycle_identity_race_test.sh` against a HEAD snapshot of `bin/` → **FAIL 12 of 93**, exit 1, with the exact CI message `PID <n> was reused by a different process before the health check succeeded`
+  - `addr_socket_class_test.sh` against the pre-fix classifier → **14 assertions fail**
+  - the repository regression against the pre-fix wiring (mutated copy) → **`Tests run: 173, failures: 3`**, the decisive test failing as `expected RepositoryException but nothing was thrown`
+- On real Linux the stopped listener really is `[::ffff:127.0.0.1]:8080` and `status.sh` now attributes it to the tracked PID ("the SAME socket address as the configured bind 127.0.0.1")
 
-```text
-java ... -cp .../build/cm-insight.jar com.mraibo.cminsight.app.Main --config ...
-```
+### GitHub Actions — both events, same SHA
 
-The application was still starting; moments later it wrote normal startup output and served health.
-Thus the recycled-process conclusion is false.
+For work commit `43a3c7035c8165548f8014d57e0f862a9b8e9f00`:
 
-### 3. IPv4-mapped IPv6 listener representation is classified as foreign
+| Run | Event | Conclusion |
+|---|---|---|
+| `36469846033` | push | **success — every step passed** |
+| `36469852172` | pull_request | **success — every step passed** |
 
-The same failed Linux run later had a live exact CM Insight health marker, but cleanup could not prove
-ownership because `ss` reported:
+This is the section E requirement: CI is now a reliable gate on both events for the same tree,
+observed rather than inferred. The previous failure mode (push red while pull_request green on the
+identical SHA) is gone.
 
-```text
-::ffff:127.0.0.1:8080
-```
+### IBM / DB live tests
 
-for configured `web.bind=127.0.0.1`, and the current address model classified that listener as foreign.
+**Not run, and they cannot be run in this goal.** `lib/{ibm,db2,oracle,app}` is empty, no IBM CM SDK
+or JDBC driver is present, and no real connection is ever opened or closed. The physical-bound and
+uncertain-close guarantees are therefore proven against fake resources only; in particular
+"close outcome uncertain" is simulated by a fake whose `close()` throws.
 
-The shell socket layer must recognize mapped IPv6 as an equivalent socket-table representation of the
-underlying IPv4 address. This must NOT loosen Java web-exposure rules for a user-configured
-`::ffff:127.0.0.1` bind.
+### Independent review
 
-## Checkpoint-protocol correction
+An independent adversarial reviewer judged the Goal 01B corrections; its findings and their
+resolutions are recorded in the handoff report. The three blocking defects were each closed with a
+pre-fix gate proof (above), and the committed shell suite plus the full CI step sequence were
+reproduced by the lead on real Linux.
 
-The previous STATUS attempted to record the final HEAD as `ffc9ced7...`, but the actual reviewed
-remote HEAD is `9c7168aa...`.
+## Unresolved risks and accepted limitations
 
-A commit cannot truthfully contain its own SHA. From Goal 01B onward:
-
-- STATUS records the last completed work/implementation commit it describes;
-- authoritative current branch HEAD is read from Git;
-- the final handoff report records exact local and verified remote HEAD after the STATUS commit is pushed;
-- no self-referential SHA placeholders.
-
-## CI status
-
-CI is **not yet a reliable green gate** for Goal 01A because push and pull_request runs for the exact
-same current SHA disagree.
-
-The external review can retrieve Actions job logs and has confirmed the real failure described above.
-Goal 01B must make both event runs green on the same final SHA and commit the relevant shell
-regressions.
+- **No IBM CM / DB2 / Oracle integration was tested, and no real connection was ever opened or
+  closed.** The first real adapter (Goal 02) must re-prove the physical-bound and uncertain-close
+  guarantees against real sessions, and it must surface a quarantined pool through the context's close
+  outcome — the generic contract now exists for exactly that, but it has only ever been exercised with
+  fakes.
+- **The Linux lifecycle evidence comes from WSL2**, not from GitHub's ubuntu-latest image directly.
+  The genuine Actions runs above are the authoritative Linux signal; the local WSL runs are
+  corroboration.
+- **Windows/Git Bash remains a secondary platform**: the committed suite skips its Linux-only lifecycle
+  cases explicitly there and says so, rather than reporting a false pass.
+- **A HARD link inside `secrets.dir`** remains undetectable by any path test (documented limitation
+  from Goal 01A).
+- **No TLS.** Remote access requires a reverse proxy; when one proxy fronts the application all clients
+  share one throttle key and `X-Forwarded-For` is deliberately not trusted.
+- **`BoundedPool` is still not instantiated at runtime** (no adapter yet); only `SelfCheck` and the
+  tests read `PoolMetrics`. There is no diagnostics/metrics route, and the login lockout has no unlock
+  route.
+- The pre-existing `Start` flake had been reproduced at roughly 2 failures in 10 cycles on the pre-fix
+  scripts; the fix is bounded and evidence-based, but no finite number of green runs proves an
+  intermittent defect impossible. Two green events plus the committed 10-cycle soak is the strongest
+  available statement.
 
 ## Exact next goal
 
-Execute only:
+**NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.**
 
-1. `harness/MASTER_GOAL.md`
-2. `harness/GOAL_01B_LINUX_LIFECYCLE_AND_CLOSE_PROPAGATION.md`
-
-Do not execute Goal 02.
+Do not execute Goal 02. The next step is an architecture review of this Goal 01B result, and only then
+a new approved goal file under `harness/`.
 
 ## Resume / handoff instruction
 
-"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture. Fetch and fast-forward to the current remote branch, read STATUS.md, harness/MASTER_GOAL.md and harness/GOAL_01B_LINUX_LIFECYCLE_AND_CLOSE_PROPAGATION.md, and execute only Goal 01B. Preserve accepted Goal 01A behavior. At completion commit coherently, push the branch yourself, verify local and remote HEAD equality, require both push and pull_request Actions runs on the same final SHA to pass, update STATUS.md using the non-self-referential checkpoint protocol, set the next goal to NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED, do not merge PR #1, and stop."
+"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture. First
+`git fetch origin`, confirm the branch, and fast-forward to the current remote state; do not rewrite or
+discard the existing Goal 01, 01A or 01B commits. Then read STATUS.md, harness/MASTER_GOAL.md and
+harness/GOAL_01B_LINUX_LIFECYCLE_AND_CLOSE_PROPAGATION.md. Goal 01B is executed and pushed; the next
+goal is NOT YET APPROVED. Do not execute Goal 02, do not implement IBM CM SDK integration or JDBC
+analytics, and do not merge PR #1 unless explicitly asked. Keep the hard-bounded pool rule with no
+emergency connections, Java 17 with javac+jar+bash, read-only V1/V2, and the ownership rule that a
+process is never signalled without positive CM Insight evidence. When a new goal is approved, execute
+only that goal, run its required validation, update STATUS.md using the non-self-referential checkpoint
+protocol, commit coherently, push the branch yourself, verify remote HEAD equals local HEAD, and verify
+both Actions events for the final SHA."
 
 ## Mandatory checkpoint rule
 
