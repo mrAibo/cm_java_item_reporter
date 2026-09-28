@@ -11,13 +11,77 @@
 - Goal 01A: accepted after review-hardening
 - Goal 01B: accepted after Linux lifecycle / close-propagation review
 - Goal 01C reviewed remote HEAD: `8dcea7222178fd95aa8b123994187187aa2bd192`
-- Stage: **Goal 01C ACCEPTED; Goal 02 IBM CM read-only integration is APPROVED**
+- Stage: **Goal 02 IN PROGRESS - not complete, not pushed yet; see "Goal 02 execution state" below**
 - Runtime target: Java 17 LTS / OpenJDK-compatible
 - Build/deployment: javac + jar + bash; single JVM
 - Product safety mode: read-only V1/V2
 - Current approved goal: `harness/GOAL_02_IBM_CM_RETENTION.md`
 - Goals 03-05: PROVISIONAL; do not execute
 - Next goal after Goal 02: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+
+## Goal 02 execution state (IN PROGRESS)
+
+Interface surface frozen in `harness/GOAL_02_IMPLEMENTATION_SPEC.md`; real-SDK API evidence in
+`harness/IBM_CM87_SDK_API_SURFACE.md` (rescued from `%TEMP%` deliberately - it is the evidence for the
+corrections noted below).
+
+Landed, each its own commit:
+
+| Commit | Contents |
+| --- | --- |
+| `6dcbfc4` | wave 1: `CreationFailure`, the `BoundedPool` uncertain-create quarantine, `PoolMetrics.createQuarantineFailures`, `ActivationFailedException`, the `RepositoryManager` retained-cleanup path, `CmSessionFactory`/`CmPoolSettings`/`CmPoolDiagnostics`/`RepositoryServices`, `MetadataRepository`/`RetentionRepository`, extended DTOs |
+| `b7c5c1d` | `tests/shell/ibm_guard.sh` - the section A (SDK isolation) and section H (read-only) source guards |
+| `acc34a1` | build: optional IBM source set, `--require-ibm`, `--check-ibm-isolation`, and `lib/ibm` REMOVED from the core class path so the isolation is structural rather than conventional |
+| `2d8c090` | launcher: `CM_INSIGHT_IBM_LIBS`, `CM_INSIGHT_REQUIRE_IBM`, `--check-repository` documented |
+| `fb479a5` | stub compilation wired into the build, the `initialize()` rollback fix, the guard narrowing, and the first section C tests |
+| `bcf77f9` | 32 signature-only IBM CM 8.7 compile stubs + `EXPECTED_SIGNATURES.txt` + `check-signatures.sh` (ibm-stubs member) |
+
+Still open at the time of writing: the IBM adapter source set (`src/ibm/java`), the provider/registry
+wiring, the web API, the remaining test suites and the documentation. Nothing is pushed, so the branch
+head is still the accepted review SHA plus local commits.
+
+### Three defects found in the lead's own work, and fixed
+
+Recorded explicitly: each was a real safety defect rather than a typo, and two were found by other
+members attacking the lead's code rather than by the lead's own tests.
+
+1. **`BoundedPool.initialize()` lost every never-started reservation** (found by the foundation member).
+   `initialize()` reserves all `size` slots in one step and `newEntry()` consumes one per attempt, so
+   after the loop aborted the outstanding reservations were the failing attempt PLUS every attempt that
+   never started - exactly `size - entries.size()`. The first version resolved only the failing attempt,
+   so a size-4 pool failing on its first create leaked THREE reservations permanently: capacity lost for
+   the life of the process, and a pool that had never handed anything out reporting itself as still
+   creating. A proven-clean activation failure therefore refused every later activation forever, because
+   a phantom reservation can never be released.
+2. **The same block drove `creatingCount` NEGATIVE on the proven-clean path.** `quarantineUnprovenCreation()`
+   decrements `creating` itself, so releasing the failing attempt as well removed one reservation more than
+   existed. A negative `creating` over-authorises creations, which is the direction that breaks the hard
+   bound. Both branches now account for the failing attempt exactly once. Fixing only the leak would not
+   have caught this; it surfaced by writing the arithmetic out for both paths.
+3. **The read-only guard refused ordinary Java collections** (found by the tests member). The
+   receiver-agnostic `.add(`, `.remove(`, `.update(`, `.delete(`, `.del(` patterns matched the adapter's
+   own `List`/`Map` bookkeeping, and a `.set*` pattern matched `AtomicBoolean.set` and `List.set`:
+   measured, a file containing nothing but local collection calls produced 7 refusals. A guard that cannot
+   pass is a guard that gets disabled, so those names were removed from the scan. The mutating members they
+   were meant to catch are excluded STRUCTURALLY instead, one layer earlier and more strongly than a text
+   scan can manage: `tests/ibm-stubs` declares only the read-only getters, so such a call does not compile
+   at all, and `build.sh` audits that omission against the pinned signature file.
+
+### Accepted contract decisions worth reviewing
+
+- **An UNTYPED exception from `ResourceFactory.create()` still releases the reserved slot.** Four
+  committed Goal 01 assertions pin that behaviour, so quarantining by default would have silently narrowed
+  a documented contract. Only an explicit `CreationFailure(UNPROVEN)` quarantines. **Residual risk,
+  recorded rather than hidden:** a factory that opens a physical resource, fails to clean it up and then
+  throws an ordinary exception remains invisible to the pool. CM Insight's own IBM factory always signals;
+  a third-party factory must opt in.
+- **A create-failure quarantine is folded into the existing `quarantined` counter** rather than becoming a
+  sixth slot state, because `PoolMetrics.capacityInUse()` is asserted to equal
+  `available + leased + creating + retiring + quarantined` and a sixth state would break that identity and
+  `degraded()`. The event counter `createQuarantineFailures()` keeps the two kinds distinguishable, and
+  the metrics-contract test was extended deliberately in the same commit.
+- **A failed `initialize()` propagates the factory's own exception unchanged**, so a caller sees the
+  `CreationFailure` and its cleanup verdict rather than a wrapper that hides it.
 
 ## Goal 01C review verdict
 
@@ -68,6 +132,28 @@ failure path and apply the same pending/uncertain latch rules.
 ## IBM source evidence
 
 Reviewed working CM_Migrator connection/pool code and CM_retention CmService.
+
+> **Goal 02 progress correction (factual, verified against the real SDK jar).** Two statements in the
+> evidence block below could not be confirmed on this machine and must not be relied on:
+>
+> 1. **`CM_retention` is not present anywhere on this machine.** Recursive case-insensitive searches over
+>    `C:\Users\crown\Downloads\Projects` and `C:\Users\crown` found no `CM_retention` directory, no
+>    `CmService.java` and no `CmService.class`; no Java source anywhere on the machine calls the retention
+>    API at all. The "confirmed read paths from CM_retention" list therefore has no local source backing
+>    it. It was replaced as evidence by direct `javap` verification against the real
+>    `cmbicmsdk81.jar` (8.7.00.400.44), recorded in `harness/IBM_CM87_SDK_API_SURFACE.md`.
+> 2. **`DKDatastoreDefICM.listEntities(...)` as written in that list does not exist.** The real overloads
+>    are `listEntities()`, `listEntities(int)` and `listEntities(DKNVPair[])`; there is no
+>    `listEntities(String)`, and `DKConstantICM.DK_ICM_ENTITY_TYPE` is a `String` constant that no
+>    `listEntities` overload consumes. The correct call is `listEntities(DK_ICM_BASE)`.
+>
+> Six further facts were corrected the same way; all are recorded in
+> `harness/GOAL_02_IMPLEMENTATION_SPEC.md` section 1. The most consequential: `DKDatastoreICM` is in
+> `com.ibm.mm.sdk.`**`server`**, the SDK has **no `close()` anywhere** (teardown is `disconnect()` then
+> `destroy()`), `datastoreDef()` and `datastoreAdmin()` do not narrow so both casts are load-bearing, the
+> retention period-unit "constants" are nested **enums** rather than ints, the ItemType integer id comes
+> from `getIntId()` (the inherited `getId()` is a lossy `short`), and `DKSystemException` does not exist
+> (the real class is `DKSystemError`).
 
 Useful from CM_Migrator:
 - DKDatastoreICM lifecycle and cleanup patterns;
