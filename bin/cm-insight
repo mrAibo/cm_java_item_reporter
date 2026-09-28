@@ -1,13 +1,114 @@
 #!/usr/bin/env bash
+#
+# CM Insight - application launcher.
+#
+#   ./bin/cm-insight [--help] [application arguments...]
+#
+# Runs the packaged build/cm-insight.jar with the JDK from JAVA_HOME (or PATH),
+# adding any local jars from lib/{ibm,db2,oracle,app} to the class path. No
+# network access. Exits with the application's own exit code.
+#
+# Message prefixes: "OK:" informational, "WARN:" non-fatal, "ERROR:" fatal.
+# Exit codes: 2 usage/environment problem, otherwise the application's code.
+
 set -euo pipefail
-ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-JAVA="${JAVA_HOME:+${JAVA_HOME}/bin/}java"
-command -v "${JAVA}" >/dev/null 2>&1 || { echo "ERROR: java not found" >&2; exit 2; }
+
+usage() {
+  cat <<'USAGE'
+Usage: ./bin/cm-insight [--help] [application arguments...]
+
+Launches CM Insight (build/cm-insight.jar) after checking the environment.
+
+Environment:
+  JAVA_HOME                  JDK 17+ home (accepted as /c/tools/jdk17, C:/tools/jdk17
+                             or C:\tools\jdk17); falls back to PATH
+  CM_INSIGHT_CONFIG          configuration file (default conf/application.properties)
+  CM_INSIGHT_JAVA_OPTS       extra JVM options, word-split on spaces
+                             (e.g. "-Xmx512m -Dfile.encoding=UTF-8")
+
+Common application arguments:
+  --config <file>            configuration file
+  --version                  print the version and exit
+  --self-test                run the in-process self-test and exit
+
+Build first when build/cm-insight.jar is missing: ./build.sh
+USAGE
+}
+
+for arg in "$@"; do
+  case "${arg}" in
+    -h|--help) usage; exit 0 ;;
+  esac
+done
+
+SELF="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(dirname -- "${SELF}")"
+[ -d "${SCRIPT_DIR}" ] || { printf 'ERROR: cannot locate script directory: %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
+ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)" || { printf 'ERROR: cannot resolve repository root from %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
+
+# Class path separator: always ':' - the POSIX separator, correct as-is on the
+# real Linux/Unix target. Under Git Bash / MSYS2 the shell layer translates a
+# ':'-joined list of ABSOLUTE POSIX paths into the Windows form the native JVM
+# expects, whereas a ';'-joined list is passed through untranslated and javac
+# then fails with "bad path element". Do NOT "fix" this back to ';': every entry
+# below is an absolute path derived from the repository root, which is what keeps
+# that translation reliable on Windows and correct on Linux/macOS.
+CP_SEP=":"
+
+JH="${JAVA_HOME:-}"
+if [ -n "${JH}" ]; then
+  case "$(uname -s 2>/dev/null || printf 'unknown')" in
+    MINGW*|MSYS*|CYGWIN*)
+      case "${JH}" in
+        [A-Za-z]:[\\/]*)
+          _drive="$(printf '%s' "${JH}" | cut -c1 | tr 'A-Z' 'a-z')"
+          _rest="$(printf '%s' "${JH}" | cut -c3- | tr '\\' '/')"
+          JH="/${_drive}${_rest}"
+          ;;
+      esac
+      ;;
+  esac
+  case "${JH}" in */) JH="${JH%/}" ;; esac
+  JAVA="${JH}/bin/java"
+else
+  JAVA="$(command -v java 2>/dev/null || true)"
+fi
+if [ -z "${JAVA}" ] || [ ! -x "${JAVA}" ]; then
+  printf 'ERROR: java not found%s. Install a JDK 17+ and set JAVA_HOME, or put its bin/ directory on PATH.\n' "${JAVA:+ at ${JAVA}}" >&2
+  exit 2
+fi
+
 APP_JAR="${ROOT}/build/cm-insight.jar"
-[[ -f "${APP_JAR}" ]] || { echo "ERROR: ${APP_JAR} not found; run ./build.sh" >&2; exit 2; }
-shopt -s nullglob
-JARS=("${ROOT}"/lib/ibm/*.jar "${ROOT}"/lib/db2/*.jar "${ROOT}"/lib/oracle/*.jar "${ROOT}"/lib/app/*.jar)
+if [ ! -f "${APP_JAR}" ]; then
+  printf 'ERROR: %s not found. Build the application first: ./build.sh\n' "${APP_JAR}" >&2
+  exit 2
+fi
+if [ ! -s "${APP_JAR}" ]; then
+  printf 'ERROR: %s is empty or truncated. Re-run ./build.sh\n' "${APP_JAR}" >&2
+  exit 2
+fi
+
 CP="${APP_JAR}"
-if (( ${#JARS[@]} > 0 )); then OLD_IFS="${IFS}"; IFS=:; CP="${CP}:${JARS[*]}"; IFS="${OLD_IFS}"; fi
+for module in ibm db2 oracle app; do
+  dir="${ROOT}/lib/${module}"
+  [ -d "${dir}" ] || continue
+  for jar_file in "${dir}"/*.jar; do
+    [ -e "${jar_file}" ] || continue
+    CP="${CP}${CP_SEP}${jar_file}"
+  done
+done
+
 CONFIG="${CM_INSIGHT_CONFIG:-${ROOT}/conf/application.properties}"
-exec "${JAVA}" ${CM_INSIGHT_JAVA_OPTS:-} -cp "${CP}" com.mraibo.cminsight.app.Main --config "${CONFIG}" "$@"
+if [ ! -f "${CONFIG}" ]; then
+  printf 'ERROR: configuration file not found: %s\n       Create it with: cp conf/application.properties.example conf/application.properties\n' "${CONFIG}" >&2
+  exit 2
+fi
+
+JAVA_OPTS=()
+if [ -n "${CM_INSIGHT_JAVA_OPTS:-}" ]; then
+  # Intentional word splitting: CM_INSIGHT_JAVA_OPTS holds a list of JVM options.
+  # shellcheck disable=SC2206
+  JAVA_OPTS=(${CM_INSIGHT_JAVA_OPTS})
+fi
+
+exec "${JAVA}" ${JAVA_OPTS[@]+"${JAVA_OPTS[@]}"} -cp "${CP}" com.mraibo.cminsight.app.Main --config "${CONFIG}" "$@"

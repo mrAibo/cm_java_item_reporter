@@ -4,12 +4,18 @@ out/
 *.class
 *.jar
 !lib/README.md
+.tools/
 conf/application.properties
 conf/profiles/*.properties
 !conf/profiles/*.properties.example
 .env
 *.secret
 *.secrets
+conf/secrets/
+*.key
+*.pem
+*.p12
+*.jks
 logs/
 data/
 reports/
@@ -21,3 +27,4 @@ run/
 .vscode/
 *.iml
 .DS_Store
+.agent-teams/

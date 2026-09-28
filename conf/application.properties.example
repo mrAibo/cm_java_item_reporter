@@ -1,19 +1,71 @@
+# CM Insight configuration example.
+#
+# Copy it next to the application and edit:
+#     cp conf/application.properties.example conf/application.properties
+#
+# Secrets are never stored inline by default. A secret-valued key can be given in
+# three forms, and the suffix selects the source:
+#     <key>.env=NAME    value read from environment variable NAME   (recommended)
+#     <key>.file=PATH   value read from PATH, interpreted relative to secrets.dir
+#                       when it is not absolute (keep that file mode 0600)
+#     <key>=value       inline value in this file (DISCOURAGED: it ends up in a
+#                       readable file, in backups, in process listings and in shell
+#                       history; use one of the two forms above instead)
+# This example deliberately contains no password value.
+#
+# With web.bind on loopback and no password configured, the application starts
+# with the built-in admin/admin fallback and prints a warning. On a non-loopback
+# bind it refuses to start (fail closed) until a password is configured.
+
 app.name=CM Insight
+
+# Optional, reported by GET /api/info (defaults shown; safe to delete).
+app.version=0.1.0-SNAPSHOT
+app.mode=bootstrap-read-only
 
 web.bind=127.0.0.1
 web.port=8080
 web.threads=8
+
+# Optional hardening for the built-in basic-auth throttle (defaults shown).
+# web.backlog is the listen backlog, 0..4096 (0 = JDK default).
+# web.auth.lockout accepts a bare number of milliseconds or an ms/s/m/h/d suffix.
+web.backlog=0
+web.auth.maxFailures=5
+web.auth.lockout=5m
+web.auth.maxTrackedKeys=4096
+
+# --- Web credentials ----------------------------------------------------------
+# With NONE of the web.auth.user*/web.auth.password* keys present, the application
+# starts with the built-in admin/admin development credentials on a loopback bind
+# and prints a warning; on a non-loopback bind it refuses to start until a real
+# password is configured.
+#
+# If you DO configure a source, that source must resolve. The application fails
+# closed rather than silently falling back to admin/admin, so only uncomment the
+# line below once CM_INSIGHT_WEB_PASSWORD is actually exported in the environment
+# that starts the JVM.
 web.auth.user=admin
-web.auth.password=admin
+# web.auth.password.env=CM_INSIGHT_WEB_PASSWORD
+# web.auth.password.file=web.password
+# web.auth.password=<inline value>   (discouraged: it ends up in backups and shell history)
 
 feature.dashboard=true
 feature.itemtypes=true
+feature.statistics=true
 feature.retention.viewer=true
 feature.history=true
 feature.reports=true
-feature.itemlookup=false
+feature.system.diagnostics=true
+feature.item.lookup=false
 feature.retention.admin=false
 
+# --- Reserved for later goals -------------------------------------------------
+# Goal 01 carries these keys so the configuration shape stays stable, but nothing reads
+# them yet: the pool, statistics and cache settings are attached by the IBM CM adapter
+# and analytics goals, and data.dir/reports.dir/logs.dir are conventions the shell scripts
+# create as directories without reading them from this file. Setting them has no effect
+# today, and changing them cannot break the current build.
 cm.pool.size=4
 cm.pool.borrow.timeout.ms=5000
 cm.pool.max.age.minutes=30
@@ -28,7 +80,16 @@ statistics.scan.timeout.seconds=600
 cache.metadata.ttl.seconds=600
 cache.statistics.ttl.seconds=300
 
+# Paths: use forward slashes (conf/profiles) or doubled backslashes (conf\\profiles).
+# A single backslash is an escape character in .properties files, so conf\profiles
+# silently becomes confprofiles and the application then fails on an unreadable path.
 profiles.dir=conf/profiles
+classifications.file=conf/classifications.properties
 data.dir=data
 reports.dir=reports
 logs.dir=logs
+secrets.dir=conf/secrets
+
+# web.port=0 binds a random free port; the application is then reachable only at the
+# port printed in its startup banner, and bin/start.sh / bin/status.sh skip the HTTP
+# health check (they cannot derive the URL) and verify the process instead.

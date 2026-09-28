@@ -55,6 +55,14 @@ try (Lease<CmSession> lease = cmPool.borrow()) {
 
 Pool metrics: configured size, available, leased, borrow count, average/max wait, sessions created/closed, reconnect attempts/success/failures, stale rotations and validation failures.
 
+### Capacity accounting
+
+Every capacity slot is accounted for under a single lock as one of four states: idle, leased, being created, or retiring. A borrow either takes an idle resource, or, when that sum is below the configured size, reserves a slot and creates one. Because that sum is the only thing that authorises a creation, the bound cannot be exceeded under any interleaving, no capacity is overshot during a refill and no emergency or overflow resource is ever created. Refill is lazy rather than eager: retiring a resource frees its slot and the next borrow creates the replacement, so there are no refill worker threads to explode and no refill race to lose.
+
+A retiring resource keeps its slot until its `close()` has returned. A slow close therefore delays capacity instead of letting a replacement open while the old resource is still alive: the hard bound takes precedence over promptness.
+
+There is exactly one capacity path. Nothing in the codebase may bypass the pool to open an ad-hoc or emergency connection.
+
 ## RepositoryContext
 
 ```text
@@ -69,6 +77,8 @@ RepositoryContext
 ```
 
 Modules borrow resources from this context and do not create ad-hoc connections.
+
+Goal 01 ships the generic `BoundedPool`, the `RepositoryContext` resource container and the `RepositoryContextFactory` seam. The named CM and JDBC pools and the metadata, statistics and retention repositories in the tree above are the target shape for the later adapter and analytics goals; those types do not exist yet.
 
 ## Statistics
 
@@ -96,7 +106,7 @@ Retention administration is a later feature and disabled by default.
 
 ## Feature modules
 
-dashboard, itemtypes, statistics, retention-viewer, history, reports, system-diagnostics, item-lookup (initially off), retention-admin (off).
+`feature.dashboard`, `feature.itemtypes`, `feature.statistics`, `feature.retention.viewer`, `feature.history`, `feature.reports`, `feature.system.diagnostics`, `feature.item.lookup` (initially off), `feature.retention.admin` (off, and it cannot be enabled).
 
 Dynamic third-party JAR plugins are not required. Modularity is package/service based.
 

@@ -10,23 +10,69 @@ permissions:
 jobs:
   java17-bootstrap:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Verify script permissions
+        run: |
+          for f in build.sh tests/selftest.sh bin/compile.sh bin/cm-insight bin/start.sh \
+                   bin/stop.sh bin/restart.sh bin/status.sh bin/doctor.sh bin/clean.sh; do
+            test -x "$f" || { echo "ERROR: $f is not executable"; exit 1; }
+          done
+          echo "OK: all operational scripts are executable"
+
+      - name: Shell syntax check
+        run: |
+          for f in build.sh tests/selftest.sh bin/compile.sh bin/cm-insight bin/start.sh \
+                   bin/stop.sh bin/restart.sh bin/status.sh bin/doctor.sh bin/clean.sh; do
+            bash -n "$f" || { echo "ERROR: $f has a syntax error"; exit 1; }
+          done
+          echo "OK: script syntax is valid"
+
+      - name: Script help smoke test
+        run: |
+          ./build.sh --help >/dev/null
+          ./tests/selftest.sh --help >/dev/null
+          ./bin/compile.sh --help >/dev/null
+          ./bin/cm-insight --help >/dev/null
+          ./bin/start.sh --help >/dev/null
+          ./bin/stop.sh --help >/dev/null
+          ./bin/restart.sh --help >/dev/null
+          ./bin/status.sh --help >/dev/null
+          ./bin/doctor.sh --help >/dev/null
+          ./bin/clean.sh --help >/dev/null
+          echo "OK: every script supports --help"
+
       - name: Prepare local configuration
-        run: cp conf/application.properties.example conf/application.properties
-      - name: Build and self-test
+        run: |
+          cp conf/application.properties.example conf/application.properties
+          echo "OK: conf/application.properties prepared from the example"
+          grep -c '=' conf/application.properties >/dev/null
+
+      - name: Build (offline compile + required test suite + package)
         run: ./build.sh
+
       - name: Doctor
         run: ./bin/doctor.sh
+
       - name: Start
-        run: ./bin/start.sh
-      - name: Status and health
+        run: ./bin/start.sh --timeout 30
+
+      - name: Status and local health
         run: ./bin/status.sh
-      - name: Stop
+
+      - name: Application log on failure
+        if: failure()
+        run: tail -n 200 logs/cm-insight.out || true
+
+      - name: Stop (always)
         if: always()
-        run: ./bin/stop.sh --force || true
+        run: ./bin/stop.sh --force --timeout 15 || true
