@@ -58,14 +58,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>a late lease that comes back clean lets the context reach {@link CloseState#CLOSED_CLEAN}
  *       afterwards - a switch that was correctly refused earlier is allowed later, without anybody
  *       having to re-close anything;</li>
- *   <li>uncertainty is a LATCH, not a derived value: once a resource failed, reported an unreadable
- *       outcome, or was seen uncertain, no later clean answer can revoke it. A quarantine never clears,
- *       so this only ever makes the reported state more conservative.</li>
+ *   <li>uncertainty is a LATCH, not merely a derived value: uncertainty seen by ANY read - recorded when
+ *       {@code close()} ran, reported by an owned resource now, or observed at any point in between - is
+ *       permanent, and no later clean answer can revoke it. This is deliberately stronger than trusting
+ *       each resource to be monotone: a resource whose state transiently reads uncertain and then clean
+ *       would otherwise be refused on one switch attempt and allowed through on the next, which is a
+ *       fail-open window across retries. {@code BoundedPool}'s quarantine is already monotone, so this
+ *       only ever makes the repository layer more conservative than the pool it owns.</li>
  * </ul>
  *
  * <p>The derivation is monotone in the safe direction - {@code NOT_CLOSED -> CLOSING ->
  * CLOSED_CLEAN} may each be followed by {@code CLOSED_UNCERTAIN}, and {@code CLOSED_UNCERTAIN} is
- * final. Every query is read-only: it never closes, waits, or retries anything.
+ * final. Every query is read-only with respect to the LIFECYCLE: it never closes, waits, retries, or
+ * changes what will be released. It does latch uncertainty, which is the one deliberate exception, and
+ * it is monotone and idempotent by construction.
  *
  * <p>This class is itself {@link CloseOutcomeAware} and {@link CloseStateAware}: a container that owns a
  * context (or an adapter that does) can ask the same questions of it and get the same vocabulary.
@@ -250,6 +256,13 @@ public final class RepositoryContext implements CloseOutcomeAware, CloseStateAwa
         for (int i = resources.size() - 1; i >= 0; i--) {
             CloseState state = ownedState(resources.get(i));
             if (state == CloseState.CLOSED_UNCERTAIN) {
+                // Latch it. Uncertainty observed on ANY read is permanent, not merely the uncertainty
+                // recorded when close() ran: otherwise a resource that reported CLOSED_UNCERTAIN once and
+                // CLOSED_CLEAN afterwards - a transient report from a future adapter whose closeState() is
+                // not monotone, or a hostile one - would be refused on one switch attempt and then allowed
+                // through on the next, which is a fail-open window across retries. The manager's fail-closed
+                // rule must not depend on every implementation being monotone by itself.
+                uncertainLatched = true;
                 return CloseState.CLOSED_UNCERTAIN;
             }
             if (state == CloseState.CLOSING || state == CloseState.NOT_CLOSED) {
@@ -279,7 +292,10 @@ public final class RepositoryContext implements CloseOutcomeAware, CloseStateAwa
     @Override
     public String uncertainCloseDetail() {
         List<String> failures = closeFailures;
-        List<String> reports = uncertainCloseReports;
+        // The DERIVED reports, not the stored field: a quarantine that only appeared after close()
+        // returned has no stored report, and this detail is the human-readable side of closeState(). It
+        // must therefore describe the same instant the state does.
+        List<String> reports = uncertainCloseReports();
         if (failures.isEmpty() && reports.isEmpty()) {
             return "";
         }

@@ -2,7 +2,6 @@ package com.mraibo.cminsight.repository;
 
 import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.core.CloseState;
-import com.mraibo.cminsight.core.CloseStateAware;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -75,6 +74,16 @@ public final class RepositoryManager implements AutoCloseable {
 
     /** How many lifecycle notes are retained; a long-lived console must not grow without bound. */
     private static final int MAX_DIAGNOSTICS = 512;
+
+    /**
+     * How often {@link #switchTo(RepositoryProfile)} re-samples the retained previous context when its
+     * sample keeps being invalidated by a concurrent switch.
+     *
+     * <p>Bounded on purpose: the loop may only ever refuse or re-decide, never create, so giving up after
+     * a few attempts is fail-closed and the caller simply retries. It exists so that a pathological
+     * stream of concurrent switches cannot spin this method forever.
+     */
+    private static final int MAX_SAMPLE_ATTEMPTS = 16;
 
     private final RepositoryContextFactory factory;
     private final ReentrantLock switchLock = new ReentrantLock();
@@ -285,60 +294,122 @@ public final class RepositoryManager implements AutoCloseable {
      */
     public void switchTo(RepositoryProfile profile) throws RepositoryException {
         Objects.requireNonNull(profile, "profile");
-        switchLock.lock();
-        try {
-            ensureOpen();
-            resolveUnpublishedClosing(profile);
 
-            RepositoryContext previous = lifecycle.get().context();
-            if (previous != null) {
-                // Publish SWITCHING and clear the context in one store, so no reader can observe
-                // ACTIVE together with nothing published. The context is retained on the way out: from
-                // here on it is the manager's only handle on the repository it is tearing down.
-                lifecycle.set(new Lifecycle(RepositoryState.SWITCHING, null));
-                String previousId = previous.profileUnchecked().id();
-                unpublishedClosing = previous;
-                CloseOutcome outcome = closeContext(previous, "switch away from '" + previousId + "'");
-                CloseState state = closeStateOf(previous);
-                if (state == CloseState.CLOSED_UNCERTAIN || outcome.uncertain()) {
-                    throw failClosed(profile, previousId, Refusal.UNCERTAIN, outcome);
-                }
-                if (state != CloseState.CLOSED_CLEAN) {
-                    throw failClosed(profile, previousId, Refusal.PENDING, outcome);
-                }
-                // Proven released. Clearing the reference is what makes a later switch able to proceed -
-                // the same release the retry path performs.
-                releaseLatch(previous);
-            }
+        // The retained context's state is sampled OUTSIDE the switch lock on purpose. Reporting its close
+        // state means calling into an owned resource, and an adapter is arbitrary code: a resource whose
+        // closeState() blocks (or one whose health probe holds its pool's lock) would otherwise wedge the
+        // whole manager - including closingContext() and diagnostics - for as long as it likes. Sampling
+        // first means a blocking read delays only this caller, which is exactly the fail-closed outcome it
+        // would have got anyway. The sample is then revalidated under the lock, so a concurrent switch
+        // cannot slip a different context past it.
+        RetainedSample sample = sampleRetained();
 
-            refusal = null;
-            lifecycle.set(new Lifecycle(RepositoryState.INITIALIZING, null));
-            RepositoryContext created = null;
+        for (int attempt = 0; attempt < MAX_SAMPLE_ATTEMPTS; attempt++) {
+            switchLock.lock();
             try {
-                created = factory.create(profile);
-                validate(created, profile);
-                lastFailure = null;
-                lifecycle.set(new Lifecycle(RepositoryState.ACTIVE, created));
-                record("Activated repository '" + profile.id() + "' ("
-                        + profile.databaseVendor() + ", SSID " + profile.ssid() + ").");
-            } catch (Exception e) {
-                if (created != null) {
-                    // The context is unpublished and will never be activated: retain then close it, so a
-                    // still-draining resource in a failed activation is refused by the same rule as a
-                    // switch, instead of vanishing with the exception.
-                    unpublishedClosing = created;
-                    CloseOutcome outcome = closeContext(created, "failed activation of '" + profile.id() + "'");
-                    maybeReleaseLatch(created, outcome);
+                ensureOpen();
+                if (unpublishedClosing != sample.context()) {
+                    // A concurrent switch published or released the retained context between the sample and
+                    // this lock. Loop and take a fresh sample: the state must never be judged from a stale
+                    // reference, and the fresh sample is again taken outside the lock.
+                    continue;
                 }
-                lastFailure = describe(e);
-                refusal = Refusal.ACTIVATION_FAILED;
-                lifecycle.set(new Lifecycle(RepositoryState.FAILED, null));
-                throw new RepositoryException("Could not activate repository '" + profile.id()
-                        + "': " + describe(e), e);
+                resolveUnpublishedClosing(profile, sample);
+
+                RepositoryContext previous = lifecycle.get().context();
+                if (previous != null) {
+                    // Publish SWITCHING and clear the context in one store, so no reader can observe
+                    // ACTIVE together with nothing published. The context is retained on the way out: from
+                    // here on it is the manager's only handle on the repository it is tearing down.
+                    lifecycle.set(new Lifecycle(RepositoryState.SWITCHING, null));
+                    String previousId = previous.profileUnchecked().id();
+                    unpublishedClosing = previous;
+                    CloseOutcome outcome = closeContext(previous, "switch away from '" + previousId + "'");
+                    CloseState state = sampleState(previous);
+                    if (state == CloseState.CLOSED_UNCERTAIN || outcome.uncertain()) {
+                        throw failClosed(profile, previousId, Refusal.UNCERTAIN, outcome);
+                    }
+                    if (state != CloseState.CLOSED_CLEAN) {
+                        throw failClosed(profile, previousId, Refusal.PENDING, outcome);
+                    }
+                    // Proven released. Clearing the reference is what makes a later switch able to proceed -
+                    // the same release the retry path performs.
+                    releaseLatch(previous);
+                }
+
+                refusal = null;
+                lifecycle.set(new Lifecycle(RepositoryState.INITIALIZING, null));
+                RepositoryContext created = null;
+                try {
+                    created = factory.create(profile);
+                    validate(created, profile);
+                    lastFailure = null;
+                    lifecycle.set(new Lifecycle(RepositoryState.ACTIVE, created));
+                    record("Activated repository '" + profile.id() + "' ("
+                            + profile.databaseVendor() + ", SSID " + profile.ssid() + ").");
+                } catch (Throwable e) {
+                    // Throwable, not Exception: an Error from the factory must not leave the manager
+                    // stuck in INITIALIZING with no recorded failure and a half-built context published
+                    // nowhere. It is recorded, the state becomes FAILED, and it still reaches the caller.
+                    if (created != null) {
+                        // The context is unpublished and will never be activated: retain then close it, so a
+                        // still-draining resource in a failed activation is refused by the same rule as a
+                        // switch, instead of vanishing with the exception.
+                        unpublishedClosing = created;
+                        CloseOutcome outcome =
+                                closeContext(created, "failed activation of '" + profile.id() + "'");
+                        maybeReleaseLatch(created, outcome);
+                    }
+                    lastFailure = describe(e);
+                    refusal = Refusal.ACTIVATION_FAILED;
+                    lifecycle.set(new Lifecycle(RepositoryState.FAILED, null));
+                    if (e instanceof Error error) {
+                        throw error;
+                    }
+                    throw new RepositoryException("Could not activate repository '" + profile.id()
+                            + "': " + describe(e), e);
+                }
+                return;
+            } finally {
+                switchLock.unlock();
             }
-        } finally {
-            switchLock.unlock();
         }
+        // The sample could never be revalidated because another thread kept moving the lifecycle. There
+        // are only two ways out of that loop - refuse, or retry - and both are fail-closed: no context is
+        // created. Retrying is what the caller would do anyway.
+        throw new RepositoryException("Could not switch to '" + profile.id()
+                + "': the repository lifecycle kept changing while this switch was being evaluated;"
+                + " nothing was created. Retry.");
+    }
+
+    /**
+     * Samples the retained context's close state outside the switch lock.
+     *
+     * <p>A pure read: it reports, it never closes, waits, retries or creates, and it does not touch
+     * {@link #unpublishedClosing}.
+     */
+    private RetainedSample sampleRetained() {
+        RepositoryContext retained = unpublishedClosing;
+        return new RetainedSample(retained, retained == null ? null : closeStateOf(retained));
+    }
+
+    /**
+     * The close state of one context, read WITHOUT extra lock scope held of our own.
+     *
+     * <p>Used for a context this thread has just published into {@link #unpublishedClosing}: it is no
+     * longer reachable as active, so reading its state delays only this switch.
+     */
+    private static CloseState sampleState(RepositoryContext context) {
+        return closeStateOf(context);
+    }
+
+    /**
+     * What the retained previous context was at one instant, and what its shutdown said.
+     *
+     * @param context the retained context, or {@code null} when nothing was retained
+     * @param state   its close state at sampling time, or {@code null} when there was none
+     */
+    private record RetainedSample(RepositoryContext context, CloseState state) {
     }
 
     /**
@@ -392,20 +463,24 @@ public final class RepositoryManager implements AutoCloseable {
     /** Lifecycle snapshot for the diagnostics endpoint. */
     public Map<String, String> statusSnapshot() {
         Map<String, String> snapshot = new LinkedHashMap<>();
-        Lifecycle current = lifecycle.get();
+        Lifecycle current;
+        RepositoryContext closing;
+        // The published lifecycle and the retained latch are read in ONE lock section, so the snapshot
+        // cannot pair a repositoryId from one instant with a closingRepositoryId from another. The close
+        // state itself is still derived outside the lock, because reading it calls into owned resources.
+        switchLock.lock();
+        try {
+            current = lifecycle.get();
+            closing = unpublishedClosing;
+        } finally {
+            switchLock.unlock();
+        }
         snapshot.put("state", current.state().name());
         snapshot.put("stateDescription", current.state().description());
         snapshot.put("repositoryId", current.context() == null
                 ? "" : current.context().profileUnchecked().id());
         snapshot.put("lastFailure", lastFailure == null ? "" : lastFailure);
         snapshot.put("refusal", refusal == null ? "" : refusal.name());
-        RepositoryContext closing;
-        switchLock.lock();
-        try {
-            closing = unpublishedClosing;
-        } finally {
-            switchLock.unlock();
-        }
         snapshot.put("closingRepositoryId", closing == null ? "" : closing.profileUnchecked().id());
         snapshot.put("closingState", closing == null ? "" : closeStateOf(closing).name());
         return snapshot;
@@ -468,15 +543,20 @@ public final class RepositoryManager implements AutoCloseable {
      * switch, not only the first, which is exactly the difference between "refused once" and "refused
      * until the previous repository is provably gone".
      *
+     * <p>The state it decides on was SAMPLED OUTSIDE the switch lock by {@link #sampleRetained()} and is
+     * only revalidated here - the caller has already confirmed that the retained reference did not change
+     * in between - so an owned resource that blocks while reporting cannot wedge the manager.
+     *
      * @throws RepositoryException when the retained context is not terminal-clean
      */
-    private void resolveUnpublishedClosing(RepositoryProfile requested) throws RepositoryException {
-        RepositoryContext retained = unpublishedClosing;
+    private void resolveUnpublishedClosing(RepositoryProfile requested, RetainedSample sample)
+            throws RepositoryException {
+        RepositoryContext retained = sample.context();
         if (retained == null) {
             return;
         }
         String retainedId = retained.profileUnchecked().id();
-        CloseState state = closeStateOf(retained);
+        CloseState state = sample.state();
         if (state == CloseState.CLOSED_CLEAN) {
             // Every physical resource of the previous repository is proven gone: the latch has done its
             // job and must be released, or a future switch would be refused forever.
@@ -487,7 +567,9 @@ public final class RepositoryManager implements AutoCloseable {
 
         boolean uncertain = state == CloseState.CLOSED_UNCERTAIN;
         Refusal reason = uncertain ? Refusal.UNCERTAIN : Refusal.PENDING;
-        lifecycle.set(new Lifecycle(RepositoryState.CLOSING, null));
+        // FAILED, exactly as the FIRST refusal publishes (failClosed): the manager state must not depend
+        // on which attempt happened to be refused, and CLOSING is reserved for the manager's own shutdown.
+        lifecycle.set(new Lifecycle(RepositoryState.FAILED, null));
         String detail = uncertain
                 ? "Switch to '" + requested.id() + "' refused again: the previous repository '" + retainedId
                         + "' still has resources whose physical shutdown is unproven (" + state + "); "

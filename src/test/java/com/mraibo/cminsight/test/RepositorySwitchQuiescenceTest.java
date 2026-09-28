@@ -653,6 +653,140 @@ public class RepositorySwitchQuiescenceTest {
     }
 
     /**
+     * Goal 01C C: the fail-closed rule cannot be revoked by reporting uncertainty ONCE and then clean.
+     *
+     * <p>This pins the LATCH, not merely the derivation. {@link BoundedPool}'s quarantine is monotone, so
+     * a pool could not demonstrate the difference; this uses a resource whose state goes
+     * {@code CLOSED_UNCERTAIN} and would answer {@code CLOSED_CLEAN} afterwards - the shape a future
+     * adapter with a non-monotone (or hostile) {@code closeState()} would have. If the uncertainty were
+     * only derived and not latched, the first attempt would be refused and the second would be ALLOWED,
+     * which is exactly the fail-open window across retries that section C forbids.
+     */
+    public void anUncertaintyObservedOnceIsLatchedAndNeverRevoked() throws Exception {
+        FlappingFlakyResource flaky = new FlappingFlakyResource();
+        List<String> factoryCalls = Collections.synchronizedList(new ArrayList<>());
+        RepositoryManager manager = new RepositoryManager(requested -> {
+            factoryCalls.add(requested.id());
+            return requested.id().equals("alpha")
+                    ? new RepositoryContext(requested, List.of(flaky))
+                    : new RepositoryContext(requested);
+        });
+
+        manager.switchTo(profile("alpha"));
+        Assert.assertEquals(List.of("alpha"), List.copyOf(factoryCalls), "A was created");
+
+        // Attempt 1: the resource reports uncertainty, so the switch is refused.
+        Assert.assertThrows(RepositoryException.class, () -> manager.switchTo(profile("beta")),
+                "an uncertain previous repository refuses the switch");
+        Assert.assertEquals(RepositoryManager.Refusal.UNCERTAIN, manager.refusal().orElseThrow(),
+                "the refusal is classified as permanent uncertainty");
+        Assert.assertEquals(CloseState.CLOSED_UNCERTAIN, flaky.state, "the resource really reported it");
+        Assert.assertEquals(List.of("alpha"), List.copyOf(factoryCalls), "B was not created");
+
+        // The resource now answers CLOSED_CLEAN. A derived-only implementation would allow the retry.
+        flaky.state = CloseState.CLOSED_CLEAN;
+        Assert.assertEquals(CloseState.CLOSED_UNCERTAIN, manager.closingState().orElseThrow(),
+                "the manager still reports the latched uncertainty, not the resource's latest answer");
+        RepositoryException retry = Assert.assertThrows(RepositoryException.class,
+                () -> manager.switchTo(profile("beta")),
+                "a latched uncertainty cannot be revoked by a later clean answer");
+        Assert.assertTrue(retry.getMessage().contains("unproven"),
+                "the refusal still explains the unproven shutdown: " + retry.getMessage());
+        Assert.assertEquals(List.of("alpha"), List.copyOf(factoryCalls),
+                "B's factory invocation count is STILL zero after the flap");
+
+        // And it stays refused for as long as the manager lives.
+        Assert.assertThrows(RepositoryException.class, () -> manager.switchTo(profile("beta")),
+                "the latch is permanent");
+        Assert.assertEquals(List.of("alpha"), List.copyOf(factoryCalls), "and it never creates anything");
+        Assert.assertEquals(RepositoryManager.Refusal.UNCERTAIN, manager.refusal().orElseThrow(),
+                "the refusal classification is stable");
+
+        manager.close();
+    }
+
+    /**
+     * Goal 01C C and the releaseLatch guard: a merely PENDING previous context is swept by an explicit
+     * {@code deactivate()}, is never reported as released, and is never remembered afterwards.
+     *
+     * <p>The second {@code deactivate()} is the pin for the guard inside the latch release: a manager that
+     * dropped the retained reference while it was not terminal-clean, or that kept reporting work after a
+     * clean release, would answer true here.
+     */
+    public void deactivatingAPendingContextNeverClaimsItWasReleased() throws Exception {
+        FakePoolFactory poolFactory = new FakePoolFactory();
+        BoundedPool<FakeResource> pool = initializedPool(poolFactory, "cm-sessions");
+        Lease<FakeResource> held = pool.borrow();
+
+        List<String> factoryCalls = Collections.synchronizedList(new ArrayList<>());
+        RepositoryManager manager = new RepositoryManager(requested -> {
+            factoryCalls.add(requested.id());
+            return requested.id().equals("alpha")
+                    ? new RepositoryContext(requested, List.of(pool))
+                    : new RepositoryContext(requested);
+        });
+        manager.switchTo(profile("alpha"));
+        Assert.assertThrows(RepositoryException.class, () -> manager.switchTo(profile("beta")),
+                "the held lease refuses the switch and retains A");
+
+        // The previous context is pending, not uncertain: deactivate must not report a clean release.
+        Assert.assertTrue(manager.deactivate(), "deactivate reports that it dealt with the retained context");
+        Assert.assertFalse(manager.state() == RepositoryState.NONE,
+                "a still-draining repository is never reported as released: " + manager.state());
+        Assert.assertEquals(RepositoryManager.Refusal.PENDING, manager.refusal().orElseThrow(),
+                "the refusal stays recoverable");
+        Assert.assertTrue(manager.closingContext().isPresent(), "the context is still retained");
+        Assert.assertTrue(poolFactory.liveCount() > 0, "and its physical resource is still alive");
+        Assert.assertEquals(List.of("alpha"), List.copyOf(factoryCalls), "nothing was created");
+        Assert.assertThrows(RepositoryException.class, () -> manager.switchTo(profile("beta")),
+                "the outstanding lease still refuses the switch after a deactivate");
+
+        // Drain it, then the retained context reaches terminal-clean and the switch proceeds.
+        returnLease(held);
+        Assert.assertTrue(waitFor(() -> pool.closeState() == CloseState.CLOSED_CLEAN, GENEROUS),
+                "the pool reaches terminal-clean once the lease is returned");
+        manager.switchTo(profile("beta"));
+        Assert.assertEquals(List.of("alpha", "beta"), List.copyOf(factoryCalls),
+                "the switch proceeds once the previous repository is proven released");
+        Assert.assertTrue(manager.closingContext().isEmpty(),
+                "and the manager forgets it only after that proof");
+        Assert.assertTrue(manager.refusal().isEmpty(), "a successful switch clears the refusal");
+
+        manager.close();
+    }
+
+    /**
+     * A resource whose reported shutdown state can change - the non-monotone shape the LATCH exists to
+     * contain. Used by {@link #anUncertaintyObservedOnceIsLatchedAndNeverRevoked}.
+     */
+    private static final class FlappingFlakyResource implements com.mraibo.cminsight.core.CloseStateAware,
+            com.mraibo.cminsight.core.CloseOutcomeAware {
+
+        private volatile CloseState state = CloseState.CLOSED_UNCERTAIN;
+
+        @Override
+        public void close() {
+            // The resource closes "successfully"; only its reported outcome is in doubt.
+        }
+
+        @Override
+        public CloseState closeState() {
+            return state;
+        }
+
+        @Override
+        public boolean closedWithUncertainResources() {
+            return state == CloseState.CLOSED_UNCERTAIN;
+        }
+
+        @Override
+        public String uncertainCloseDetail() {
+            return state == CloseState.CLOSED_UNCERTAIN
+                    ? "flapping resource reported an unproven shutdown" : "";
+        }
+    }
+
+    /**
      * Goal 01C E5. The counter-regression: an ordinary context with no outstanding resources still closes
      * and switches normally, and is never misreported as pending or uncertain.
      *

@@ -27,12 +27,20 @@ package com.mraibo.cminsight.core;
  * <ul>
  *   <li>the answer must be safe to read at any time, including concurrently with {@code close()} and
  *       after it returned;</li>
+ *   <li>the answer must be CHEAP and must never block. It is read while a caller holds a lifecycle lock -
+ *       {@code RepositoryManager} asks the previous repository's context whether its shutdown is finished,
+ *       and refuses to create the next repository until it is. An implementation that waits on I/O, sleeps
+ *       or acquires a contended lock inside {@code closeState()} therefore stalls a repository switch;
+ *       report what you know now instead of waiting for a better answer. A caller that needs to WAIT uses
+ *       its own bounded wait around this call, never a blocking implementation;</li>
  *   <li>{@link CloseState#NOT_CLOSED} before close is requested, {@link CloseState#CLOSING} while
  *       physical resources are still outstanding after close began, and only
  *       {@link CloseState#CLOSED_CLEAN} once every one of them is proven gone;</li>
  *   <li>{@link CloseState#CLOSED_UNCERTAIN} is terminal: a close outcome that is uncertain never
  *       becomes certain later, because nothing in this process can prove the physical resource is
- *       gone;</li>
+ *       gone. An implementation whose state could flap back to {@link CloseState#CLOSED_CLEAN} would
+ *       create a fail-open window in every caller that retries, so this is a hard requirement of the
+ *       contract rather than a property each caller may assume;</li>
  *   <li>a resource that is still physically outstanding must never be reported as
  *       {@link CloseState#CLOSED_CLEAN};</li>
  *   <li>the answer carries no secret - {@link CloseOutcomeAware#uncertainCloseDetail()} names counts and
