@@ -158,6 +158,7 @@ Exact-SHA GitHub Actions (`bootstrap-test`, both events) - all green:
 | `dd6a34c` (review fixes) | `36479626191` success | `36479635585` success |
 | `26894a4` (STATUS.md only) | `36480132293` **failure** | `36480141960` **failure** |
 | `98a97e3` + `2df7c3c` (regression fix + checkpoint) | `36481356205` success | `36481361254` success |
+| `9e7fdf0` (final checkpoint) | `36481852057` success | `36481856632` success |
 
 Each of these runs is exact-SHA: the run's `headSha` equals the commit in the row, so a green row is
 evidence about that revision and no other.
