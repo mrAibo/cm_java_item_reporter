@@ -7,12 +7,15 @@
 - Project: CM Insight
 - Repository: mrAibo/cm_java_item_reporter
 - Active branch: bootstrap/cm-insight-architecture
-- Stage: Bootstrap complete; ready for Harness Goal 01
+- Stage: Bootstrap complete; Harness Goal 01 approved for execution
 - Runtime target: Java 17 LTS, OpenJDK-compatible
 - Build/deployment: javac + jar + bash; single JVM
 - Product safety mode: read-only V1/V2
-- Last completed bootstrap implementation commit: da297e1eb46cace2983e06272a43a3b528a11fe9
-- This STATUS.md update is the checkpoint commit immediately after that implementation commit; on resume confirm actual HEAD with git log -1.
+- Goal policy: dynamic; only the current explicitly approved goal may execute
+- Current approved goal: harness/GOAL_01_CORE_RUNTIME.md
+- Goals 02-05: provisional drafts; architecture review required before any is approved
+- Last completed bootstrap checkpoint before this policy update: b8bd42718b6b64161e094aa5fc68257f376d1af5
+- On resume confirm actual HEAD with git log -1.
 
 ## Completed architecture work
 
@@ -29,6 +32,7 @@
 - Fixed retention viewer for V1 and retention administration as a later disabled-by-default module.
 - Fixed configurable classification rules instead of hard-coded SAP/NON-SAP.
 - Fixed Versions and Parts as research gates: no guessed SQL.
+- Fixed dynamic-goal workflow: after each approved Harness goal, stop for architecture/code review before approving the next goal.
 
 ## Bootstrap files created
 
@@ -82,11 +86,11 @@ Java bootstrap:
 Harness:
 
 - harness/MASTER_GOAL.md
-- GOAL_01_CORE_RUNTIME.md
-- GOAL_02_IBM_CM_RETENTION.md
-- GOAL_03_FAST_ANALYTICS.md
-- GOAL_04_CACHE_REPORTS_UI.md
-- GOAL_05_VERSIONS_PARTS_RESEARCH.md
+- GOAL_01_CORE_RUNTIME.md — APPROVED
+- GOAL_02_IBM_CM_RETENTION.md — PROVISIONAL
+- GOAL_03_FAST_ANALYTICS.md — PROVISIONAL
+- GOAL_04_CACHE_REPORTS_UI.md — PROVISIONAL
+- GOAL_05_VERSIONS_PARTS_RESEARCH.md — PROVISIONAL
 
 CI:
 
@@ -96,8 +100,8 @@ CI:
 ## Validation status
 
 - GitHub commits and branch creation succeeded.
-- A local git clone/build could not be executed from the current assistant container because that environment could not resolve github.com.
-- The bootstrap CI workflow was committed, but no workflow run was visible immediately after the push. Do not claim CI passed until a run is actually observed.
+- A local git clone/build could not be executed from the previous assistant container because that environment could not resolve github.com.
+- The bootstrap CI workflow was committed, but no completed workflow run had been observed at the last check. Do not claim CI passed until verified.
 - No IBM CM live test has been performed for this new project yet.
 - No DB2/Oracle live statistics query has been performed yet.
 - Proprietary IBM/Oracle JARs were intentionally not committed.
@@ -105,7 +109,7 @@ CI:
 ## Current limitations
 
 - RepositoryProfileLoader and RepositoryManager are not implemented yet.
-- Generic BoundedPool is a bootstrap implementation and still needs the Goal 01 concurrency hardening/review.
+- Generic BoundedPool is a bootstrap implementation and still needs Goal 01 concurrency hardening/review.
 - IBM DKDatastoreICM adapter is not implemented yet.
 - Retention viewer business implementation is not implemented yet.
 - JDBC pools/root resolver/statistics are not implemented yet.
@@ -115,22 +119,31 @@ CI:
 
 ## Exact next goal
 
-Execute:
+Execute only:
 
 1. harness/MASTER_GOAL.md
 2. harness/GOAL_01_CORE_RUNTIME.md
 
 Goal 01 should use subagents for concurrency/pool review, security/config review, and independent tests/reliability review, with the lead agent integrating all changes.
 
+After Goal 01 completes, Harness must:
+
+- update STATUS.md with exact results;
+- set next goal to **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**;
+- stop;
+- not execute GOAL_02 automatically.
+
+The user will return the Goal 01 result/STATUS/commit for architecture and code review. The next goal will be approved or rewritten based on the actual implementation.
+
 ## Resume instruction for a new session
 
 Use this prompt:
 
-"Continue the CM Insight project in mrAibo/cm_java_item_reporter. Read STATUS.md first, then README.md, ARCHITECTURE.md, REQUIREMENTS.md, DATA_MODEL.md, SECURITY.md, IMPLEMENTATION_PLAN.md, DEEPSEEK_HARNESS_PLAN.md and harness/MASTER_GOAL.md. Confirm the current branch/HEAD and do not redo completed bootstrap work. Continue from the Exact next goal in STATUS.md. Keep the architecture fixed unless I explicitly approve a change. At the end, build/test what is actually available, commit coherent changes, and update STATUS.md with the exact checkpoint."
+"Continue the CM Insight project in mrAibo/cm_java_item_reporter. Read STATUS.md first, then README.md, ARCHITECTURE.md, REQUIREMENTS.md, DATA_MODEL.md, SECURITY.md, IMPLEMENTATION_PLAN.md, DEEPSEEK_HARNESS_PLAN.md and harness/MASTER_GOAL.md. Confirm the current branch/HEAD and do not redo completed bootstrap work. Execute only the explicitly APPROVED goal recorded in STATUS.md. At the end, build/test what is actually available, commit coherent changes, update STATUS.md, set the next goal to NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED, and stop."
 
 ## Mandatory checkpoint rule
 
-At the end of every substantial goal update this file with:
+At the end of every substantial approved goal update this file with:
 
 - date/time
 - branch and verified HEAD/commit reference
@@ -140,5 +153,5 @@ At the end of every substantial goal update this file with:
 - live IBM/DB tests actually run or explicitly not run
 - unresolved failures and risks
 - architecture changes only when user-approved
-- exact next goal
-- a copy/paste resume instruction
+- next goal status: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED
+- a copy/paste resume/review instruction

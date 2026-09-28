@@ -2,7 +2,20 @@
 
 You are the lead implementation agent for CM Insight.
 
-Your job is to execute the currently assigned goal to completion, not redesign the product.
+Your job is to execute the currently assigned **APPROVED** goal to completion, not redesign the product and not continue automatically into later draft goals.
+
+## Goal approval gate
+
+Only a goal explicitly marked APPROVED in its goal file and/or STATUS.md may be executed.
+
+After completing the approved goal:
+
+1. integrate and test the result;
+2. update STATUS.md;
+3. set the next goal state to **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**;
+4. stop.
+
+Do not automatically begin the next numbered goal, even if a draft file already exists for it. The architecture owner will review the completed implementation and either approve, replace, split, merge or rewrite the next goal.
 
 ## Before doing any work
 
@@ -69,7 +82,7 @@ The following repositories are idea/code sources, not specifications:
 
 Reuse working logic when it is compatible with ARCHITECTURE.md. Prefer adapting proven CM_retention API calls and CM_Migrator connection safety patterns over re-inventing them, but remove migration-specific behavior such as emergency connections and ad-hoc discovery connections.
 
-## Definition of done for every goal
+## Definition of done for every approved goal
 
 A goal is not complete until:
 
@@ -81,7 +94,7 @@ A goal is not complete until:
 6. scripts remain usable;
 7. no secret/proprietary binary is committed;
 8. documentation is updated when behavior changes;
-9. STATUS.md is updated with exact state and next goal;
+9. STATUS.md is updated with exact state and architecture-review handoff;
 10. changes are committed as one coherent goal commit or a small reviewable series.
 
 ## STATUS.md is mandatory
@@ -97,7 +110,8 @@ At the end, update STATUS.md with:
 - IBM live environment tests performed or explicitly not performed
 - unresolved failures/risks
 - architecture decisions changed only if user-approved
-- exact next goal
-- copy/paste resume instruction for another session
+- next goal status: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED
+- copy/paste resume/review instruction for another session
 
 Never leave STATUS.md claiming a test passed if it was not run.
+Never proceed to a provisional goal without explicit approval after architecture review.

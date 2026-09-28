@@ -1,5 +1,7 @@
 # Goal 03 - Fast DB2/Oracle analytics and bounded parallel scan
 
+**Status: PROVISIONAL DRAFT — DO NOT EXECUTE WITHOUT EXPLICIT APPROVAL AFTER ARCHITECTURE REVIEW**
+
 ## Objective
 
 Implement high-performance read-only statistics for large IBM CM repositories.
@@ -92,4 +94,4 @@ Optimize elapsed scan time under a bounded, production-safe load. Do not maximiz
 
 ## Acceptance
 
-A refresh scans ItemTypes in bounded parallel fashion on DB2 and Oracle adapters, reports partial failures, and publishes freshness/duration. Versions/Parts remain unavailable. Update STATUS.md; next goal Goal 04.
+This draft may be rewritten after earlier-goal review. If later explicitly approved and completed, stop for architecture review again instead of automatically starting another numbered goal.

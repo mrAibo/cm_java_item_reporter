@@ -1,5 +1,7 @@
 # Goal 04 - Cache/history, reports and complete operator Web UI
 
+**Status: PROVISIONAL DRAFT — DO NOT EXECUTE WITHOUT EXPLICIT APPROVAL AFTER ARCHITECTURE REVIEW**
+
 ## Objective
 
 Turn the backend into a usable internal administration console while preserving offline, dependency-light operation.
@@ -80,4 +82,4 @@ Recheck all routes for authentication except minimal health. Validate HTML/JSON 
 
 ## Acceptance
 
-An operator can use the application end-to-end without command-line interaction after startup. Build, tests and read-only safety pass. Update STATUS.md; next goal Goal 05.
+This draft may be rewritten after earlier-goal review. If later explicitly approved and completed, stop for architecture review again instead of automatically starting another numbered goal.

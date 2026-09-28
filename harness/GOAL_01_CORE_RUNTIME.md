@@ -1,5 +1,7 @@
 # Goal 01 - Production-grade core runtime
 
+**Status: APPROVED / EXECUTE**
+
 ## Objective
 
 Turn the bootstrap core into a robust offline application foundation without requiring IBM CM libraries for core tests.
@@ -91,4 +93,11 @@ Add dependency-free tests/self-tests for:
 
 ## Acceptance
 
-No IBM SDK is required for this goal's test suite. build.sh and tests must pass on JDK 17. Update STATUS.md and set next goal to Goal 02.
+No IBM SDK is required for this goal's test suite. build.sh and tests must pass on JDK 17.
+
+At completion:
+
+- update STATUS.md with exact implementation/test state;
+- set **Next goal: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**;
+- stop and wait for architecture/code review;
+- do **not** automatically execute GOAL_02.

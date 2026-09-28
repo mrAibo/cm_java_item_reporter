@@ -2,12 +2,18 @@
 
 These goals are intentionally large. The lead agent should use subagents for independent investigation, review and testing, then integrate the result itself.
 
-Run goals in order unless STATUS.md explicitly says otherwise:
+## Approval model
 
-1. GOAL_01_CORE_RUNTIME.md
-2. GOAL_02_IBM_CM_RETENTION.md
-3. GOAL_03_FAST_ANALYTICS.md
-4. GOAL_04_CACHE_REPORTS_UI.md
-5. GOAL_05_VERSIONS_PARTS_RESEARCH.md
+Goals are **not an automatic sequence**.
 
-Always begin with MASTER_GOAL.md.
+- GOAL_01_CORE_RUNTIME.md — **APPROVED / EXECUTE**
+- GOAL_02_IBM_CM_RETENTION.md — **PROVISIONAL DRAFT**
+- GOAL_03_FAST_ANALYTICS.md — **PROVISIONAL DRAFT**
+- GOAL_04_CACHE_REPORTS_UI.md — **PROVISIONAL DRAFT**
+- GOAL_05_VERSIONS_PARTS_RESEARCH.md — **PROVISIONAL DRAFT**
+
+The provisional files preserve design ideas and likely future work. They must be re-reviewed against the actual implementation after each completed goal.
+
+After an approved goal finishes, stop and request architecture review. Do not automatically execute the next numbered file.
+
+Always begin with MASTER_GOAL.md and STATUS.md.

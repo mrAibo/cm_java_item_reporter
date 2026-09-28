@@ -1,5 +1,7 @@
 # Goal 02 - IBM CM adapter, ItemTypes and retention viewer
 
+**Status: PROVISIONAL DRAFT — DO NOT EXECUTE WITHOUT EXPLICIT APPROVAL AFTER ARCHITECTURE REVIEW**
+
 ## Objective
 
 Implement the IBM Content Manager 8.7 read-only adapter and retention viewer using the local IBM SDK libraries.
@@ -96,4 +98,4 @@ Provide clear "IBM adapter unavailable" diagnostics if required local JARs/confi
 
 ## Acceptance
 
-ItemTypes and retention data can be read through the new shared architecture. No write method is exposed. Update STATUS.md; next goal Goal 03.
+This draft may be rewritten after Goal 01 review. If later explicitly approved and completed, stop for architecture review again instead of automatically starting another numbered goal.

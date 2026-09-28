@@ -1,5 +1,7 @@
 # Goal 05 - Versions and Parts correctness research gate
 
+**Status: PROVISIONAL DRAFT — DO NOT EXECUTE WITHOUT EXPLICIT APPROVAL AFTER ARCHITECTURE REVIEW**
+
 ## Objective
 
 Resolve the two intentionally deferred metrics before implementing them.
@@ -48,4 +50,4 @@ Only after the evidence is written into DATA_MODEL.md:
 
 ## Acceptance
 
-Either the metrics are implemented with documented verification, or the goal explicitly concludes that one/both remain unavailable. Both outcomes are valid if evidence is honest. Update STATUS.md with the next extension selected by the user.
+This draft may be rewritten after earlier-goal review. If later explicitly approved and completed, stop for architecture review again. Either verified implementation or an explicit evidence-based "remain unavailable" conclusion is acceptable.
