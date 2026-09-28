@@ -51,6 +51,7 @@ public final class SelfTest {
             BoundedPoolHardeningTest.class,
             RepositoryManagerTest.class,
             RepositoryClosePropagationTest.class,
+            RepositorySwitchQuiescenceTest.class,
             StatisticsContractTest.class,
             RouterTest.class,
             WebServerSocketTest.class);

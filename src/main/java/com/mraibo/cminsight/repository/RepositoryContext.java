@@ -2,6 +2,8 @@ package com.mraibo.cminsight.repository;
 
 import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.core.CloseOutcomeAware;
+import com.mraibo.cminsight.core.CloseState;
+import com.mraibo.cminsight.core.CloseStateAware;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -35,18 +37,62 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * report marks this context uncertain exactly like a thrown close and is recorded on
  * {@link #uncertainCloseReports()}.
  *
- * <p>This class is itself {@link CloseOutcomeAware}: a container that owns a context (or an adapter that
- * does) can ask the same question of it and get the same vocabulary.
+ * <h2>The close outcome is derived, never frozen</h2>
+ *
+ * {@link #close()} returns as soon as each owned resource's {@code close()} has returned - and for a
+ * pool that is not the end of the story, because a resource that is still out on a lease is closed
+ * later, by the thread that returns it. A context that snapshotted its outcome at the end of the first
+ * {@code close()} call would therefore publish a permanent "clean" verdict about a lease that had not
+ * even been closed yet, and {@link RepositoryManager} would create the next repository's connections on
+ * the strength of it.
+ *
+ * <p>So the state is instead <em>derived on every read</em> from the owned close-aware resources plus
+ * the facts this context recorded itself. Consequences, all deliberate:
+ *
+ * <ul>
+ *   <li>an owned pool that is still draining reports {@link CloseState#CLOSING}, and this context
+ *       reports it too - pending, not clean and not uncertain;</li>
+ *   <li>a late lease that comes back quarantined moves the context to
+ *       {@link CloseState#CLOSED_UNCERTAIN}, even though that happened long after {@code close()}
+ *       returned;</li>
+ *   <li>a late lease that comes back clean lets the context reach {@link CloseState#CLOSED_CLEAN}
+ *       afterwards - a switch that was correctly refused earlier is allowed later, without anybody
+ *       having to re-close anything;</li>
+ *   <li>uncertainty is a LATCH, not a derived value: once a resource failed, reported an unreadable
+ *       outcome, or was seen uncertain, no later clean answer can revoke it. A quarantine never clears,
+ *       so this only ever makes the reported state more conservative.</li>
+ * </ul>
+ *
+ * <p>The derivation is monotone in the safe direction - {@code NOT_CLOSED -> CLOSING ->
+ * CLOSED_CLEAN} may each be followed by {@code CLOSED_UNCERTAIN}, and {@code CLOSED_UNCERTAIN} is
+ * final. Every query is read-only: it never closes, waits, or retries anything.
+ *
+ * <p>This class is itself {@link CloseOutcomeAware} and {@link CloseStateAware}: a container that owns a
+ * context (or an adapter that does) can ask the same questions of it and get the same vocabulary.
  */
-public final class RepositoryContext implements CloseOutcomeAware {
+public final class RepositoryContext implements CloseOutcomeAware, CloseStateAware {
 
     private final RepositoryProfile profile;
     private final List<AutoCloseable> resources;
     private final Instant createdAt = Instant.now();
-    private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean closeStarted = new AtomicBoolean();
     private volatile List<String> closeFailures = List.of();
     private volatile List<String> uncertainCloseReports = List.of();
-    private volatile boolean closedWithUncertainResources;
+    /**
+     * The owned resources whose {@code close()} reported uncertainty, in close order.
+     *
+     * <p>Kept as resource REFERENCES, not only as text, so {@link #uncertainCloseReports()} can ask them
+     * again later: a pool slot that becomes quarantined after {@code close()} returned is exactly the case
+     * Goal 01C is about, and the explanation must follow the state.
+     */
+    private volatile List<AutoCloseable> uncertainAtClose = List.of();
+    /**
+     * Latched uncertainty that no later read may revoke: set when a resource failed to close, when a
+     * report could not be read at all, or when a resource was ever observed to report an uncertain
+     * shutdown. Volatile rather than lock-guarded because {@link #closeState()} must stay a cheap,
+     * lock-free, side-effect-free read on a hot switch path.
+     */
+    private volatile boolean uncertainLatched;
 
     public RepositoryContext(RepositoryProfile profile) {
         this(profile, List.of());
@@ -68,7 +114,7 @@ public final class RepositoryContext implements CloseOutcomeAware {
      * @throws IllegalStateException when the context is already closed
      */
     public RepositoryProfile profile() {
-        if (closed.get()) {
+        if (closeStarted.get()) {
             throw new IllegalStateException("RepositoryContext is closed");
         }
         return profile;
@@ -83,8 +129,15 @@ public final class RepositoryContext implements CloseOutcomeAware {
         return createdAt;
     }
 
+    /**
+     * True once {@link #close()} has been called.
+     *
+     * <p>Deliberately says nothing about the PHYSICAL resources: a pool that is still waiting for a lease
+     * to come back is closed to new borrows while a session it owns is still alive. Ask
+     * {@link #closeState()} for that question - this flag answers only "has shutdown begun".
+     */
     public boolean isClosed() {
-        return closed.get();
+        return closeStarted.get();
     }
 
     /** Owned resources, in acquisition order. Exposed for diagnostics only. */
@@ -106,9 +159,41 @@ public final class RepositoryContext implements CloseOutcomeAware {
      * resource instead of an unproven one. The text comes from
      * {@link CloseOutcomeAware#uncertainCloseDetail()} and is expected to name counts and sources only -
      * never a credential, a URL userinfo or a file content.
+     *
+     * <p>Like {@link #closeState()}, this is derived from the owned resources on every read rather than
+     * frozen when {@code close()} returned. That is what keeps the explanation attached to the state: a
+     * pool slot that only becomes quarantined when a late lease comes back would otherwise be reported as
+     * {@code CLOSED_UNCERTAIN} with no reason text at all, and an operator would see "unproven" with no
+     * cause. Reports for resources that were already accounted for during {@code close()} are not
+     * duplicated - each owned resource contributes at most one line.
      */
     public List<String> uncertainCloseReports() {
-        return uncertainCloseReports;
+        if (!closeStarted.get()) {
+            return uncertainCloseReports;
+        }
+        // Ask the owned resources again whenever the outcome is not proven clean. This covers the case
+        // Goal 01C exists for: a pool that was still draining when close() ran and only became
+        // quarantined when a late lease came back. Its stored report is empty by then, and reporting
+        // CLOSED_UNCERTAIN with no reason at all would send an operator looking for nothing.
+        if (!uncertainLatched && closeState() != CloseState.CLOSED_UNCERTAIN) {
+            return uncertainCloseReports;
+        }
+        List<String> current = collectUncertainReports(uncertainAtClose);
+        if (current.isEmpty()) {
+            return uncertainCloseReports;
+        }
+        List<String> merged = new ArrayList<>(uncertainCloseReports.size() + current.size());
+        for (String report : uncertainCloseReports) {
+            if (!merged.contains(report)) {
+                merged.add(report);
+            }
+        }
+        for (String report : current) {
+            if (!merged.contains(report)) {
+                merged.add(report);
+            }
+        }
+        return List.copyOf(merged);
     }
 
     /**
@@ -121,14 +206,67 @@ public final class RepositoryContext implements CloseOutcomeAware {
      * released - but the outcome is uncertain, and new connections of the same kind must therefore not
      * be opened on the strength of it.
      *
-     * <p>False before {@code close()} runs, false after a fully successful close, and immutable once the
-     * first {@code close()} call completed: a later {@code close()} is a no-op. An {@link Error} thrown
-     * by a resource is recorded as a failure too, so the flag is visible even when {@code close()}
+     * <p>False before {@code close()} runs, false after a fully successful close, and false while an
+     * owned resource is merely still draining - draining is unfinished, not uncertain. An {@link Error}
+     * thrown by a resource is recorded as a failure too, so the flag is visible even when {@code close()}
      * rethrows.
+     *
+     * <p>Derived from {@link #closeState()} rather than stored, so a quarantine that happens AFTER
+     * {@code close()} returned (a lease coming back late to a pool this context owns) is still reported
+     * here instead of leaving a stale clean answer behind.
      */
     @Override
     public boolean closedWithUncertainResources() {
-        return closedWithUncertainResources;
+        return closeState() == CloseState.CLOSED_UNCERTAIN;
+    }
+
+    /**
+     * The shutdown state of this context, derived from its owned resources on every read.
+     *
+     * <p>The precedence is fixed and conservative:
+     *
+     * <ol>
+     *   <li>uncertainty - recorded or currently reported by an owned resource - wins over everything,
+     *       because it is terminal and because a physically outstanding resource must never be described
+     *       as anything milder;</li>
+     *   <li>then pending: close has begun and at least one owned close-aware resource has not finished,
+     *       so a physical resource is still outstanding. This is the state that used to be reported as
+     *       clean, and reporting it as clean is exactly the defect Goal 01C closes;</li>
+     *   <li>then {@link CloseState#CLOSED_CLEAN}, only once close has been requested and nothing owned
+     *       answers otherwise;</li>
+     *   <li>otherwise {@link CloseState#NOT_CLOSED}.</li>
+     * </ol>
+     *
+     * <p>An owned resource is only asked once its own {@code close()} has returned. Asking earlier would
+     * be meaningless - an open pool answers {@code NOT_CLOSED} - and could misread a container that is
+     * still being used.
+     */
+    @Override
+    public CloseState closeState() {
+        if (!closeStarted.get()) {
+            return CloseState.NOT_CLOSED;
+        }
+        boolean pending = false;
+        for (int i = resources.size() - 1; i >= 0; i--) {
+            CloseState state = ownedState(resources.get(i));
+            if (state == CloseState.CLOSED_UNCERTAIN) {
+                return CloseState.CLOSED_UNCERTAIN;
+            }
+            if (state == CloseState.CLOSING || state == CloseState.NOT_CLOSED) {
+                // NOT_CLOSED after our close() returned can only mean the resource's own shutdown is not
+                // finished, so the physical resource may still exist. Pending, never clean.
+                pending = true;
+            }
+        }
+        if (uncertainLatched) {
+            return CloseState.CLOSED_UNCERTAIN;
+        }
+        return pending ? CloseState.CLOSING : CloseState.CLOSED_CLEAN;
+    }
+
+    /** True when close was requested and an owned physical resource is still outstanding. */
+    public boolean isDraining() {
+        return closeState() == CloseState.CLOSING;
     }
 
     /**
@@ -162,11 +300,16 @@ public final class RepositoryContext implements CloseOutcomeAware {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
+        if (!closeStarted.compareAndSet(false, true)) {
+            // Idempotent, and deliberately does NOT re-probe or re-close anything: a resource still
+            // draining closure is drained by whoever owns it (the pool closes a returned lease itself),
+            // and a second close() must never resurrect the uncertainty question. The DERIVED state is
+            // what makes a later answer possible, so a no-op here loses nothing.
             return;
         }
         List<String> failures = new ArrayList<>(0);
         List<String> uncertain = new ArrayList<>(0);
+        List<AutoCloseable> uncertainResources = new ArrayList<>(0);
         Error fatal = null;
         for (int i = resources.size() - 1; i >= 0; i--) {
             AutoCloseable resource = resources.get(i);
@@ -174,21 +317,29 @@ public final class RepositoryContext implements CloseOutcomeAware {
                 resource.close();
                 // A normal return is NOT the same statement as "proven closed". A close-aware container
                 // (BoundedPool is the first) returns normally while a member it could not close stays
-                // quarantined, so its own report has to be consulted here - without this, a pool
-                // quarantine would look like a clean shutdown to the switch rule.
+                // quarantined - or while a lease it handed out is still alive - so its own report has to
+                // be consulted here. Without this, either case would look like a clean shutdown to the
+                // switch rule.
                 UncertainOutcome outcome = uncertainOutcomeOf(resource);
                 if (outcome.detail() != null) {
                     uncertain.add(outcome.detail());
+                    uncertainResources.add(resource);
+                    // Latched here as well as recorded: the state must be able to answer
+                    // CLOSED_UNCERTAIN even for a resource that stops reporting it later, and even
+                    // while a DIFFERENT owned resource is still draining.
+                    uncertainLatched = true;
                 }
                 if (outcome.fatal() != null && fatal == null) {
                     fatal = outcome.fatal();
                 }
             } catch (Exception e) {
                 failures.add(describeFailure(resource, e.getMessage()));
+                uncertainLatched = true;
             } catch (Error e) {
                 // Record it, keep releasing the rest, and rethrow afterwards: one hostile resource
                 // must not leave the others open, but an Error is still reported to the caller.
                 failures.add(describeFailure(resource, e.getClass().getName()));
+                uncertainLatched = true;
                 if (fatal == null) {
                     fatal = e;
                 }
@@ -196,13 +347,82 @@ public final class RepositoryContext implements CloseOutcomeAware {
         }
         this.closeFailures = List.copyOf(failures);
         this.uncertainCloseReports = List.copyOf(uncertain);
-        // Publish the outcome BEFORE a possible rethrow, so a caller that unwinds on the Error still
-        // sees an accurate answer, and never AFTER the loop, so a partially released context is never
-        // described as a clean one.
-        this.closedWithUncertainResources = !failures.isEmpty() || !uncertain.isEmpty();
+        this.uncertainAtClose = List.copyOf(uncertainResources);
+        // No final "clean" verdict is published here on purpose. closeState() derives the answer from
+        // the latch and from what the owned resources report NOW, so this context can move from
+        // CLOSING to CLOSED_CLEAN when a late lease returns cleanly, and from CLOSING or
+        // CLOSED_CLEAN to CLOSED_UNCERTAIN when one comes back quarantined. Writing a snapshot here
+        // is precisely the stale-clean defect Goal 01C removes.
         if (fatal != null) {
             throw fatal;
         }
+    }
+
+    /**
+     * Asks every owned resource that is currently uncertain for its value-free explanation, skipping the
+     * ones already accounted for when {@code close()} ran.
+     *
+     * <p>Pure: it records nothing and changes no state. Package-visible for the tests that pin the
+     * derivation.
+     */
+    private List<String> collectUncertainReports(List<AutoCloseable> alreadyAccountedFor) {
+        List<String> collected = new ArrayList<>(0);
+        for (AutoCloseable resource : resources) {
+            if (alreadyAccountedFor.contains(resource)) {
+                continue;
+            }
+            if (resource instanceof CloseOutcomeAware aware) {
+                try {
+                    if (aware.closedWithUncertainResources()) {
+                        collected.add(describeUncertain(resource, aware.uncertainCloseDetail()));
+                    }
+                } catch (Exception e) {
+                    collected.add(unreadableReport(resource, e.getClass().getName()));
+                } catch (Error e) {
+                    collected.add(unreadableReport(resource, e.getClass().getName()));
+                }
+            }
+        }
+        return collected;
+    }
+
+    /**
+     * The state of one owned resource, as far as it can be observed.
+     *
+     * <p>An ordinary {@link AutoCloseable} cannot answer and is trusted, exactly as before: it is
+     * treated as clean once its own {@code close()} returned. A {@link CloseStateAware} is asked
+     * directly. A {@link CloseOutcomeAware} that cannot describe its state is mapped from the boolean
+     * question it does answer, so Goal 01B's implementations keep working: uncertain stays uncertain,
+     * and "not uncertain" is taken as finished.
+     *
+     * <p>A report that cannot be read at all is NOT evidence of a clean shutdown, so it is treated as
+     * uncertain, which also latches. Reporting is done separately by
+     * {@link #uncertainOutcomeOf(AutoCloseable)}; this method is the pure state projection and never
+     * records anything.
+     */
+    private static CloseState ownedState(AutoCloseable resource) {
+        if (resource instanceof CloseStateAware aware) {
+            try {
+                CloseState state = aware.closeState();
+                return state == null ? CloseState.CLOSED_UNCERTAIN : state;
+            } catch (Exception e) {
+                return CloseState.CLOSED_UNCERTAIN;
+            } catch (Error e) {
+                return CloseState.CLOSED_UNCERTAIN;
+            }
+        }
+        if (resource instanceof CloseOutcomeAware aware) {
+            try {
+                return aware.closedWithUncertainResources()
+                        ? CloseState.CLOSED_UNCERTAIN
+                        : CloseState.CLOSED_CLEAN;
+            } catch (Exception e) {
+                return CloseState.CLOSED_UNCERTAIN;
+            } catch (Error e) {
+                return CloseState.CLOSED_UNCERTAIN;
+            }
+        }
+        return CloseState.CLOSED_CLEAN;
     }
 
     /**
@@ -265,7 +485,7 @@ public final class RepositoryContext implements CloseOutcomeAware {
     public String toString() {
         return "RepositoryContext[repository=" + profile.id()
                 + ", resources=" + resources.size()
-                + ", closed=" + closed.get()
-                + ", uncertain=" + closedWithUncertainResources + "]";
+                + ", closed=" + closeStarted.get()
+                + ", closeState=" + closeState() + "]";
     }
 }

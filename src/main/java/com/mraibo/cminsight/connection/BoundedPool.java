@@ -1,6 +1,8 @@
 package com.mraibo.cminsight.connection;
 
 import com.mraibo.cminsight.core.CloseOutcomeAware;
+import com.mraibo.cminsight.core.CloseState;
+import com.mraibo.cminsight.core.CloseStateAware;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -53,6 +55,24 @@ import java.util.concurrent.locks.ReentrantLock;
  * still alive. Bounded-but-slower was chosen over fast-but-overshooting because the hard bound is a
  * non-negotiable architecture rule.
  *
+ * <h2>Shutdown has a state, not just an uncertainty flag</h2>
+ *
+ * {@link #close()} returns as soon as the idle resources are released; a resource that is still out on a
+ * lease is closed later, by the thread that returns it. The pool therefore reports a
+ * {@link CloseState} rather than a boolean:
+ *
+ * <ul>
+ *   <li>{@link CloseState#NOT_CLOSED} while the pool is in service;</li>
+ *   <li>{@link CloseState#CLOSING} from the moment close begins until the last leased, creating or
+ *       retiring slot has finished - the pool is closed to new borrows, but a physical resource is still
+ *       alive, so this is NOT a clean shutdown;</li>
+ *   <li>{@link CloseState#CLOSED_CLEAN} once every slot is proven released and nothing is quarantined;</li>
+ *   <li>{@link CloseState#CLOSED_UNCERTAIN} once any slot is quarantined.</li>
+ * </ul>
+ *
+ * <p>{@link #isClosed()} keeps its original meaning - close was requested - so it says nothing about
+ * whether the physical resources are gone. {@link #closeState()} is the question to ask for that.
+ *
  * <h2>Usage rotation cannot be forgotten</h2>
  *
  * Every completed borrow/use/close cycle counts as one usage automatically, so a caller that only uses
@@ -62,7 +82,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * @param <T> pooled resource type
  */
-public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeAware {
+public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeAware, CloseStateAware {
 
     /** Why a resource is being taken out of service. */
     private enum Rotation {
@@ -373,6 +393,12 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
     /**
      * Waits until every lease has been returned and every in-flight creation or close has finished.
      *
+     * <p>Deliberately unchanged by Goal 01C: this answers "has everything settled?", which is a useful
+     * question while the pool is still open (a maintenance sweep, for example). It is NOT the shutdown
+     * question - an open pool with nothing outstanding is perfectly quiescent and must still report
+     * true here, or every existing caller would be broken by a semantic change it never asked for. Ask
+     * {@link #closeState()} whether the SHUTDOWN is clean.
+     *
      * @return true when the pool became quiescent within the timeout
      */
     public boolean awaitQuiescence(Duration timeout) throws InterruptedException {
@@ -390,6 +416,41 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
                 }
                 capacityChanged.awaitNanos(remaining);
             }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * The shutdown state of this pool, read under the same lock that authorises every capacity change.
+     *
+     * <p>The three-way answer is the point. Before Goal 01C a caller could only ask
+     * {@link #closedWithUncertainResources()}, which is {@code false} both for a pool that released
+     * everything AND for a pool that is still waiting for a lease to come back - so a repository switch
+     * reading only that flag would create the next repository's connections while an old one was
+     * demonstrably still alive. {@link CloseState#CLOSING} is that second case, and it is neither clean
+     * nor uncertain: the resource is not leaking, it is simply still in use.
+     *
+     * <p>Ordering matters and is fixed here: {@code CLOSED_UNCERTAIN} is checked before anything else, so
+     * a quarantined slot can never be described as pending, and pending can never be described as clean.
+     */
+    @Override
+    public CloseState closeState() {
+        lock.lock();
+        try {
+            if (!closed) {
+                return CloseState.NOT_CLOSED;
+            }
+            if (quarantinedCount > 0) {
+                return CloseState.CLOSED_UNCERTAIN;
+            }
+            if (leasedCount > 0 || creatingCount > 0 || retiringCount > 0) {
+                // Close has begun and a physical resource is still outstanding: a lease is out with its
+                // user, a creation is materialising a session, or a retirement has not finished closing.
+                // None of those is evidence that the resource is gone.
+                return CloseState.CLOSING;
+            }
+            return CloseState.CLOSED_CLEAN;
         } finally {
             lock.unlock();
         }
@@ -435,8 +496,13 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
      *
      * <p>{@code closed} is set before the idle set is drained, so a lease returned concurrently is
      * retired by the returning thread rather than being added to a pool that no longer drains.
-     * Leased resources are closed by the thread that returns them; use
-     * {@link #awaitQuiescence(Duration)} to wait for that to finish.
+     * Leased resources are closed by the thread that returns them; use {@link #closeState()} - or
+     * {@link #awaitQuiescence(Duration)} - to see whether that has finished.
+     *
+     * <p>A normal return therefore means "the idle resources are released and no new lease will be
+     * handed out", never "every physical resource is gone". Counting the idle set as retiring before
+     * closing it is what keeps that honest: an in-flight close is still a capacity slot, so the pool
+     * reports {@link CloseState#CLOSING} rather than a clean shutdown until it finishes.
      */
     @Override
     public void close() {
@@ -473,15 +539,16 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
      *
      * <p>A pool that closed everything cleanly reports false, so an ordinary shutdown is never turned
      * into a failure.
+     *
+     * <p>This is deliberately the UNCERTAINTY question, not the SHUTDOWN question, and it answers
+     * {@code false} for a pool that is still draining an outstanding lease. That case is not uncertain -
+     * it is unfinished - and it is reported by {@link #closeState()} as {@link CloseState#CLOSING}.
+     * Every caller that must know whether the physical resources are gone has to consult the state;
+     * this boolean alone cannot express it.
      */
     @Override
     public boolean closedWithUncertainResources() {
-        lock.lock();
-        try {
-            return quarantinedCount > 0;
-        } finally {
-            lock.unlock();
-        }
+        return closeState() == CloseState.CLOSED_UNCERTAIN;
     }
 
     @Override
@@ -911,6 +978,7 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
 
     @Override
     public String toString() {
-        return "BoundedPool[name=" + name + ", size=" + size + ", closed=" + closed + "]";
+        return "BoundedPool[name=" + name + ", size=" + size + ", closed=" + closed
+                + ", closeState=" + closeState() + "]";
     }
 }
