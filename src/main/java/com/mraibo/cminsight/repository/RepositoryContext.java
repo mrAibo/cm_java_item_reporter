@@ -4,12 +4,17 @@ import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.core.CloseOutcomeAware;
 import com.mraibo.cminsight.core.CloseState;
 import com.mraibo.cminsight.core.CloseStateAware;
+import com.mraibo.cminsight.core.CmPoolDiagnostics;
+import com.mraibo.cminsight.core.RepositoryServices;
+import com.mraibo.cminsight.metadata.MetadataRepository;
+import com.mraibo.cminsight.retention.RetentionRepository;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -80,6 +85,7 @@ public final class RepositoryContext implements CloseOutcomeAware, CloseStateAwa
 
     private final RepositoryProfile profile;
     private final List<AutoCloseable> resources;
+    private final RepositoryServices services;
     private final Instant createdAt = Instant.now();
     private final AtomicBoolean closeStarted = new AtomicBoolean();
     private volatile List<String> closeFailures = List.of();
@@ -101,17 +107,34 @@ public final class RepositoryContext implements CloseOutcomeAware, CloseStateAwa
     private volatile boolean uncertainLatched;
 
     public RepositoryContext(RepositoryProfile profile) {
-        this(profile, List.of());
+        this(profile, List.of(), RepositoryServices.NONE);
     }
 
     public RepositoryContext(RepositoryProfile profile, List<? extends AutoCloseable> resources) {
+        this(profile, resources, RepositoryServices.NONE);
+    }
+
+    /**
+     * A context that owns the given resources and exposes the given read services.
+     *
+     * <p>The two are deliberately independent. {@code resources} is what {@link #close()} releases, in
+     * reverse order, and it is what {@link #closeState()} derives the shutdown answer from. {@code
+     * services} is what modules read. A service that owns a closeable - the metadata cache does - is
+     * passed in BOTH lists: once as a service so it can be read, and once as a resource so its lifetime
+     * is tied to the context instead of leaking with it.
+     */
+    public RepositoryContext(RepositoryProfile profile,
+                             List<? extends AutoCloseable> resources,
+                             RepositoryServices services) {
         this.profile = Objects.requireNonNull(profile, "profile");
         Objects.requireNonNull(resources, "resources");
+        Objects.requireNonNull(services, "services");
         List<AutoCloseable> copy = new ArrayList<>(resources.size());
         for (AutoCloseable resource : resources) {
             copy.add(Objects.requireNonNull(resource, "resource"));
         }
         this.resources = Collections.unmodifiableList(copy);
+        this.services = services;
     }
 
     /**
@@ -149,6 +172,38 @@ public final class RepositoryContext implements CloseOutcomeAware, CloseStateAwa
     /** Owned resources, in acquisition order. Exposed for diagnostics only. */
     public List<AutoCloseable> resources() {
         return resources;
+    }
+
+    /**
+     * Every read service this context owns, whether or not each one is available.
+     *
+     * <p>Safe after {@link #close()}: unlike {@link #profile()}, this does not throw for a closed
+     * context, because a diagnostics page has to be able to describe a repository that is shutting down.
+     * The services themselves are expected to refuse work once their pool is closed, and that refusal is
+     * what a caller reports - not a hidden exception from the accessor.
+     */
+    public RepositoryServices services() {
+        return services;
+    }
+
+    /** The read-only ItemType metadata service, or empty when this context has none. */
+    public Optional<MetadataRepository> metadata() {
+        return services.metadataService();
+    }
+
+    /** The read-only retention viewer service, or empty when this context has none. */
+    public Optional<RetentionRepository> retention() {
+        return services.retentionService();
+    }
+
+    /**
+     * CM pool and adapter diagnostics, or empty when this context has no CM pool.
+     *
+     * <p>Present in core-only mode too, where there is no CM pool at all: a repository may be listed
+     * without an adapter, and the honest answer there is "no pool", not a pool reporting zeros.
+     */
+    public Optional<CmPoolDiagnostics> cmPool() {
+        return services.cmDiagnosticsService();
     }
 
     /** Descriptions of resources that failed to close, if any. */

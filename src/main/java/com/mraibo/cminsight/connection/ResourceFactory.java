@@ -3,8 +3,9 @@ package com.mraibo.cminsight.connection;
 /**
  * Creates and validates the resources owned by a {@link BoundedPool}.
  *
- * <p>Implementations must never block indefinitely and must release whatever they allocated before
- * throwing.
+ * <p>Implementations must never block indefinitely, and must tell the pool the truth about a failed
+ * attempt: either clean up completely, or report that the cleanup is unproven. A partial cleanup is
+ * never reported as a clean one.
  *
  * <h2>Why "release before throwing" is a hard requirement, not a nicety</h2>
  *
@@ -14,8 +15,30 @@ package com.mraibo.cminsight.connection;
  * an implementation opened a CM session or a JDBC connection and then threw without closing it, that
  * resource would be physically alive while the pool reported
  * {@link com.mraibo.cminsight.core.CloseState#CLOSED_CLEAN} - the one state a repository switch is
- * allowed to trust. The pool cannot detect the leak, so the obligation is the implementation's: close
- * what you opened, on every failure path.
+ * allowed to trust. The pool cannot detect the leak.
+ *
+ * <p>So the obligation is split in two, and the second half is now expressible:
+ *
+ * <ul>
+ *   <li><strong>Preferred:</strong> close what you opened before the exception leaves, and throw an
+ *       ordinary exception. The pool releases the reserved slot and the next borrow may create a
+ *       replacement.</li>
+ *   <li><strong>When that cannot be proven:</strong> throw a {@link CreationFailure} with
+ *       {@link CreationFailure.Cleanup#UNPROVEN}. The pool then <em>quarantines</em> the reserved slot -
+ *       it stays consumed for the lifetime of the pool, so no replacement can be created while the old
+ *       resource may still exist. Capacity is deliberately lost rather than the physical hard bound being
+ *       risked.</li>
+ * </ul>
+ *
+ * <p>This is a real distinction, not a formality: an implementation that can allocate a resource and
+ * then fail to remove it - connecting to a server is exactly that shape, because the cleanup of a
+ * half-built session can itself fail - must use {@code UNPROVEN} rather than silently claiming a clean
+ * failure. Reporting {@code PROVEN_CLEAN} for a cleanup that did not actually complete is the one
+ * mistake this contract exists to prevent.
+ *
+ * <p>An ordinary exception keeps its historical meaning - "this attempt left nothing behind" - so every
+ * existing implementation is unaffected. The residual risk is documented in {@code STATUS.md}: a factory
+ * that leaks and then throws an ordinary exception is still invisible to the pool.
  */
 public interface ResourceFactory<T extends AutoCloseable> {
 

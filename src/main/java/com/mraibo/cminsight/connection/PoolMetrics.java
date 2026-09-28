@@ -38,6 +38,14 @@ public record PoolMetrics(
         long replacementCreations,
         long created,
         long createFailures,
+        /**
+         * Creation attempts whose failure reported an UNPROVEN cleanup
+         * ({@link CreationFailure.Cleanup#UNPROVEN}), so their reserved slot was quarantined instead of
+         * released. Separated from {@link #createFailures()} because the two answer different questions:
+         * {@code createFailures} counts attempts that did not produce a resource, while this counts the
+         * ones that also cost the pool a capacity slot for good.
+         */
+        long createQuarantineFailures,
         long closeAttempts,
         long closeSuccesses,
         long closeFailures,

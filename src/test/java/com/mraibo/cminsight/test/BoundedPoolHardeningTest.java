@@ -519,6 +519,12 @@ public class BoundedPoolHardeningTest {
      * deliberate, reviewed change of the metrics contract, which is the intent of A4 - only the future
      * CM/JDBC adapter can say what a reconnect is, so the pool publishes no such counter at all.
      *
+     * <p>Deliberately extended by Goal 02 with {@code createQuarantineFailures}: a failed creation whose
+     * cleanup could not be proven now quarantines its reserved slot, and that event has to be visible
+     * next to {@code createFailures} or an operator could not tell a harmless failed attempt from one
+     * that permanently cost the pool a capacity slot. The set is still exact, so any further name - a
+     * reconnect alias, another ambiguous 'closed' counter - still fails this test.
+     *
      * <p>Fails against the pre-Goal-01A {@code PoolMetrics}, which published
      * {@code reconnectAttempts()}/{@code reconnectSuccesses()}/{@code reconnectFailures()} plus one
      * ambiguous {@code closed()} counter.
@@ -536,6 +542,7 @@ public class BoundedPoolHardeningTest {
                 "name", "configuredSize", "available", "leased", "creating", "retiring", "quarantined",
                 "borrowCount", "borrowTimeoutCount", "averageBorrowWaitMs", "maxBorrowWaitMs",
                 "createAttempts", "initialCreations", "replacementCreations", "created", "createFailures",
+                "createQuarantineFailures",
                 "closeAttempts", "closeSuccesses", "closeFailures",
                 "validationFailures", "ageRotations", "operationRotations", "unhealthyRotations",
                 "automaticUsages", "explicitOperations",

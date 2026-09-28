@@ -324,13 +324,29 @@ public final class RepositoryManager implements AutoCloseable {
                 // Throwable, not Exception: an Error from the factory must not leave the manager stuck in
                 // INITIALIZING with no recorded failure and a half-built context published nowhere. It is
                 // recorded, the state becomes FAILED, and it still reaches the caller.
-                if (created != null) {
-                    // The context is unpublished and will never be activated: retain then close it, so a
-                    // still-draining resource in a failed activation is refused by the same rule as a
-                    // switch, instead of vanishing with the exception.
-                    unpublishedClosing = created;
-                    CloseOutcome outcome = closeContext(created, "failed activation of '" + profile.id() + "'");
-                    maybeReleaseLatch(created, outcome);
+                //
+                // TWO ways a failed activation can leave physical resources behind, and both must end up
+                // retained rather than dropped:
+                //
+                //   1. the factory RETURNED a context and validation rejected it - `created` is non-null;
+                //   2. the factory threw an ActivationFailedException carrying the partially built context
+                //      it allocated before failing. The manager can only close what a factory hands over,
+                //      so a factory that allocated a pool and then failed MUST report it this way; losing
+                //      that reference would let the next activation open a second pool on top of a live
+                //      first one, which is the same defect Goal 01C removed from the switch path.
+                //
+                // In both cases the context is unpublished, retained on the latch, and closed through the
+                // same close-outcome path a switch uses, so "CLOSED_CLEAN lets a later activation proceed /
+                // CLOSING refuses as PENDING / CLOSED_UNCERTAIN refuses permanently" holds identically.
+                RepositoryContext cleanup = created;
+                if (cleanup == null && e instanceof ActivationFailedException activationFailure) {
+                    cleanup = activationFailure.cleanupContext().orElse(null);
+                }
+                if (cleanup != null) {
+                    unpublishedClosing = cleanup;
+                    CloseOutcome outcome = closeContext(cleanup,
+                            "failed activation of '" + profile.id() + "'");
+                    maybeReleaseLatch(cleanup, outcome);
                 }
                 lastFailure = describe(e);
                 refusal = Refusal.ACTIVATION_FAILED;

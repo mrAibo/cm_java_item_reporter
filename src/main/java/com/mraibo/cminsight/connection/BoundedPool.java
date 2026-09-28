@@ -145,6 +145,7 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
     private final AtomicLong replacementCreations = new AtomicLong();
     private final AtomicLong created = new AtomicLong();
     private final AtomicLong createFailures = new AtomicLong();
+    private final AtomicLong createQuarantineFailures = new AtomicLong();
     private final AtomicLong closeAttempts = new AtomicLong();
     private final AtomicLong closeSuccesses = new AtomicLong();
     private final AtomicLong closeFailures = new AtomicLong();
@@ -226,6 +227,10 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
         }
 
         List<Entry<T>> entries = new ArrayList<>(size);
+        // A creation attempt that rolled the pool back with an UNPROVEN cleanup keeps its reserved slot
+        // quarantined instead of being released, and the reservation it used must therefore not be part
+        // of the blanket rollback below.
+        boolean unprovenCreation = false;
         try {
             for (int i = 0; i < size; i++) {
                 entries.add(newEntry(true));
@@ -238,9 +243,18 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
             // freed only when close() returned normally, and quarantined when the outcome is uncertain.
             // Decrementing creatingCount while closing would free capacity for resources that may still
             // exist.
+            //
+            // The attempt that FAILED is not in `entries` - the pool never received its resource - so its
+            // own reservation is resolved here. It is released only when the failure proved that nothing
+            // was left behind; an unproven cleanup is quarantined so no replacement can be created while
+            // the physical resource may still exist.
+            unprovenCreation = quarantineUnprovenCreation(failure);
             lock.lock();
             try {
-                creatingCount -= size;
+                if (!unprovenCreation) {
+                    creatingCount--;
+                }
+                creatingCount -= entries.size();
                 retiringCount += entries.size();
                 initialized = false;
                 capacityChanged.signalAll();
@@ -477,6 +491,7 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
                     replacementCreations.get(),
                     created.get(),
                     createFailures.get(),
+                    createQuarantineFailures.get(),
                     closeAttempts.get(),
                     closeSuccesses.get(),
                     closeFailures.get(),
@@ -679,7 +694,13 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
         try {
             entry = newEntry(false);
         } catch (Throwable failure) {
-            releaseCreationSlot();
+            // The outcome decides whether the reserved slot may come back. See
+            // quarantineUnprovenCreation: an attempt that could not prove it released what it allocated
+            // keeps its slot consumed, so no replacement can be created on top of a resource that may
+            // still exist.
+            if (!quarantineUnprovenCreation(failure)) {
+                releaseCreationSlot();
+            }
             if (failure instanceof InterruptedException interrupted) {
                 throw interrupted;
             }
@@ -727,6 +748,48 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Converts a reserved creation slot into a quarantined one when the failure reported an unproven
+     * cleanup, and reports whether it did.
+     *
+     * <h2>Why a failed creation can consume capacity</h2>
+     *
+     * <p>The pool cannot see what a factory did before it threw. A factory that opened a physical CM
+     * session and then failed to remove it leaves that session alive while the pool believes the
+     * attempt was empty; releasing the slot would authorise a replacement next to a resource that is
+     * still there, and the configured size is a hard <em>physical</em> bound. So the factory reports the
+     * outcome (see {@link CreationFailure}) and an unproven cleanup keeps the slot consumed for the
+     * lifetime of this pool - the same treatment a slot gets when a {@code close()} throws.
+     *
+     * <p>{@code creating--} and {@code quarantined++} happen in ONE lock section on purpose: the pool
+     * must never be observable with the slot in neither state, because
+     * {@code available + leased + creating + retiring + quarantined} is the identity that bounds every
+     * later creation. A window with the slot in neither set would let the next borrow overshoot.
+     *
+     * <p>An ordinary exception - anything that is not a {@link CreationFailure} - keeps the historical
+     * reading and returns {@code false}, so the slot is released. That is what keeps every existing
+     * {@code ResourceFactory} implementation and every committed Goal 01 assertion working unchanged.
+     * The residual risk of that default is recorded in {@code STATUS.md}.
+     *
+     * @return true when the slot was quarantined, false when the caller must release it
+     */
+    private boolean quarantineUnprovenCreation(Throwable failure) {
+        if (!(failure instanceof CreationFailure creationFailure)
+                || creationFailure.cleanupProven()) {
+            return false;
+        }
+        lock.lock();
+        try {
+            creatingCount--;
+            quarantinedCount++;
+            createQuarantineFailures.incrementAndGet();
+            capacityChanged.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        return true;
     }
 
     private void awaitCapacity(long deadlineNanos) throws InterruptedException, TimeoutException {
