@@ -218,7 +218,18 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
                 throw new IllegalStateException("Pool '" + name + "' is already initialized");
             }
             if (capacityInUse() != 0) {
-                throw new IllegalStateException("Pool '" + name + "' has already handed out resources");
+                // Deliberately refuses on ANY accounted slot, not only on a lease. The message has to say
+                // which, because "already handed out resources" is WRONG for the case that actually
+                // reaches here in production: a slot quarantined by an unproven creation failure. Nothing
+                // was handed out, and a quarantined slot is never reused - it is held for the lifetime of
+                // this pool because the physical resource behind it may still exist. An operator reading
+                // the old text would look for a leaked lease instead of building a new pool.
+                throw new IllegalStateException("Pool '" + name + "' cannot be initialized: " + capacityInUse()
+                        + " of its " + size + " slot(s) are already accounted for (leased=" + leasedCount
+                        + ", creating=" + creatingCount + ", retiring=" + retiringCount
+                        + ", quarantined=" + quarantinedCount + "). A quarantined slot is never reused -"
+                        + " its physical outcome is unknown - so this pool cannot be filled again; create a"
+                        + " new pool instead.");
             }
             initialized = true;
             creatingCount += size;

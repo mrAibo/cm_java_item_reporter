@@ -154,37 +154,42 @@ public final class UncertainCreationTest {
 
         assertIdentity(pool, "before anything happened");
 
-        // Both slots are taken and HELD, because a returned lease makes the resource idle again and the
-        // next borrow would reuse it instead of creating - which is exactly the branch under test here.
+        // Both slots are created and HELD. A returned lease makes its resource idle again and the next
+        // borrow would reuse it instead of creating, which would miss the branch under test entirely.
         Lease<FakeResource> first = pool.borrow();
+        Lease<FakeResource> second = pool.borrow();
         Assert.assertNotNull(first.value(), "C: the first borrow created a real resource");
-        assertIdentity(pool, "after one lease was taken");
+        Assert.assertNotNull(second.value(), "C: the second borrow created a real resource");
+        Assert.assertEquals(2, factory.liveCount(), "C: two physical resources exist, the configured bound");
+        assertIdentity(pool, "with both slots leased");
 
-        // Make the idle resource unhealthy so the next borrow RETIRES it instead of reusing it - that
-        // forces a real creation, which is the branch under test. Without this the fake is healthy and
-        // every later borrow would just reuse the same idle resource.
+        // Retire the first resource and force the replacement creation to fail with an unproven cleanup.
+        // The retire frees its slot for the replacement, so the failing creation is reached - with size 1
+        // it would instead be refused by backpressure before it could create anything.
         first.value().setHealthy(false);
+        first.close();
         factory.failNextCreatesAfterAllocation(1, false);
         Assert.assertThrows(PoolException.class, pool::borrow,
                 "C: the replacement creation fails with an unproven cleanup");
         assertIdentity(pool, "after an unproven creation failure");
 
         Assert.assertEquals(1, pool.metrics().quarantined(), "C: exactly one slot is quarantined");
-        Assert.assertEquals(1, pool.metrics().capacityInUse(),
-                "C: the quarantined slot consumes the pool's whole configured size");
+        Assert.assertEquals(2, pool.metrics().capacityInUse(),
+                "C: one live lease plus one quarantined slot consume the whole configured size");
         Assert.assertEquals(2, factory.liveCount(),
-                "C: two physical resources exist - the retired one and the leaked one - and two is the"
-                        + " configured hard bound, so the bound held");
+                "C: two physical resources are alive: the held one, and the one the unproven failure left"
+                        + " behind with its cleanup unproven (the retired resource is proven closed, so it"
+                        + " is not alive). Two is the configured bound, and the bound held.");
 
-        // Capacity is fully consumed by the quarantined slot, so a further borrow must be refused rather
-        // than authorise a creation on top of what is still there.
+        // Both slots are consumed now, so a further borrow cannot create and must report backpressure
+        // rather than open a session next to one that may still exist.
         int liveBefore = factory.liveCount();
         Assert.assertThrows(TimeoutException.class, pool::borrow,
                 "C: the pool must refuse rather than exceed its configured physical bound");
         Assert.assertEquals(liveBefore, factory.liveCount(),
                 "C: no physical resource was created by the refused borrow");
 
-        first.close();
+        second.close();
         pool.close();
     }
 
@@ -252,23 +257,27 @@ public final class UncertainCreationTest {
         Assert.assertEquals(1, partial.metrics().capacityInUse(),
                 "C: only the quarantined slot is consumed; nothing else is reserved");
 
-        // The pool stays retryable, but only within the capacity it provably still owns. One of the
-        // three slots is gone for good, so the retry can fill at most two.
+        // The pool is deliberately NOT retryable after a partial failure that quarantined a slot, and this
+        // is asserted rather than assumed. Option (B) - reserving `size - quarantined` on a retry - was
+        // considered and rejected: it would let a caller re-fill a pool that has permanently lost a slot
+        // to an unknown physical outcome, and nothing in the production path ever re-initializes a pool
+        // (a quarantined cleanup context is CLOSED_UNCERTAIN, so the manager refuses every later
+        // activation and never calls the factory again). A retry that cannot happen in production is not
+        // worth the extra accounting, and the operator-facing answer is "build a new pool".
         //
-        // Nothing has to be returned first: initialize() failed, so it handed out no lease at all and
-        // the pool is still in construction. (initialize() refuses a pool that has already handed out
-        // resources, and refusing is right - a pool with a lease outstanding is in service.)
+        // What the refusal MUST say is also asserted: the old message read "has already handed out
+        // resources", which is simply wrong here - nothing was handed out, and an operator reading it
+        // would hunt for a leaked lease instead of the quarantine that actually caused it.
         factory.failNextCreatesAfterAllocation(0, false);
-        partial.initialize();
-        Assert.assertEquals(2, partial.metrics().available(),
-                "C: the retry fills exactly the slots that are provably free, not the quarantined one");
-        Assert.assertEquals(3, partial.metrics().capacityInUse(),
-                "C: two filled slots plus one quarantined slot is the whole configured size");
-        assertIdentity(partial, "after a successful retry");
+        IllegalStateException refused = Assert.assertThrows(IllegalStateException.class, partial::initialize,
+                "C: a pool that permanently lost a slot to a quarantine is not re-initializable");
+        Assert.assertTrue(refused.getMessage().contains("quarantined=1"),
+                "C: the refusal names the quarantine as the reason, not a phantom lease: " + refused.getMessage());
+        Assert.assertTrue(refused.getMessage().contains("new pool"),
+                "C: the refusal tells the operator what to do instead: " + refused.getMessage());
+        assertIdentity(partial, "after the refused re-initialization");
         Assert.assertEquals(0, partial.metrics().creating(),
-                "C: a successful initialize leaves nothing in flight either");
-        Assert.assertTrue(partial.metrics().capacityInUse() <= partial.metrics().configuredSize(),
-                "C: the configured physical bound still holds after recovery");
+                "C: the refused re-initialization reserved nothing and left nothing in flight");
 
         pool.close();
         partial.close();
