@@ -152,12 +152,15 @@ factory leak obligation (F7), an unused import (F8) and two uncovered routes (F9
 
 Exact-SHA GitHub Actions (`bootstrap-test`, both events) - all green:
 
-| Commits | push run | pull_request run |
+| Commit | push run | pull_request run |
 | --- | --- | --- |
 | `4b844bd` (initial Goal 01C) | `36477237772` success | `36477243761` success |
 | `dd6a34c` (review fixes) | `36479626191` success | `36479635585` success |
 | `26894a4` (STATUS.md only) | `36480132293` **failure** | `36480141960` **failure** |
-| `98a97e3` (regression fix) | see the final handoff report | see the final handoff report |
+| `98a97e3` + `2df7c3c` (regression fix + checkpoint) | `36481356205` success | `36481361254` success |
+
+Each of these runs is exact-SHA: the run's `headSha` equals the commit in the row, so a green row is
+evidence about that revision and no other.
 
 The `26894a4` failure is recorded deliberately rather than hidden. A documentation-only commit cannot
 change test behaviour, so its two red runs were the first visible symptom of a REAL regression
