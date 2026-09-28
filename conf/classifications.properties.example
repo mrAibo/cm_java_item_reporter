@@ -1,0 +1,4 @@
+classification.sap.label=SAP
+classification.sap.regex=.*(_PRI_|_DOC_|_DAT_|_PK_).*
+classification.default.label=Other
+classification.default.regex=.*
