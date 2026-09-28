@@ -39,6 +39,16 @@ Environment:
                              Default: this installation's root, i.e. the directory that
                              contains bin/ and conf/. It is passed to the JVM as
                              -Dcminsight.home and exported as CM_INSIGHT_HOME
+  CM_INSIGHT_IBM_LIBS        directory holding the IBM CM 8.7 SDK jars when they are NOT
+                             in lib/ibm (a staging directory, a shared mount, a vendor
+                             installation). Additive to lib/ibm, so a one-off real-SDK
+                             check needs no repository change. A relative value is
+                             resolved against the application home. The jars are never
+                             committed: they are proprietary
+  CM_INSIGHT_REQUIRE_IBM     "true" refuses to launch unless at least one IBM SDK jar is
+                             on the class path. Use it when a check is meaningless
+                             without the adapter, so a silently core-only run cannot be
+                             mistaken for a validated one
   CM_INSIGHT_JAVA_OPTS       extra JVM options, word-split on spaces
                              (e.g. "-Xmx512m -Dfile.encoding=UTF-8"); a
                              -Dcminsight.home here is overridden by the launcher
@@ -47,6 +57,11 @@ Common application arguments:
   --config <file>            configuration file
   --validate-config          check credentials and the exposure policy, print the
                              resolved operational paths, then exit
+  --check-repository <id>    activate one repository through the production bounded-pool
+                             path, report the CM API release, the ItemType count and the
+                             retention policy count, shut down through the repository
+                             manager, and fail unless that shutdown is terminal-clean.
+                             Read-only: it performs no IBM CM write
   --version                  print the version and exit
   --self-test                run the in-process self-test and exit
 
@@ -150,6 +165,62 @@ if [ -n "${CM_INSIGHT_JAVA_OPTS:-}" ]; then
   # Intentional word splitting: CM_INSIGHT_JAVA_OPTS holds a list of JVM options.
   # shellcheck disable=SC2206
   JAVA_OPTS=(${CM_INSIGHT_JAVA_OPTS})
+fi
+
+# ---------------------------------------------------------------------------
+# External IBM SDK (Goal 02 section A).
+#
+# The IBM CM SDK jars are proprietary and are never committed to this repository.
+# lib/README.md tells an operator to place them in lib/ibm, which the class-path
+# loop above already picked up. This adds the second, equally supported case: the
+# jars live elsewhere on the host - a staging directory, a shared read-only mount,
+# a vendor installation - and CM_INSIGHT_IBM_LIBS names that directory.
+#
+# The two are additive on purpose: a host can carry a routine SDK in lib/ibm and
+# point at a different build for a one-off check without editing the repository,
+# which is exactly what a real-SDK validation run needs. It sits AFTER the
+# application-home block because a relative value is resolved against the home.
+#
+# The jar count is reported, never assumed. "The class path carries the SDK" and
+# "the adapter is available" are different statements and only the second is
+# evidence: the application reports true availability through its own provider
+# discovery, and this line only says what was put in front of the JVM.
+# ---------------------------------------------------------------------------
+IBM_JAR_COUNT=0
+for jar_file in "${ROOT}"/lib/ibm/*.jar; do
+  [ -e "${jar_file}" ] || continue
+  IBM_JAR_COUNT=$((IBM_JAR_COUNT + 1))
+done
+
+EXTERNAL_IBM_DIR="${CM_INSIGHT_IBM_LIBS:-}"
+if [ -n "${EXTERNAL_IBM_DIR}" ]; then
+  case "${EXTERNAL_IBM_DIR}" in
+    /*|[A-Za-z]:[\\/]*) : ;;
+    *) EXTERNAL_IBM_DIR="${APP_HOME}/${EXTERNAL_IBM_DIR}" ;;
+  esac
+  if [ ! -d "${EXTERNAL_IBM_DIR}" ]; then
+    printf 'ERROR: CM_INSIGHT_IBM_LIBS is set to %s but that is not a directory.\n' "${EXTERNAL_IBM_DIR}" >&2
+    exit 2
+  fi
+  for jar_file in "${EXTERNAL_IBM_DIR}"/*.jar; do
+    [ -e "${jar_file}" ] || continue
+    CP="${CP}${CP_SEP}${jar_file}"
+    IBM_JAR_COUNT=$((IBM_JAR_COUNT + 1))
+  done
+fi
+
+if [ "${IBM_JAR_COUNT}" -gt 0 ]; then
+  printf 'OK: IBM SDK jars on the class path: %s\n' "${IBM_JAR_COUNT}"
+else
+  # Not an error: core-only mode is supported and repository profiles are still
+  # listed. Reported because an operator who expected the adapter needs to see why
+  # activation will refuse.
+  printf 'WARN: no IBM SDK jar on the class path (lib/ibm is empty and CM_INSIGHT_IBM_LIBS is unset); the IBM adapter will report itself unavailable.\n'
+fi
+
+if [ "${CM_INSIGHT_REQUIRE_IBM:-false}" = "true" ] && [ "${IBM_JAR_COUNT}" -eq 0 ]; then
+  printf 'ERROR: CM_INSIGHT_REQUIRE_IBM=true but no IBM SDK jar is on the class path. Place the IBM CM 8.7 SDK jars in lib/ibm, or set CM_INSIGHT_IBM_LIBS to the directory that holds them; see lib/README.md.\n' >&2
+  exit 2
 fi
 
 # -Dcminsight.home comes after CM_INSIGHT_JAVA_OPTS on purpose: the launcher, not a
