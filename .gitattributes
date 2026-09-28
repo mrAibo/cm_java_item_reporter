@@ -1,0 +1,35 @@
+# Line-ending policy.
+#
+# The deployment target is Linux/Unix and the operational scripts are shell scripts, so their endings
+# must be LF. A CRLF shebang ("#!/usr/bin/env bash\r") makes the kernel look for an interpreter
+# literally named "bash\r" and the script dies with "bad interpreter: No such file or directory".
+# Several contributors work on Windows with core.autocrlf=true, so the endings are pinned here rather
+# than left to each machine's local git configuration.
+
+* text=auto
+
+*.sh    text eol=lf
+bin/*   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.properties text eol=lf
+*.properties.example text eol=lf
+*.java  text eol=lf
+*.md    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.txt   text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+# Binary artefacts must never be line-ending converted.
+*.jar   binary
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff2 binary
