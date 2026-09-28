@@ -6,7 +6,9 @@ These goals are intentionally large. The lead agent should use subagents for ind
 
 Goals are **not an automatic sequence**.
 
-- GOAL_01_CORE_RUNTIME.md — **APPROVED / EXECUTE**
+- GOAL_01_CORE_RUNTIME.md — **COMPLETED / REVIEWED**
+- GOAL_01A_REVIEW_HARDENING.md — **COMPLETED / REVIEWED**
+- GOAL_01B_LINUX_LIFECYCLE_AND_CLOSE_PROPAGATION.md — **APPROVED / EXECUTE**
 - GOAL_02_IBM_CM_RETENTION.md — **PROVISIONAL DRAFT**
 - GOAL_03_FAST_ANALYTICS.md — **PROVISIONAL DRAFT**
 - GOAL_04_CACHE_REPORTS_UI.md — **PROVISIONAL DRAFT**
