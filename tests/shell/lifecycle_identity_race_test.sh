@@ -44,19 +44,30 @@
 #   and aborted with exit 1 and
 #   `ERROR: PID <n> was reused by a different process before the health check succeeded`.
 #   This phase requires that same start to succeed (rc=0) AND requires the transient to have
-#   been WITNESSED (`reads as a different process` + `identity is provisional` in the
+#   been WITNESSED (`reads as a different process` + `identity state: provisional` in the
 #   output), so the fixture itself is checked: if the launch transition ever stopped
 #   reproducing, the phase fails loudly instead of passing vacuously. It is also a two-sided
-#   gate: the grace may not become "adopt whatever the pid is now" - PHASE 3 pins that a
-#   foreign PID is still refused, and the transition table is pinned at function level by
-#   the suite.
+#   gate: the grace may not become "adopt whatever the pid is now" - PHASE 3 and PHASE 4 pin
+#   that a never-identifying chain and a foreign PID are still refused.
 #
-# PHASE 3 - an unrelated live process must never be signalled
+# PHASE 3 - a launcher that re-execs through a NON-IDENTITY image (review finding F1)
+#   bin/start.sh decides "PID reuse" with corroboration: after a POSITIVE identity, a
+#   contradictory sample is only a recycle verdict when the pid is PROVEN to be a different
+#   process INSTANCE (its /proc/<pid>/stat start time changed; execve preserves it). The
+#   independent reviewer executed the shape this protects - an identity-positive launcher that
+#   execs an intermediate image naming neither bin/cm-insight, nor cm-insight.jar, nor the main
+#   class - and got a false "PID <n> was reused by a different process" at 2s and 5s. This
+#   phase builds that chain out of the SHIPPED scripts in a sandbox, requires the 2s and 5s
+#   windows to start cleanly (the assertion that FAILS against the pre-F1 code), pins the
+#   start-time invariance the corroboration rests on, and requires a chain that NEVER identifies
+#   to still be refused with nothing published.
+#
+# PHASE 4 - an unrelated live process must never be signalled
 #   A PID file holding a live non-CM-Insight process: stop.sh must report a different
 #   process, remove the stale PID file, exit 0 - and that process must still be alive
-#   afterwards. The startup grace may not weaken the stop-time ownership rule.
+#   afterwards. The startup rules may not weaken the stop-time ownership rule.
 #
-# PHASE 4 - the exact marker must be TIED to the socket that served it (sections C/D)
+# PHASE 5 - the exact marker must be TIED to the socket that served it (sections C/D)
 #   On Linux the socket table spells an IPv4 loopback listener `::ffff:127.0.0.1`, which is
 #   the form the failing CI run showed. stop.sh ties the health answer to the socket it is
 #   about to signal; with raw string equality the marker at 127.0.0.1 and the row
@@ -136,6 +147,15 @@ cleanup() {
     fi
   done
   reap_isolated_port
+  # Fixture leftovers with no PID file and no socket yet (the sandbox launcher/helper images of
+  # a FAILING case, which are still inside their bounded non-identity window). They are matched
+  # by this run's own private work directory, so nothing outside this test's fixtures can match.
+  if [ -n "${WORK}" ] && command -v pgrep >/dev/null 2>&1; then
+    for _p in $(pgrep -f -- "${WORK}" 2>/dev/null); do
+      case "${_p}" in ''|"$$") continue ;; esac
+      kill "${_p}" 2>/dev/null
+    done
+  fi
   if [ -n "${WORK}" ] && [ -d "${WORK}" ]; then rm -rf -- "${WORK}"; fi
   return 0
 }
@@ -209,6 +229,7 @@ else
 fi
 
 CONFIG_EXAMPLE="${ROOT}/conf/application.properties.example"
+CM_BIN="${ROOT}/bin"
 if [ -s "${CONFIG_EXAMPLE}" ]; then
   ok "prerequisite: ${CONFIG_EXAMPLE}"
 else
@@ -293,8 +314,10 @@ make_home() {
 }
 
 cm_run() {
-  # $1 = home, $2 = script name under bin/, rest = script arguments. Runs a repository
+  # $1 = home, $2 = script name under ${CM_BIN}, rest = script arguments. Runs a repository
   # lifecycle script against that home with every repo-visible path redirected into it.
+  # CM_BIN is ${ROOT}/bin except in the sandbox phases, where it is a copy of the SHIPPED
+  # scripts whose launcher is the synthetic one from the fixture.
   _home="$1"
   _script="$2"
   shift 2
@@ -302,7 +325,41 @@ cm_run() {
   CM_INSIGHT_CONFIG="${_home}/conf/application.properties" \
   CM_INSIGHT_RUN_DIR="${_home}/run" \
   CM_INSIGHT_LOG_DIR="${_home}/logs" \
-  "${ROOT}/bin/${_script}" "$@"
+  "${CM_BIN}/${_script}" "$@"
+}
+
+make_sandbox() {
+  # $1 = sandbox dir, $2 = seconds the intermediate NON-IDENTITY image holds.
+  # Builds a self-contained installation from the SHIPPED scripts (so the code under test is
+  # the real bin/start.sh, only copied) plus the real jar, and installs a synthetic launcher
+  # chain that models a WRAPPED launcher (independent review finding F1):
+  #   <sandbox>/bin/cm-insight   identity-positive in this image (a documented identity token),
+  #                              then execs the intermediate image below
+  #   <sandbox>/helper-launch.sh command line names neither cm-insight.jar, nor bin/cm-insight,
+  #                              nor the main class: a bounded NON-IDENTITY window
+  #   -> exec <real java> -Dcminsight.home=... -cp <jar> com.mraibo.cminsight.app.Main
+  _sb="$1"
+  _secs="$2"
+  mkdir -p "${_sb}/build" "${_sb}/conf" || return 1
+  cp -R "${ROOT}/bin" "${_sb}/bin" || return 1
+  cp -f "${JAR}" "${_sb}/build/cm-insight.jar" || return 1
+  cp -f "${CONFIG_EXAMPLE}" "${_sb}/conf/application.properties.example" || return 1
+  cat > "${_sb}/bin/cm-insight" <<EOF
+#!/usr/bin/env bash
+set -u
+sleep "\${CM_INSIGHT_F1_STAGE:-0.4}"
+exec "${_sb}/helper-launch.sh" --release
+EOF
+  cat > "${_sb}/helper-launch.sh" <<EOF
+#!/usr/bin/env bash
+set -u
+sleep "${_secs}"
+exec "${JAVA_BIN}" -Dcminsight.home="\${CM_INSIGHT_HOME:-}" \\
+  -cp "${_sb}/build/cm-insight.jar" \\
+  com.mraibo.cminsight.app.Main --config "\${CM_INSIGHT_CONFIG:-}"
+EOF
+  chmod +x "${_sb}/bin/cm-insight" "${_sb}/helper-launch.sh" || return 1
+  return 0
 }
 
 probe_port() {
@@ -331,12 +388,12 @@ all_stopped_and_silent() {
 }
 
 one_cycle() {
-  # $1 = home, $2 = cycle number. Runs start -> status -> stop, asserting every step in
-  # order (so a failure is reported at the step that failed, with that step's raw output).
+  # $1 = home, $2 = label, $3 = output directory. Runs start -> status -> stop, asserting
+  # every step in order (so a failure is reported at the step that failed, with that step's
+  # raw output).
   _h="$1"
-  _n="$2"
-  _label="cycle ${_n}/${CYCLES}"
-  _dir="${WORK}/cycle-${_n}"
+  _label="$2"
+  _dir="$3"
   mkdir -p "${_dir}" 2>/dev/null
 
   cm_run "${_h}" start.sh --timeout 45 > "${_dir}/start.log" 2>&1
@@ -394,7 +451,7 @@ one_cycle() {
 # ===========================================================================
 # PHASE 1 - bounded soak: real start/status/stop cycles
 # ===========================================================================
-note "PHASE 1/4: ${CYCLES} real start/status/stop cycles on port ${PORT} (isolated home)"
+note "PHASE 1/5: ${CYCLES} real start/status/stop cycles on port ${PORT} (isolated home)"
 SOAK_HOME="${WORK}/soak/home"
 if ! make_home "${SOAK_HOME}"; then
   bad "PHASE 1: could not build the isolated home/configuration under ${SOAK_HOME}"
@@ -402,7 +459,7 @@ else
   ok "PHASE 1: isolated home ${SOAK_HOME} (config derived from conf/application.properties.example, web.bind=127.0.0.1, web.port=${PORT})"
   _i=1
   while [ "${_i}" -le "${CYCLES}" ]; do
-    one_cycle "${SOAK_HOME}" "${_i}"
+    one_cycle "${SOAK_HOME}" "cycle ${_i}/${CYCLES}" "${WORK}/cycle-${_i}"
     _i=$(( _i + 1 ))
   done
 fi
@@ -410,7 +467,7 @@ fi
 # ===========================================================================
 # PHASE 2 - the launch transition (deterministic; fails against the pre-fix code)
 # ===========================================================================
-note "PHASE 2/4: launch transition with the forked child blocked before its first execve"
+note "PHASE 2/5: launch transition with the forked child blocked before its first execve"
 T="${WORK}/transition"
 if ! make_home "${T}/home"; then
   bad "PHASE 2: could not build the isolated home/configuration under ${T}/home"
@@ -433,9 +490,11 @@ else
 
   # Wait for the transient to be WITNESSED (post-fix) or for start.sh to finish (pre-fix:
   # it aborts with the "reused by a different process" error on its very first sample).
+  # The decisive token is "reads as a different process": both the provisional and the
+  # same-instance branches print it, so the guard cannot silently stop reproducing.
   _waited=0
   while [ "${_waited}" -lt 100 ]; do
-    if grep -q 'identity is provisional' "${T}/start.log" 2>/dev/null; then break; fi
+    if grep -q 'reads as a different process' "${T}/start.log" 2>/dev/null; then break; fi
     if ! kill -0 "${START_WRAPPER}" 2>/dev/null; then break; fi
     sleep 0.1
     _waited=$(( _waited + 1 ))
@@ -450,10 +509,10 @@ else
   wait "${START_WRAPPER}"
   S_RC=$?
 
-  if grep -q 'identity is provisional' "${T}/start.log" 2>/dev/null; then
-    ok "PHASE 2: the launch transition WAS witnessed: start.sh saw a contradictory identity reading, called it provisional and kept waiting (the pre-fix code never prints this line)"
+  if grep -q 'identity state: provisional' "${T}/start.log" 2>/dev/null; then
+    ok "PHASE 2: the launch transition WAS witnessed: start.sh saw a contradictory identity reading while the identity was still provisional and kept waiting (the pre-fix code never prints this line)"
   else
-    bad "PHASE 2: fixture check failed - the launch transition was never witnessed (no 'identity is provisional' line)"
+    bad "PHASE 2: fixture check failed - the launch transition was never witnessed (no 'identity state: provisional' line)"
   fi
   raw "${T}/start.log"
 
@@ -503,67 +562,235 @@ else
 fi
 
 # ===========================================================================
-# PHASE 3 - a foreign live process is never signalled (the grace must not weaken this)
+# PHASE 3 - a launcher that re-execs through a NON-IDENTITY image (review finding F1)
 # ===========================================================================
-note "PHASE 3/4: a PID file holding an unrelated live process must never be signalled"
+note "PHASE 3/5: a bounded non-identity image after a positive identity is NOT PID reuse"
+# The rule itself, pinned row by row (deterministic, no processes needed): every verdict the
+# state machine may reach. The rows that must NOT be a recycle verdict are the F1 ones; the
+# only decisive latch is a CHANGED process instance.
+_ident_rows="
+provisional 0 false unknown positive
+provisional 0 true unknown positive
+positive 0 false unknown positive
+provisional 2 false unknown provisional
+provisional 2 true unknown provisional
+positive 2 false unknown positive
+positive 2 true unknown positive
+provisional 1 false same provisional
+provisional 1 true same provisional
+provisional 1 false unknown provisional
+provisional 1 true unknown recycle
+positive 1 false same provisional
+positive 1 true same provisional
+positive 1 false unknown provisional
+positive 1 true unknown provisional
+positive 1 false different recycle
+positive 1 true different recycle
+provisional 1 false different recycle
+provisional 1 true different recycle
+"
+while IFS=' ' read -r _st _rc _gr _inst _want; do
+  [ -n "${_st}" ] || continue
+  _got="$(ci_start_identity_next "${_st}" "${_rc}" "${_gr}" "${_inst}")"
+  if [ "${_got}" = "${_want}" ]; then
+    ok "PHASE 3: identity rule: state=${_st} rc=${_rc} grace=${_gr} instance=${_inst} -> ${_got}"
+  else
+    bad "PHASE 3: identity rule: state=${_st} rc=${_rc} grace=${_gr} instance=${_inst} -> ${_got} (expected ${_want})"
+  fi
+done <<< "${_ident_rows}"
+
+# The corroboration evidence the rule above relies on, pinned directly: /proc/<pid>/stat
+# starttime is stable across an execve of the SAME pid. The child is held in its pre-exec
+# image by a FIFO (the same lever PHASE 2 uses), read, released and read again.
+ST="${WORK}/starttime"
+mkdir -p "${ST}"
+mkfifo "${ST}/block.fifo"
+nohup sleep 5 >> "${ST}/block.fifo" 2>&1 &
+ST_PID=$!
+EXTRA_PIDS="${EXTRA_PIDS} ${ST_PID}"
+ST_BEFORE="$(ci_proc_starttime "${ST_PID}" 2>/dev/null || true)"
+timeout 10 cat "${ST}/block.fifo" > /dev/null &
+ST_READER=$!
+EXTRA_PIDS="${EXTRA_PIDS} ${ST_READER}"
+sleep 0.5
+ST_AFTER="$(ci_proc_starttime "${ST_PID}" 2>/dev/null || true)"
+if [ -n "${ST_BEFORE}" ]; then
+  ok "PHASE 3: ci_proc_starttime reports a process-instance start time (PID ${ST_PID} -> ${ST_BEFORE})"
+else
+  bad "PHASE 3: ci_proc_starttime returned nothing for PID ${ST_PID}; the corroboration cannot work on this platform"
+fi
+if [ -n "${ST_BEFORE}" ] && [ "${ST_AFTER}" = "${ST_BEFORE}" ]; then
+  ok "PHASE 3: the start time is UNCHANGED across the execve of the same pid (${ST_BEFORE}) - 'same instance' is trustworthy"
+else
+  bad "PHASE 3: the start time changed across exec of the same pid ('${ST_BEFORE}' -> '${ST_AFTER}'); the corroboration would be unsound"
+fi
+kill "${ST_PID}" 2>/dev/null
+kill "${ST_READER}" 2>/dev/null
+
+# The reviewer's scenario (executed at the shipped revision): a launcher that is
+# identity-positive in the shebang image and then execs an INTERMEDIATE NON-IDENTITY image for
+# a bounded period before the real JVM. 1s and 2s transitions used to slip between samples;
+# 2s and 5s gave a false "PID <n> was reused by a different process ..." while the process was
+# still ours. Both must start cleanly.
+for _secs in 2 5; do
+  _sb="${WORK}/sandbox-${_secs}"
+  _hm="${WORK}/f1home-${_secs}"
+  _dir="${WORK}/f1-${_secs}"
+  if ! make_sandbox "${_sb}" "${_secs}"; then
+    bad "PHASE 3: could not build the synthetic-launcher sandbox under ${_sb}"
+    continue
+  fi
+  if ! make_home "${_hm}"; then
+    bad "PHASE 3: could not build the isolated home under ${_hm}"
+    continue
+  fi
+  ok "PHASE 3: fixture ready - ${_secs}s non-identity image between the launcher and the JVM (sandbox ${_sb})"
+  CM_BIN="${_sb}/bin"
+  CM_INSIGHT_F1_STAGE=0.4
+  CM_INSIGHT_F1_TRANSITION="${_secs}"
+  export CM_INSIGHT_F1_STAGE CM_INSIGHT_F1_TRANSITION
+  one_cycle "${_hm}" "F1 ${_secs}s transition" "${_dir}"
+  CM_BIN="${ROOT}/bin"
+  unset CM_INSIGHT_F1_STAGE CM_INSIGHT_F1_TRANSITION
+
+  if grep -q 'instance: same' "${_dir}/start.log" 2>/dev/null; then
+    ok "PHASE 3: the ${_secs}s non-identity window WAS witnessed and treated as the SAME process instance (identity state: positive; NOT a recycle verdict)"
+  else
+    bad "PHASE 3: the ${_secs}s non-identity window was not witnessed as a same-instance contradiction, so the F1 rule was not exercised (fixture or rule regression)"
+    raw "${_dir}/start.log"
+  fi
+  if grep -q 'was reused by a different process' "${_dir}/start.log" 2>/dev/null; then
+    bad "PHASE 3: the ${_secs}s non-identity window was declared PID REUSE - the false positive this phase pins"
+  else
+    ok "PHASE 3: the ${_secs}s non-identity window was never declared PID reuse"
+  fi
+  # A failed case can leave the sandbox JVM serving the isolated port (no PID file was
+  # published), which would make every later phase fail for the wrong reason. Reap it now.
+  reap_isolated_port
+done
+
+# The refusal must survive the F1 change: a chain that never shows a CM Insight identity
+# (stage 0 = the non-identity image starts immediately, and it holds for 30s) must be refused,
+# with nothing published and nothing adopted. It is also the accuracy case: this chain is
+# still the SAME process instance, so a refusal that claimed "reused by a different process"
+# would be exactly the false statement the rule exists to avoid. start.sh --timeout 6 bounds
+# the wait (the operator's own timeout, no new magic number).
+_sb="${WORK}/sandbox-never"
+_hm="${WORK}/neverhome"
+_dir="${WORK}/never"
+if ! make_sandbox "${_sb}" 30; then
+  bad "PHASE 3: could not build the never-identifying sandbox under ${_sb}"
+elif ! make_home "${_hm}"; then
+  bad "PHASE 3: could not build the isolated home under ${_hm}"
+else
+  CM_BIN="${_sb}/bin"
+  CM_INSIGHT_F1_STAGE=0
+  export CM_INSIGHT_F1_STAGE
+  mkdir -p "${_dir}" 2>/dev/null
+  cm_run "${_hm}" start.sh --timeout 6 > "${_dir}/start.log" 2>&1
+  _n_rc=$?
+  CM_BIN="${ROOT}/bin"
+  unset CM_INSIGHT_F1_STAGE
+  raw "${_dir}/start.log"
+  if [ -s "${_dir}/start.log" ]; then
+    ok "PHASE 3: the never-identifying chain actually started (start.sh wrote its output to ${_dir}/start.log), so the assertions below are not vacuous"
+  else
+    bad "PHASE 3: start.sh produced no output for the never-identifying chain, so this case did not run"
+  fi
+  if [ "${_n_rc}" -ne 0 ]; then
+    ok "PHASE 3: a chain that never identifies was REFUSED (start.sh exit ${_n_rc}), so the F1 corroboration did not disable the bounded refusal"
+  else
+    bad "PHASE 3: a chain that never showed a CM Insight identity was accepted (exit 0) - the bounded refusal was weakened"
+  fi
+  if [ -f "${_hm}/run/cm-insight.pid" ]; then
+    bad "PHASE 3: a PID file was published for the never-identifying chain"
+  else
+    ok "PHASE 3: no PID file was published for the never-identifying chain"
+  fi
+  if grep -qE 'reads as a different process|was reused by a different process' "${_dir}/start.log" 2>/dev/null; then
+    ok "PHASE 3: the refusal named the identity contradiction the F1 rule acted on"
+  else
+    bad "PHASE 3: the refusal did not name the identity contradiction"
+  fi
+  # Accuracy pin: the chain is the SAME process instance (start time unchanged), so calling it
+  # "reused by a different process" would be the false statement this whole rule exists to
+  # avoid - the refusal must stay truthful instead of fast.
+  if grep -q 'was reused by a different process' "${_dir}/start.log" 2>/dev/null; then
+    bad "PHASE 3: the never-identifying but SAME-instance chain was described as reused by a different process - a false statement"
+  else
+    ok "PHASE 3: the refusal did not claim PID reuse for a chain that is still the same process instance"
+  fi
+  # The fixture process itself is not ours to keep: kill the pid start.sh reported.
+  _np="$(sed -n 's/^ERROR: CM Insight (PID \([0-9][0-9]*\).*/\1/p' "${_dir}/start.log" | head -n 1)"
+  case "${_np}" in
+    ''|*[!0-9]*) : ;;
+    *) EXTRA_PIDS="${EXTRA_PIDS} ${_np}"; kill "${_np}" 2>/dev/null ;;
+  esac
+  reap_isolated_port
+fi
+
+# ===========================================================================
+# PHASE 4 - a foreign live process is never signalled (the grace must not weaken this)
+# ===========================================================================
+note "PHASE 4/5: a PID file holding an unrelated live process must never be signalled"
 F="${WORK}/foreign"
 if ! make_home "${F}/home"; then
-  bad "PHASE 3: could not build the isolated home under ${F}/home"
+  bad "PHASE 4: could not build the isolated home under ${F}/home"
 else
   sleep 60 &
   FOREIGN_PID=$!
   EXTRA_PIDS="${EXTRA_PIDS} ${FOREIGN_PID}"
   printf '%s\n' "${FOREIGN_PID}" > "${F}/home/run/cm-insight.pid"
-  ok "PHASE 3: PID file holds PID ${FOREIGN_PID} ('sleep 60'), an unrelated live process"
+  ok "PHASE 4: PID file holds PID ${FOREIGN_PID} ('sleep 60'), an unrelated live process"
   cm_run "${F}/home" stop.sh --timeout 5 > "${F}/stop.log" 2>&1
   _f_rc=$?
   raw "${F}/stop.log"
   if [ "${_f_rc}" -eq 0 ]; then
-    ok "PHASE 3: stop.sh rc=0 (it reported that CM Insight is not running)"
+    ok "PHASE 4: stop.sh rc=0 (it reported that CM Insight is not running)"
   else
-    bad "PHASE 3: stop.sh exited ${_f_rc} for a foreign PID file (expected 0: nothing to stop, nothing to signal)"
+    bad "PHASE 4: stop.sh exited ${_f_rc} for a foreign PID file (expected 0: nothing to stop, nothing to signal)"
   fi
   if grep -q 'different process' "${F}/stop.log"; then
-    ok "PHASE 3: stop.sh named the truth - the PID file points at a DIFFERENT process"
+    ok "PHASE 4: stop.sh named the truth - the PID file points at a DIFFERENT process"
   else
-    bad "PHASE 3: stop.sh did not report a different process for the foreign PID"
+    bad "PHASE 4: stop.sh did not report a different process for the foreign PID"
   fi
   if kill -0 "${FOREIGN_PID}" 2>/dev/null; then
-    ok "PHASE 3: the unrelated live process was NOT signalled (it is still alive)"
+    ok "PHASE 4: the unrelated live process was NOT signalled (it is still alive)"
   else
-    bad "PHASE 3: the unrelated process was signalled/terminated - ownership safety was weakened"
+    bad "PHASE 4: the unrelated process was signalled/terminated - ownership safety was weakened"
   fi
   if [ -f "${F}/home/run/cm-insight.pid" ]; then
-    bad "PHASE 3: the stale PID file was not removed"
+    bad "PHASE 4: the stale PID file was not removed"
   else
-    ok "PHASE 3: the stale PID file was removed"
+    ok "PHASE 4: the stale PID file was removed"
   fi
   kill "${FOREIGN_PID}" 2>/dev/null
 fi
 
 # ===========================================================================
-# PHASE 4 - marker-to-socket tie across the mapped/plain spellings (sections C and D)
+# PHASE 5 - marker-to-socket tie across the mapped/plain spellings (sections C and D)
 # ===========================================================================
-note "PHASE 4/4: the exact marker tied to a socket the table spells IPv4-mapped IPv6"
+note "PHASE 5/5: the exact marker tied to a socket the table spells IPv4-mapped IPv6"
 if ci_socket_host_matches '::ffff:127.0.0.1' '127.0.0.1'; then
-  ok "PHASE 4: the CI evidence's row spelling ::ffff:127.0.0.1 is TIED to the configured 127.0.0.1 (ci_socket_host_matches)"
+  ok "PHASE 5: the CI evidence's row spelling ::ffff:127.0.0.1 is TIED to the configured 127.0.0.1 (ci_socket_host_matches)"
 else
-  bad "PHASE 4: the mapped spelling ::ffff:127.0.0.1 is not tied to the configured 127.0.0.1 - raw string equality is back"
+  bad "PHASE 5: the mapped spelling ::ffff:127.0.0.1 is not tied to the configured 127.0.0.1 - raw string equality is back"
 fi
 if ci_socket_host_matches '[::ffff:127.0.0.1]' '127.0.0.1'; then
-  ok "PHASE 4: the bracketed tool spelling [::ffff:127.0.0.1] is tied to 127.0.0.1 as well"
+  ok "PHASE 5: the bracketed tool spelling [::ffff:127.0.0.1] is tied to 127.0.0.1 as well"
 else
-  bad "PHASE 4: the bracketed spelling [::ffff:127.0.0.1] is not tied to 127.0.0.1"
+  bad "PHASE 5: the bracketed spelling [::ffff:127.0.0.1] is not tied to 127.0.0.1"
 fi
 if ci_socket_host_matches '::ffff:192.0.2.10' '127.0.0.1'; then
-  bad "PHASE 4: an unrelated mapped address (::ffff:192.0.2.10) was tied to the loopback bind 127.0.0.1 - the tie must not widen"
+  bad "PHASE 5: an unrelated mapped address (::ffff:192.0.2.10) was tied to the loopback bind 127.0.0.1 - the tie must not widen"
 else
-  ok "PHASE 4: the unrelated mapped address ::ffff:192.0.2.10 is NOT tied to 127.0.0.1 (the tie does not widen an ownership claim)"
+  ok "PHASE 5: the unrelated mapped address ::ffff:192.0.2.10 is NOT tied to 127.0.0.1 (the tie does not widen an ownership claim)"
 fi
 
 M="${WORK}/mapped"
 if ! make_home "${M}/home"; then
-  bad "PHASE 4: could not build the isolated home under ${M}/home"
+  bad "PHASE 5: could not build the isolated home under ${M}/home"
 else
   # A marker listener whose argv does NOT identify CM Insight, bound to the IPv4-mapped IPv6
   # address: the only admissible ownership evidence is the marker-to-socket tie. Bound with a
@@ -579,7 +806,7 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Test fixture for tests/shell/lifecycle_identity_race_test.sh (PHASE 4). Serves the exact
+ * Test fixture for tests/shell/lifecycle_identity_race_test.sh (PHASE 5). Serves the exact
  * CM Insight health marker on a socket the kernel reports as ::ffff:127.0.0.1, so the
  * marker-to-socket tie in bin/stop.sh has to compare socket-equivalent spellings. Its own
  * command line deliberately does NOT name cm-insight.jar, bin/cm-insight or the main class,
@@ -633,46 +860,46 @@ JAVA
     _w=$(( _w + 1 ))
   done
   if ci_health_marker_ok "$(ci_health_url 127.0.0.1 "${PORT}")"; then
-    ok "PHASE 4: the fixture listener answers the EXACT CM Insight marker on 127.0.0.1:${PORT}"
+    ok "PHASE 5: the fixture listener answers the EXACT CM Insight marker on 127.0.0.1:${PORT}"
   else
-    bad "PHASE 4: the fixture listener did not answer the exact marker; see ${M}/listener.log"
+    bad "PHASE 5: the fixture listener did not answer the exact marker; see ${M}/listener.log"
     raw "${M}/listener.log"
   fi
 
   _row_hosts="$(ci_listener_rows "${PORT}" | awk -F'|' '{print $1}' | sort -u | tr '\n' ' ')"
   case "${_row_hosts}" in
     *::ffff:*)
-      ok "PHASE 4: the socket table reports the listener as '${_row_hosts}' - the IPv4-mapped IPv6 form of the CI evidence, not the plain spelling"
+      ok "PHASE 5: the socket table reports the listener as '${_row_hosts}' - the IPv4-mapped IPv6 form of the CI evidence, not the plain spelling"
       ;;
     *)
-      bad "PHASE 4: the fixture bound an IPv4-mapped IPv6 socket but the table reports '${_row_hosts:-<nothing>}'; the mapped case is not being exercised"
+      bad "PHASE 5: the fixture bound an IPv4-mapped IPv6 socket but the table reports '${_row_hosts:-<nothing>}'; the mapped case is not being exercised"
       ;;
   esac
 
   _l_ident="$(pid_identity "${LISTENER_PID}")"
   if [ "${_l_ident}" = "1" ]; then
-    ok "PHASE 4: the fixture's command line does NOT identify CM Insight (ci_proc_identity=1), so ONLY the marker-to-socket tie can authorise stopping it"
+    ok "PHASE 5: the fixture's command line does NOT identify CM Insight (ci_proc_identity=1), so ONLY the marker-to-socket tie can authorise stopping it"
   else
-    bad "PHASE 4: the fixture's identity came out as ${_l_ident} (expected 1 = a different process); the argv-identity path would mask the tie"
+    bad "PHASE 5: the fixture's identity came out as ${_l_ident} (expected 1 = a different process); the argv-identity path would mask the tie"
   fi
 
   cm_run "${M}/home" stop.sh --untracked --timeout 10 > "${M}/stop.log" 2>&1
   _m_rc=$?
   raw "${M}/stop.log"
   if [ "${_m_rc}" -eq 0 ]; then
-    ok "PHASE 4: stop.sh --untracked rc=0 - the mapped row was attributed and the instance was stopped"
+    ok "PHASE 5: stop.sh --untracked rc=0 - the mapped row was attributed and the instance was stopped"
   else
-    bad "PHASE 4: stop.sh --untracked exited ${_m_rc} (expected 0): the marker could not be tied to the mapped socket row"
+    bad "PHASE 5: stop.sh --untracked exited ${_m_rc} (expected 0): the marker could not be tied to the mapped socket row"
   fi
   if grep -q 'exact CM Insight health marker answered' "${M}/stop.log"; then
-    ok "PHASE 4: the stated ownership evidence is the exact marker tied to that socket (section D's requirement)"
+    ok "PHASE 5: the stated ownership evidence is the exact marker tied to that socket (section D's requirement)"
   else
-    bad "PHASE 4: stop.sh stopped it without naming the marker-to-socket evidence"
+    bad "PHASE 5: stop.sh stopped it without naming the marker-to-socket evidence"
   fi
   if ci_health_marker_ok "$(ci_health_url 127.0.0.1 "${PORT}")"; then
-    bad "PHASE 4: the fixture listener still answers the marker after --untracked stop"
+    bad "PHASE 5: the fixture listener still answers the marker after --untracked stop"
   else
-    ok "PHASE 4: the fixture listener is gone and 127.0.0.1:${PORT} answers nothing"
+    ok "PHASE 5: the fixture listener is gone and 127.0.0.1:${PORT} answers nothing"
   fi
   kill "${LISTENER_PID}" 2>/dev/null
 fi

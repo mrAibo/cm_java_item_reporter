@@ -62,10 +62,10 @@ Every number below comes from an executed command.
 
 - `./build.sh` → exit 0, **`Tests run: 173, failures: 0`**, jar packaged; `./tests/selftest.sh` → exit 0
 - `javac --release 17 -encoding UTF-8 -Xlint:all` over 50 main + 25 test sources → exit 0, **zero warnings**
-- **Committed shell suite on real Linux** (Ubuntu 24.04 LTS, WSL2 kernel 6.6.87.2, Temurin 17.0.20.1): `CI=true ./tests/shell/run.sh` → exit 0, **3 passed, 0 failed, 0 not run in 48s**; `lifecycle_identity_race_test.sh` alone → **93 assertions, 10 cycles, exit 0**; a 12-cycle run → 105 assertions, exit 0
+- **Committed shell suite on real Linux** (Ubuntu 24.04 LTS, WSL2 kernel 6.6.87.2, Temurin 17.0.20.1): `CI=true ./tests/shell/run.sh` → exit 0, **3 passed, 0 failed, 0 not run in 66s**; `lifecycle_identity_race_test.sh` alone → **93 assertions, 10 cycles, exit 0**; a 12-cycle run → 105 assertions, exit 0
 - **Full CI step sequence replayed on real Linux from a clean copy with NO `build/` directory** → every step passes: permissions (including `tests/shell/*.sh`), syntax, `--help`, `./build.sh` (173/0), the four safety guards, the committed suite, doctor, the 3-cycle lifecycle step, start/status/stop
 - Pre-fix gate proofs, so the new tests are genuinely regressive and not vacuous:
-  - `lifecycle_identity_race_test.sh` against a HEAD snapshot of `bin/` → **FAIL 12 of 93**, exit 1, with the exact CI message `PID <n> was reused by a different process before the health check succeeded`
+  - `lifecycle_identity_race_test.sh` against a HEAD snapshot of `bin/` → **FAIL 16 of 127**, exit 1, with the exact CI message `PID <n> was reused by a different process before the health check succeeded`
   - `addr_socket_class_test.sh` against the pre-fix classifier → **14 assertions fail**
   - the repository regression against the pre-fix wiring (mutated copy) → **`Tests run: 173, failures: 3`**, the decisive test failing as `expected RepositoryException but nothing was thrown`
 - On real Linux the stopped listener really is `[::ffff:127.0.0.1]:8080` and `status.sh` now attributes it to the tracked PID ("the SAME socket address as the configured bind 127.0.0.1")
@@ -92,10 +92,38 @@ uncertain-close guarantees are therefore proven against fake resources only; in 
 
 ### Independent review
 
-An independent adversarial reviewer judged the Goal 01B corrections; its findings and their
-resolutions are recorded in the handoff report. The three blocking defects were each closed with a
-pre-fix gate proof (above), and the committed shell suite plus the full CI step sequence were
-reproduced by the lead on real Linux.
+An independent adversarial reviewer judged the Goal 01B corrections on the committed revision and
+returned **verdict PASS, no blocker**. It verified by execution that the three blocking defects are
+closed, including the hunts that matter most:
+
+- **A**: 38 blocking checks, covering multi-resource contexts, the silent case where ONLY the pool
+  report is uncertain (no close failure at all) and the switch is still refused before the factory
+  (invocation count 1 -> 1), hostile report accessors failing closed, a close-aware resource whose
+  close also throws, a method-name look-alike that is never consulted, an `Error` escaping close,
+  repeated close, and the clean path still switching.
+- **C**: a 71-expectation matrix including 15 adversarial spellings (zone suffix, over-long octet,
+  nine-group literal, `:8080` suffix, `::ffff:*`, mixed case, hex tails) that all stay foreign, while
+  equivalent spellings match; a real `ss` row `[::ffff:127.0.0.1]:55597` classified `exact` with the
+  real owner PID; the boundary proven by live run **and** bytecode (`isLoopbackLiteral` false for 8
+  mapped spellings, true for 7 controls); and an end-to-end untracked stop through the mapped socket.
+- **B**: **negative result, stated plainly** — the reviewer could not construct any case where a
+  foreign or recycled PID is accepted because of the grace (never-identifying -> refused;
+  positive-then-contradicted -> refused; a foreign exact-marker responder with a non-identifying PID
+  -> refused with no PID file). Their own 10-cycle soak was 10/10 and the state machine table 10/10.
+- It independently confirmed the Actions runs through the public API rather than trusting this file,
+  and confirmed the committed tests discriminate pre-01B code.
+
+Its four non-blocking findings and their disposition:
+
+| # | Severity | Finding | Disposition |
+|---|---|---|---|
+| F1 | medium | one contradictory sample after a positive identity was conclusive, so a launcher that re-execs through a non-identity image was falsely declared recycled (demonstrated at 2 s and 5 s transitions) | **FIXED.** Corroboration is now DECISIVE rather than counted: `/proc/<pid>/stat` field 22 (process start time) is invariant across `execve` but changes on PID reuse, so a contradiction is latched as recycle only when the process *instance* changed. The suggested "two consecutive samples, or no marker and no socket" alternative was **measured** to still fire inside the same windows and was rejected on that evidence. A genuinely reused PID is now refused FASTER (at the first contradiction, no grace wait). |
+| F2 | low | the deciding contradictory sample was never counted, so the log always said "0 contradictory sample(s)" | **FIXED.** Samples are counted and the command line captured before any verdict. |
+| F3 | medium | a quarantine occurring AFTER the context's close-time snapshot (a lease returned later) can leave a stale clean report while `metrics().quarantined()` is 1 | **NOT changed in 01B — recorded here as a deliberate Goal 02 decision point.** It is beyond section A's letter, and changing close semantics now would be scope creep. Goal 02 must choose explicitly: re-check quiescence before reporting, or treat outstanding leases as uncertain. |
+| F4 | low | `stop.sh --untracked` accepts the exact marker as sole ownership evidence, so a marker-mimicking non-CM-Insight process can be signalled | **Accepted by design**, matching the documented Goal 01A model: the exact marker is the strongest available positive evidence, and the alternative would make recovery impossible. |
+
+The reviewer also disclosed and corrected two flaws in its own harness rather than reporting them as
+product defects, which is the standard I want recorded.
 
 ## Unresolved risks and accepted limitations
 

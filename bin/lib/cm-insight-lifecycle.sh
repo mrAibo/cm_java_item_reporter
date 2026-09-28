@@ -24,7 +24,8 @@
 #   ci_proc_argv <pid>                  -> the real arguments, one per line
 #   ci_argv_is_cm_insight               -> stdin = argv lines; 0 for a CM Insight token
 #   ci_proc_identity <pid>              -> 0 CM Insight, 1 another process, 2 cannot tell
-#   ci_start_identity_next <state> <rc> <grace_elapsed>
+#   ci_proc_starttime <pid>             -> the process-INSTANCE start time, or nothing
+#   ci_start_identity_next <state> <rc> <grace_elapsed> <instance>
 #                                       -> the next startup identity state or a verdict:
 #                                          positive | provisional | recycle (Goal 01B B)
 #   ci_proc_cmdline <pid>               -> the command line as one line (display only)
@@ -215,6 +216,38 @@ ci_proc_cmdline() {
   ci_proc_argv "$1" | tr '\n' ' '
 }
 
+ci_proc_starttime() {
+  # $1 = pid; prints the process-INSTANCE start time (Linux /proc/<pid>/stat field 22,
+  # clock ticks since boot) or nothing when the platform cannot report it.
+  #
+  # WHY (Goal 01B section B, independent review finding F1): the kernel sets this value
+  # ONCE, when the process is created, and execve() does NOT change it. A launcher chain
+  # therefore keeps the SAME start time across every re-exec (launcher -> wrapper -> java),
+  # while a REUSED pid belongs to a different process instance and reports a different
+  # value. That is what makes "is this still the process we launched?" decidable WITHOUT a
+  # heuristic: it separates a legitimate re-exec through a non-identity image from real PID
+  # reuse. It is corroborating evidence for a VERDICT only - it never replaces argv identity
+  # and it never authorises signalling anything.
+  #
+  # /proc/<pid>/stat is `pid (comm) state ppid ...`: comm may itself contain spaces and
+  # parentheses, so everything up to the LAST ')' is stripped first; starttime is then field
+  # 20 of the remainder (state=1, ppid=2, pgrp=3, session=4, ..., starttime=20).
+  _ci_st_pid="$1"
+  case "${_ci_st_pid}" in ''|*[!0-9]*) return 1 ;; esac
+  if [ ! -r "/proc/${_ci_st_pid}/stat" ]; then
+    # MSYS/Cygwin: the pid may have to be mapped into the other namespace first.
+    _ci_st_map="$(ci_msyspid_of "${_ci_st_pid}")"
+    if [ -n "${_ci_st_map}" ] && [ -r "/proc/${_ci_st_map}/stat" ]; then
+      _ci_st_pid="${_ci_st_map}"
+    else
+      return 1
+    fi
+  fi
+  _ci_st_value="$(sed -e 's/^.*) //' "/proc/${_ci_st_pid}/stat" 2>/dev/null | awk '{print $20}')"
+  case "${_ci_st_value}" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "${_ci_st_value}"
+}
+
 # ---------------------------------------------------------------------------
 # startup identity state (Goal 01B section B)
 # ---------------------------------------------------------------------------
@@ -222,9 +255,13 @@ ci_start_identity_next() {
   # $1 = current state: provisional | positive
   # $2 = ci_proc_identity result for the tracked pid: 0 (ours) | 1 (different) | 2 (cannot tell)
   # $3 = "true" when the bounded launch grace has elapsed (the caller owns the clock)
+  # $4 = process-INSTANCE evidence for a contradictory sample (i.e. $2 == 1):
+  #        different  the pid denotes ANOTHER process instance (its ci_proc_starttime changed)
+  #        same       the pid is still the SAME instance (start time unchanged across re-exec)
+  #        unknown    the platform could not witness it (default)
   # prints one of:
   #   positive     an observation proved this pid is this application
-  #   provisional  the state is unchanged; a contradictory reading is NOT proof yet
+  #   provisional  no verdict: the caller keeps its state and keeps waiting
   #   recycle      a contradictory reading is now proof of PID reuse: refuse and never signal
   #
   # WHY this state exists at all (evidence, Actions run 36443449216 on SHA 9c7168aa):
@@ -236,33 +273,56 @@ ci_start_identity_next() {
   # run the log was still 0 bytes when the verdict was reached, and the SAME PID 3451 was
   # our JVM a fraction of a second later. One early negative sample is therefore not proof
   # of PID reuse; the identity stays PROVISIONAL until either one POSITIVE observation
-  # occurs or the caller's bounded grace elapses. After that, a contradictory reading IS
-  # recycle (see the table below), so a genuinely recycled or foreign PID is still refused
-  # - only later, and by a bounded amount.
+  # occurs or the caller's bounded grace elapses.
   #
-  # Transition table (all three inputs are caller-supplied; this function is pure):
-  #   provisional + 0 + any   -> positive      our command line: settled
-  #   provisional + 1 + false -> provisional   the launch transition is not over: not proof
-  #   provisional + 1 + true  -> recycle        the whole bounded grace produced no positive
-  #                                             identity observation: refuse (fail closed)
-  #   provisional + 2 + any   -> provisional   an uninspectable command line proves nothing
-  #   positive    + 0 + any   -> positive
-  #   positive    + 1 + any   -> recycle       a LATER contradiction: proof of reuse
-  #   positive    + 2 + any   -> positive      "cannot tell" never revokes a positive identity
-  # "Cannot tell" (2) never moves the state in either direction: it is neither evidence of
-  # identity nor evidence of reuse, so it can neither adopt a foreign pid nor destroy a
-  # proven one.
+  # WHY the instance argument exists (independent review finding F1): a launcher may
+  # legitimately re-exec through an image whose command line does not name CM Insight
+  # (operator wrapper, `nice`/`systemd-run`/`timeout`, a bin/cm-insight that shells out).
+  # After a POSITIVE observation, ONE contradictory sample must therefore not be conclusive:
+  # the reviewer executed exactly that shape and got a false "PID reused" verdict. A
+  # contradiction is only latched as recycle when the pid is PROVEN to be another process
+  # instance ("different"); "same" is a re-exec inside the process we already identified,
+  # and "unknown" is unwitnessable, which must fail towards waiting, never towards a verdict.
+  #
+  # Transition table (all four inputs are caller-supplied; this function is pure):
+  #   any         + 0 + any   + any        -> positive    our command line: settled
+  #   any         + 2 + any   + any        -> unchanged   uninspectable proves nothing
+  #   any         + 1 + any   + different  -> recycle     proven PID reuse (instance changed)
+  #   provisional + 1 + false + same       -> provisional the same instance is still starting
+  #   provisional + 1 + true  + same       -> provisional same instance: NOT a reuse verdict
+  #   provisional + 1 + true  + unknown    -> recycle     fallback where the instance cannot be
+  #                                                       witnessed: the WHOLE bounded grace
+  #                                                       produced no positive identity
+  #   provisional + 1 + false + unknown    -> provisional
+  #   positive    + 1 + any   + same       -> provisional same process instance: NOT reuse
+  #   positive    + 1 + any   + unknown    -> provisional cannot witness it: NOT a verdict
+  # "unchanged" means the printed verdict is the input state (positive stays positive,
+  # provisional stays provisional). The ONE decisive latch is a changed process instance;
+  # everything else waits, and the caller's own bounded timeout decides, with nothing
+  # published and nothing signalled either way. "Cannot tell" never moves the state in either
+  # direction: it is neither evidence of identity nor evidence of reuse.
   _ci_si_state="${1:-provisional}"
   _ci_si_rc="${2:-2}"
   _ci_si_grace_elapsed="${3:-false}"
+  _ci_si_instance="${4:-unknown}"
   case "${_ci_si_rc}" in
     0) printf 'positive' ;;
     1)
-      case "${_ci_si_state}${_ci_si_grace_elapsed}" in
-        positive*) printf 'recycle' ;;
-        provisionaltrue) printf 'recycle' ;;
-        *) printf 'provisional' ;;
-      esac
+      if [ "${_ci_si_instance}" = "different" ]; then
+        # Decisive in EITHER state: the pid now denotes another process instance.
+        printf 'recycle'
+      elif [ "${_ci_si_state}" = "positive" ] || [ "${_ci_si_instance}" = "same" ]; then
+        # A positive identity was already established, or the pid is provably still the
+        # process instance that was launched: a contradictory image is not a reuse verdict.
+        printf 'provisional'
+      else
+        # Never positively identified AND the platform cannot witness the instance: the
+        # bounded grace decides, exactly as shipped and reviewed.
+        case "${_ci_si_grace_elapsed}" in
+          true) printf 'recycle' ;;
+          *) printf 'provisional' ;;
+        esac
+      fi
       ;;
     *)
       case "${_ci_si_state}" in

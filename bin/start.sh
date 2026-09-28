@@ -30,10 +30,20 @@
 #     positive     an observation proved this PID is this application (its structural
 #                  command-line identity, or process existence + the exact marker +
 #                  ownership of the listening socket that serves the configured bind)
-#     recycle      a refusal verdict: only ever reached from `positive`, or from
-#                  `provisional` once the bounded launch grace (IDENT_GRACE, 3s, see
-#                  the justification at its definition) has elapsed with no positive
-#                  observation. The transition table is ci_start_identity_next.
+#   A contradictory reading becomes a `recycle` refusal (nothing published, nothing ever
+#   signalled) ONLY with corroboration:
+#     * the pid PROVABLY denotes a different process instance - its /proc/<pid>/stat start
+#       time changed, which execve cannot do (ci_proc_starttime) - at any time; or
+#     * on a platform where that instance evidence cannot be witnessed at all, the whole
+#       bounded launch grace (IDENT_GRACE, 3s) passed with no positive identity observation.
+#   Everything else keeps waiting, bounded by the operator's own --timeout, and the final
+#   refusal names exactly what was seen. That is deliberate: a launcher that re-execs through
+#   a non-identity image (operator wrapper, nice/systemd-run/timeout, a bin/cm-insight that
+#   shells out) is the SAME process instance and must never be called "reused" because one
+#   sample - or several - landed inside that image. The transition table is
+#   ci_start_identity_next; the independent review's F1 finding (a false recycle about a
+#   second in) and F2 (a diagnostic that reported 0 contradictory samples about the sample
+#   that decided the verdict) are pinned by tests/shell/lifecycle_identity_race_test.sh.
 #   Ownership safety is unchanged (section D of Goal 01A/01B): no PID is ever signalled
 #   here, a contradictory identity is never adopted, and stop-time checks are untouched.
 #   6. PUBLISHES run/cm-insight.pid atomically (temp file + rename) ONLY AFTER the
@@ -430,6 +440,12 @@ case "${LOG_START}" in ''|*[!0-9]*) LOG_START=0 ;; esac
 nohup "${SCRIPT_DIR}/cm-insight" ${APP_ARGS[@]+"${APP_ARGS[@]}"} >>"${OUT_FILE}" 2>&1 &
 PID=$!
 
+# Process-instance identity of the pid we just created (Goal 01B section B, review finding
+# F1). ci_proc_starttime is set at process creation and survives every execve, so it lets a
+# later contradictory identity sample be corroborated: "the same instance re-exec'd" versus
+# "this pid now denotes a different process" (real PID reuse).
+IDENT_STARTTIME="$(ci_proc_starttime "${PID}" 2>/dev/null || true)"
+
 PID_TMP="${PID_FILE}.tmp.$$"
 if ! printf '%s\n' "${PID}" > "${PID_TMP}"; then
   fail "cannot write the candidate PID file in ${RUN_DIR}; check directory permissions"
@@ -465,9 +481,11 @@ HEALTH_CONFIRMED_URL=""
 # Startup identity state (Goal 01B section B). See IDENT_GRACE above for the bound and
 # ci_start_identity_next (bin/lib/cm-insight-lifecycle.sh) for the transition table.
 IDENT_STATE="provisional"     # provisional | positive
-IDENT_SAW_DIFFERENT=false     # a contradictory reading was witnessed while provisional
+IDENT_SAW_DIFFERENT=false     # a contradictory reading was witnessed
 IDENT_DIFFERENT_SAMPLES=0
 IDENT_LAST_CMD=""
+IDENT_LAST_INSTANCE="unknown" # same | different | unknown, for the last contradictory sample
+IDENT_RECYCLE_EVIDENCE=""      # the corroboration that produced a recycle verdict
 MARKER_UNTIED=false           # the marker answers, but not on a socket this PID owns
 IDENT_UNPROVEN=false          # process-only mode: contradictory argv, never a positive one
 
@@ -500,31 +518,85 @@ while : ; do
   GONE_STRIKES=0
 
   # -------------------------------------------------------------------------
-  # Startup identity sample (Goal 01B section B)
+  # Startup identity sample (Goal 01B section B, incl. the independent review's F1/F2)
   #
   # The state machine decides whether this sample may be read as PID reuse. While the
   # identity is provisional a contradictory reading is NOT proof (the backgrounded
-  # child has not exec'd yet), and the bounded grace makes sure that patience cannot be
-  # exploited: after IDENT_GRACE seconds without a positive observation the very next
-  # contradictory sample is recycle. "Cannot tell" (rc=2) never moves the state.
+  # child has not exec'd yet); the bounded grace keeps that patience honest, because a
+  # chain that never identifies is refused once the grace is over. After a POSITIVE
+  # observation a contradiction needs corroboration (F1): it is only latched as recycle
+  # when the pid is PROVEN to be a different process INSTANCE, so a launcher that
+  # re-execs through a non-identity image is not falsely called recycled. "Cannot tell"
+  # (rc=2) never moves the state.
   # -------------------------------------------------------------------------
   set +e
   ci_proc_identity "${PID}"
   IDENT_RC=$?
   set -e
-  IDENT_GRACE_ELAPSED=false
-  [ "${WAITED}" -lt "${IDENT_GRACE}" ] || IDENT_GRACE_ELAPSED=true
-  IDENT_NEXT="$(ci_start_identity_next "${IDENT_STATE}" "${IDENT_RC}" "${IDENT_GRACE_ELAPSED}")"
-  if [ "${IDENT_NEXT}" = "recycle" ]; then RECYCLED=true; break; fi
+
+  # F2: count and record EVERY contradictory sample BEFORE any verdict is taken, so the
+  # failure diagnostic can never claim "0 contradictory sample(s)" about the sample that
+  # decided the verdict.
   if [ "${IDENT_RC}" -eq 1 ]; then
-    # Witnessed but provisional: recorded as evidence for the diagnosis below and never
-    # acted on as a verdict. This is the line that makes a CI failure self-describing.
     IDENT_SAW_DIFFERENT=true
     IDENT_DIFFERENT_SAMPLES=$((IDENT_DIFFERENT_SAMPLES + 1))
     IDENT_LAST_CMD="$(ci_proc_cmdline "${PID}" 2>/dev/null || true)"
-    log_warn "PID ${PID} reads as a different process ${WAITED}s into the launch; the identity is provisional for ${IDENT_GRACE}s (sample ${IDENT_DIFFERENT_SAMPLES}), so this is not yet proof of PID reuse. Observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")"
   fi
-  IDENT_STATE="${IDENT_NEXT}"
+
+  # Corroboration for a contradiction (F1): did this pid become a DIFFERENT process instance?
+  # starttime is set once at creation and survives every execve, so "same" means the launcher
+  # chain we started is still running (possibly inside a non-identity image), while "different"
+  # PROVES the number now denotes another process. The launch-time read can race the child's
+  # visibility, so one retry is made here before the evidence is given up as unwitnessable.
+  IDENT_INSTANCE="unknown"
+  if [ "${IDENT_RC}" -eq 1 ]; then
+    if [ -z "${IDENT_STARTTIME}" ]; then
+      IDENT_STARTTIME="$(ci_proc_starttime "${PID}" 2>/dev/null || true)"
+    fi
+    if [ -n "${IDENT_STARTTIME}" ]; then
+      IDENT_STARTTIME_NOW="$(ci_proc_starttime "${PID}" 2>/dev/null || true)"
+      if [ -n "${IDENT_STARTTIME_NOW}" ]; then
+        if [ "${IDENT_STARTTIME_NOW}" = "${IDENT_STARTTIME}" ]; then
+          IDENT_INSTANCE="same"
+        else
+          IDENT_INSTANCE="different"
+        fi
+      fi
+    fi
+  fi
+  IDENT_GRACE_ELAPSED=false
+  [ "${WAITED}" -lt "${IDENT_GRACE}" ] || IDENT_GRACE_ELAPSED=true
+  # The instance verdict for THIS sample is recorded before any verdict is taken, so the
+  # failure message below describes the sample that decided it (F2).
+  IDENT_LAST_INSTANCE="${IDENT_INSTANCE}"
+  IDENT_NEXT="$(ci_start_identity_next "${IDENT_STATE}" "${IDENT_RC}" "${IDENT_GRACE_ELAPSED}" "${IDENT_INSTANCE}")"
+  if [ "${IDENT_NEXT}" = "recycle" ]; then
+    if [ "${IDENT_INSTANCE}" = "different" ]; then
+      IDENT_RECYCLE_EVIDENCE="the process instance changed: start time ${IDENT_STARTTIME} -> ${IDENT_STARTTIME_NOW}"
+    else
+      IDENT_RECYCLE_EVIDENCE="the process instance could not be witnessed and no CM Insight identity appeared within the ${IDENT_GRACE}s launch grace"
+    fi
+    RECYCLED=true
+    break
+  fi
+  if [ "${IDENT_RC}" -eq 1 ]; then
+    # Witnessed but not decisive for THIS sample: recorded as evidence for the diagnosis
+    # below and never acted on as a verdict. This is the line that makes the log
+    # self-describing.
+    if [ "${IDENT_INSTANCE}" = "same" ]; then
+      log_warn "PID ${PID} reads as a different process ${WAITED}s into the launch, but it is the SAME process instance we started (start time ${IDENT_STARTTIME} unchanged), so this is a launcher re-exec through a non-identity image, not PID reuse (identity state: ${IDENT_STATE}; instance: same; sample ${IDENT_DIFFERENT_SAMPLES}). Observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")"
+    else
+      log_warn "PID ${PID} reads as a different process ${WAITED}s into the launch (identity state: ${IDENT_STATE}; instance: ${IDENT_INSTANCE}; grace used: ${WAITED}s of ${IDENT_GRACE}s; sample ${IDENT_DIFFERENT_SAMPLES}), so this is not yet proof of PID reuse. Observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")"
+    fi
+  fi
+  if [ "${IDENT_NEXT}" = "positive" ]; then
+    if [ "${IDENT_STATE}" != "positive" ]; then
+      # First positive observation: remember the instance it belongs to, so a LATER
+      # contradiction can be corroborated rather than assumed.
+      IDENT_STARTTIME="$(ci_proc_starttime "${PID}" 2>/dev/null || true)"
+    fi
+    IDENT_STATE="positive"
+  fi
 
   if [ "${USE_CURL}" = true ]; then
     # The exact marker is required, not any 2xx answer, and every probe candidate of
@@ -633,13 +705,20 @@ if [ "${PROC_GONE}" = true ]; then
 fi
 
 if [ "${RECYCLED}" = true ]; then
-  # Reached ONLY through ci_start_identity_next's "recycle" verdict: a contradictory
-  # reading after a positive identity had been established, or a contradictory reading
-  # that outlived the whole bounded launch grace (IDENT_GRACE). One transient sample in
-  # the launch transition is never enough (Goal 01B section B). The identity evidence is
-  # printed so a CI failure is self-describing instead of a bare "exit code 1".
-  fail_start "PID ${PID} was reused by a different process before the health check succeeded (identity state: ${IDENT_STATE}; ${IDENT_DIFFERENT_SAMPLES} contradictory sample(s) inside the ${IDENT_GRACE}s launch grace; observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")): ${REASON}." \
-             "The application is not confirmably running; no PID file was written or removed."
+  # Reached ONLY through ci_start_identity_next's "recycle" verdict. Two honest shapes:
+  #   * the pid PROVABLY became another process instance (start time changed) - the case the
+  #     original CI failure was about, so the recognizable wording is kept;
+  #   * the platform could not witness the instance at all and the whole bounded grace passed
+  #     without a positive identity, so the refusal is named as exactly that.
+  # The deciding sample is already counted (F2), so the numbers describe the sample that
+  # produced the verdict.
+  if [ "${IDENT_LAST_INSTANCE}" = "different" ]; then
+    fail_start "PID ${PID} was reused by a different process before the health check succeeded (${IDENT_RECYCLE_EVIDENCE}; identity state: ${IDENT_STATE}; ${IDENT_DIFFERENT_SAMPLES} contradictory sample(s); observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")): ${REASON}." \
+               "The application is not confirmably running; no PID file was written or removed."
+  else
+    fail_start "PID ${PID} never showed a CM Insight identity and was refused (${IDENT_RECYCLE_EVIDENCE}; identity state: ${IDENT_STATE}; ${IDENT_DIFFERENT_SAMPLES} contradictory sample(s); observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")): ${REASON}." \
+               "The application is not confirmably running; no PID file was written or removed."
+  fi
 fi
 
 if [ "${MARKER_UNTIED}" = true ]; then
@@ -665,6 +744,24 @@ if [ "${IDENT_UNPROVEN}" = true ]; then
 fi
 
 printf 'ERROR: CM Insight (PID %s) did not answer %s within %ss: %s.\n' "${PID}" "${HEALTH_URL}" "${TIMEOUT}" "${REASON}" >&2
+if [ "${IDENT_SAW_DIFFERENT}" = true ]; then
+  # The end-of-timeout verdict, with the identity evidence that kept it from being a verdict
+  # earlier (F1): a contradiction that was never corroborated as a different process instance
+  # is reported as what it is instead of being silently dropped.
+  case "${IDENT_LAST_INSTANCE}" in
+    same)
+      _ident_note="the pid is still the SAME process instance that was launched (start time ${IDENT_STARTTIME} unchanged), so it is a launcher re-exec through a non-identity image"
+      ;;
+    different)
+      _ident_note="the process instance changed, so this pid is no longer the process that was launched"
+      ;;
+    *)
+      _ident_note="the process instance could not be witnessed on this platform"
+      ;;
+  esac
+  printf '       Identity evidence: %s contradictory sample(s); identity state: %s; %s; last observed command line: %s\n' \
+    "${IDENT_DIFFERENT_SAMPLES}" "${IDENT_STATE}" "${_ident_note}" "$(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")" >&2
+fi
 printf '       The process is still alive but unconfirmed, so NO PID file was written; stop it with ./bin/stop.sh --untracked, then investigate.\n' >&2
 print_bind_hint
 print_decisive_lines "${OUT_FILE}"
