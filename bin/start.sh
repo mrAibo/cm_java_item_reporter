@@ -17,6 +17,25 @@
 #      iteration that the PID is still our process AND that the answer carries the
 #      exact CM Insight marker ({"status":"UP","service":"cm-insight"}), not merely
 #      any HTTP 2xx - a foreign service on the port is never mistaken for CM Insight
+#
+# Startup identity state (Goal 01B section B):
+#   The PID is sampled for identity while the launch transition is still in progress:
+#   the backgrounded launcher child carries the FORKED PARENT's command line until its
+#   first execve, so a sample taken in that window legitimately reads "a different
+#   process" for a PID that is ours. Actions run 36443449216 on 9c7168aa is the
+#   observed consequence: PID 3451 was declared "reused by a different process" while
+#   its log was still 0 bytes, and the same PID was our JVM a fraction of a second
+#   later. Identity is therefore an explicit STATE, bounded in time:
+#     provisional  the default: a contradictory reading is NOT proof of PID reuse
+#     positive     an observation proved this PID is this application (its structural
+#                  command-line identity, or process existence + the exact marker +
+#                  ownership of the listening socket that serves the configured bind)
+#     recycle      a refusal verdict: only ever reached from `positive`, or from
+#                  `provisional` once the bounded launch grace (IDENT_GRACE, 3s, see
+#                  the justification at its definition) has elapsed with no positive
+#                  observation. The transition table is ci_start_identity_next.
+#   Ownership safety is unchanged (section D of Goal 01A/01B): no PID is ever signalled
+#   here, a contradictory identity is never adopted, and stop-time checks are untouched.
 #   6. PUBLISHES run/cm-insight.pid atomically (temp file + rename) ONLY AFTER the
 #      instance is confirmed: health OK, or the process verified in the
 #      process-only modes (--timeout 0, web.port=0). A failed start never writes
@@ -66,6 +85,35 @@ set -euo pipefail
 
 TIMEOUT="${CM_INSIGHT_START_TIMEOUT:-30}"
 APP_ARGS=()
+
+# ---------------------------------------------------------------------------
+# The bounded launch grace for the startup identity (Goal 01B section B)
+# ---------------------------------------------------------------------------
+# Why it exists: bin/start.sh backgrounds the launcher and samples the identity of
+# $! immediately. Until that forked child has completed its FIRST execve it still
+# carries this script's own command line (measured: a child blocked before its first
+# execve reports the parent's argv), so ci_proc_identity correctly answers "1 =
+# a different process" about a PID that is ours. That is exactly what run
+# 36443449216 recorded: PID 3451 was declared recycled while its log was 0 bytes,
+# and the same PID was our JVM a fraction of a second later.
+#
+# Why 3 seconds (derived from that evidence, not chosen as a round number):
+#   * the transient ends when the child is first scheduled, and in the failing run the
+#     ENTIRE launch-to-health sequence - which contains that window as its first
+#     fraction - was over in "a fraction of a second" (0-byte log at the failing
+#     sample, warnings plus a served health answer a moment later);
+#   * the loop's own quantum is 1 second, so 3 seconds is at least 3x the whole
+#     observed startup and two orders of magnitude above the sub-millisecond-per-exec
+#     launcher chain the sample can catch, with room for a loaded shared runner;
+#   * it matches the mirror-image rule already in this loop: GONE_STRIKES=3 refuses to
+#     declare the process gone on one negative liveness sample either, so a negative
+#     identity sample and a negative liveness sample are trusted with the same bounded
+#     patience instead of two different magic numbers;
+#   * it is a bound, not a sleep: the loop sleeps 1s per iteration anyway, so this only
+#     defers a negative VERDICT. A genuinely recycled/foreign PID is still rejected -
+#     as soon as the grace elapses - and a positive identity observation ends the
+#     provisional window immediately.
+IDENT_GRACE=3
 
 usage() {
   cat <<'USAGE'
@@ -413,6 +461,16 @@ PROC_GONE=false
 RECYCLED=false
 GONE_STRIKES=0
 HEALTH_CONFIRMED_URL=""
+
+# Startup identity state (Goal 01B section B). See IDENT_GRACE above for the bound and
+# ci_start_identity_next (bin/lib/cm-insight-lifecycle.sh) for the transition table.
+IDENT_STATE="provisional"     # provisional | positive
+IDENT_SAW_DIFFERENT=false     # a contradictory reading was witnessed while provisional
+IDENT_DIFFERENT_SAMPLES=0
+IDENT_LAST_CMD=""
+MARKER_UNTIED=false           # the marker answers, but not on a socket this PID owns
+IDENT_UNPROVEN=false          # process-only mode: contradictory argv, never a positive one
+
 while : ; do
   # "Gone" is only ever concluded from BOTH nets (review finding H-3). The MSYS pid of a
   # process that exec'd native java.exe can vanish while the Windows process keeps
@@ -441,24 +499,85 @@ while : ; do
   fi
   GONE_STRIKES=0
 
+  # -------------------------------------------------------------------------
+  # Startup identity sample (Goal 01B section B)
+  #
+  # The state machine decides whether this sample may be read as PID reuse. While the
+  # identity is provisional a contradictory reading is NOT proof (the backgrounded
+  # child has not exec'd yet), and the bounded grace makes sure that patience cannot be
+  # exploited: after IDENT_GRACE seconds without a positive observation the very next
+  # contradictory sample is recycle. "Cannot tell" (rc=2) never moves the state.
+  # -------------------------------------------------------------------------
   set +e
   ci_proc_identity "${PID}"
   IDENT_RC=$?
   set -e
-  if [ "${IDENT_RC}" -eq 1 ]; then RECYCLED=true; break; fi
+  IDENT_GRACE_ELAPSED=false
+  [ "${WAITED}" -lt "${IDENT_GRACE}" ] || IDENT_GRACE_ELAPSED=true
+  IDENT_NEXT="$(ci_start_identity_next "${IDENT_STATE}" "${IDENT_RC}" "${IDENT_GRACE_ELAPSED}")"
+  if [ "${IDENT_NEXT}" = "recycle" ]; then RECYCLED=true; break; fi
+  if [ "${IDENT_RC}" -eq 1 ]; then
+    # Witnessed but provisional: recorded as evidence for the diagnosis below and never
+    # acted on as a verdict. This is the line that makes a CI failure self-describing.
+    IDENT_SAW_DIFFERENT=true
+    IDENT_DIFFERENT_SAMPLES=$((IDENT_DIFFERENT_SAMPLES + 1))
+    IDENT_LAST_CMD="$(ci_proc_cmdline "${PID}" 2>/dev/null || true)"
+    log_warn "PID ${PID} reads as a different process ${WAITED}s into the launch; the identity is provisional for ${IDENT_GRACE}s (sample ${IDENT_DIFFERENT_SAMPLES}), so this is not yet proof of PID reuse. Observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")"
+  fi
+  IDENT_STATE="${IDENT_NEXT}"
 
   if [ "${USE_CURL}" = true ]; then
     # The exact marker is required, not any 2xx answer, and every probe candidate of
     # the configured bind is tried (127.0.0.1 and/or ::1 for a wildcard bind).
     ci_health_probe "${PORT}" "${BIND}"
     if [ "${CI_HEALTH_KIND}" = "our" ]; then
-      HEALTH_OK=true
-      HEALTH_CONFIRMED_URL="${CI_HEALTH_URL}"
-      break
+      if [ "${IDENT_STATE}" = "positive" ]; then
+        HEALTH_OK=true
+        HEALTH_CONFIRMED_URL="${CI_HEALTH_URL}"
+        break
+      fi
+      if [ "${IDENT_SAW_DIFFERENT}" != true ]; then
+        # No contradictory reading was ever witnessed (including the platforms where a
+        # command line cannot be inspected at all): the exact marker keeps the weight
+        # it already had in Goal 01A.
+        HEALTH_OK=true
+        HEALTH_CONFIRMED_URL="${CI_HEALTH_URL}"
+        break
+      fi
+      if ci_pid_owns_serving_socket "${PID}" "${PORT}" "${BIND}"; then
+        # POSITIVE evidence from the combination Goal 01B section B asks for: the PID
+        # exists, the EXACT marker answers, and that PID owns the listening socket which
+        # serves the configured bind. From here on a contradictory reading is recycle.
+        IDENT_STATE="positive"
+        HEALTH_OK=true
+        HEALTH_CONFIRMED_URL="${CI_HEALTH_URL}"
+        break
+      fi
+      if [ -z "$(ci_listener_pids "${PORT}" "${BIND}" 2>/dev/null || true)" ]; then
+        # No serving socket on this port carries an attributable owner on this platform,
+        # so ownership cannot be witnessed here. The pre-existing marker rule stands
+        # rather than refusing an instance this platform cannot attribute.
+        HEALTH_OK=true
+        HEALTH_CONFIRMED_URL="${CI_HEALTH_URL}"
+        break
+      fi
+      # The marker answers, but this PID cannot be tied to the socket that served it: do
+      # NOT publish the PID file. Keep waiting (bounded by TIMEOUT) - the real instance
+      # may still be coming up, and a foreign/untracked one must never be adopted.
+      MARKER_UNTIED=true
     fi
   elif [ "${WAITED}" -ge 3 ]; then
-    PROCESS_ONLY=true
-    break
+    # Process-only mode (web.port=0 binds an unknown port, curl may be absent, or --timeout 0
+    # asked for the process only): there is no health marker and no socket evidence to fall
+    # back on, so the SAME evidence bar as in the marker branch applies - the PID file is
+    # published only when a positive identity was observed OR no contradictory reading ever
+    # was. A witnessed contradiction with no positive observation keeps waiting (bounded by
+    # TIMEOUT) instead of publishing a PID file for a pid whose identity could not be shown.
+    if [ "${IDENT_STATE}" = "positive" ] || [ "${IDENT_SAW_DIFFERENT}" != true ]; then
+      PROCESS_ONLY=true
+      break
+    fi
+    IDENT_UNPROVEN=true
   fi
 
   if [ "${WAITED}" -ge "${TIMEOUT}" ]; then break; fi
@@ -514,8 +633,35 @@ if [ "${PROC_GONE}" = true ]; then
 fi
 
 if [ "${RECYCLED}" = true ]; then
-  fail_start "PID ${PID} was reused by a different process before the health check succeeded: ${REASON}." \
+  # Reached ONLY through ci_start_identity_next's "recycle" verdict: a contradictory
+  # reading after a positive identity had been established, or a contradictory reading
+  # that outlived the whole bounded launch grace (IDENT_GRACE). One transient sample in
+  # the launch transition is never enough (Goal 01B section B). The identity evidence is
+  # printed so a CI failure is self-describing instead of a bare "exit code 1".
+  fail_start "PID ${PID} was reused by a different process before the health check succeeded (identity state: ${IDENT_STATE}; ${IDENT_DIFFERENT_SAMPLES} contradictory sample(s) inside the ${IDENT_GRACE}s launch grace; observed command line: $(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")): ${REASON}." \
              "The application is not confirmably running; no PID file was written or removed."
+fi
+
+if [ "${MARKER_UNTIED}" = true ]; then
+  printf 'ERROR: the exact CM Insight marker answered on %s, but the tracked PID %s could not be tied to it: its command line reads as a different process (observed: %s) and it does not own the listening socket that serves web.bind=%s.\n' \
+    "${HEALTH_URL}" "${PID}" "$(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")" "${BIND}" >&2
+  printf '       The marker may be another instance or a process that appeared after launch, so NO PID file was written; inspect it with ./bin/status.sh (Status: UNTRACKED INSTANCE).\n' >&2
+  print_bind_hint
+  print_decisive_lines "${OUT_FILE}"
+  print_log_tail
+  exit 1
+fi
+
+if [ "${IDENT_UNPROVEN}" = true ]; then
+  # Process-only mode, no positive identity, at least one contradictory reading: publishing
+  # the PID file would track a pid whose identity was never shown, which the pre-fix code
+  # refused as well (it refused on the first contradictory sample).
+  printf 'ERROR: CM Insight (PID %s) is alive, but its command line read as a different process during the launch and no positive CM Insight identity was ever observed.\n' "${PID}" >&2
+  printf '       Last observed command line: %s\n' "$(printf '%.200s' "${IDENT_LAST_CMD:-<not inspectable>}")" >&2
+  printf '       This start used a process-only check (%s), so there is no health marker to fall back on; NO PID file was written.\n' "${SKIP_REASON:-process-only}" >&2
+  print_decisive_lines "${OUT_FILE}"
+  print_log_tail
+  exit 1
 fi
 
 printf 'ERROR: CM Insight (PID %s) did not answer %s within %ss: %s.\n' "${PID}" "${HEALTH_URL}" "${TIMEOUT}" "${REASON}" >&2

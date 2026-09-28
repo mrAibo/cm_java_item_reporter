@@ -27,7 +27,12 @@
 #     1. the EXACT CM Insight health marker ({"status":"UP","service":"cm-insight"})
 #        answered on the configured bind address, tied to the socket that is about to
 #        be signalled (the marker answers on <host>:<port>, and the socket bound to
-#        that address on that port is the target);
+#        that address on that port is the target). The tie compares socket-equivalent
+#        spellings (ci_socket_host_matches -> ci_addr_socket_normalize), so a Linux
+#        socket table that reports a 127.0.0.1 listener as ::ffff:127.0.0.1 still ties
+#        to the marker that answered at 127.0.0.1 (Goal 01B sections C/D). That is
+#        ownership/attribution only: the mapped spelling still does NOT count as
+#        loopback for any policy decision;
 #     2. the target's command line EXPLICITLY identifies CM Insight (the
 #        cm-insight.jar path, the bin/cm-insight launcher, or the
 #        com.mraibo.cminsight main class) - used when health does not answer, e.g. a
@@ -256,10 +261,22 @@ stop_untracked_flow() {
   TARGET_ROWS="${SERVING_ROWS}"
   MARKER_TIED=false
   if [ "${CI_HEALTH_KIND}" = "our" ]; then
-    _tied="$(printf '%s\n' "${TARGET_ROWS}" | awk -F'|' -v h="${CI_HEALTH_HOST}" '$1==h')"
+    # The marker answered at CI_HEALTH_HOST:PORT, so the socket that accepted it is the one
+    # bound to THAT address - and the comparison is done in ci_addr_socket_normalize() form
+    # (ci_socket_host_matches), because a Linux socket table may spell a 127.0.0.1 listener
+    # as ::ffff:127.0.0.1 (Goal 01B sections C and D). Raw string equality silently failed
+    # to tie those two, which is exactly the half-met section D requirement: "prove that the
+    # exact marker and the socket owner can be tied to the same CM Insight process on Linux".
+    # Normalisation here is socket equivalence ONLY: it never grants loopback privilege, and
+    # a mapped non-loopback spelling still normalises to that non-loopback address.
+    _tied=""
+    while IFS='|' read -r _tie_h _tie_p _tie_c; do
+      [ -n "${_tie_h}" ] || continue
+      ci_socket_host_matches "${_tie_h}" "${CI_HEALTH_HOST}" || continue
+      _tied="${_tied}${_tie_h}|${_tie_p}|${_tie_c}"$'\n'
+    done <<< "${TARGET_ROWS}"
+    _tied="${_tied%$'\n'}"
     if [ -n "${_tied}" ]; then
-      # The marker answered at CI_HEALTH_HOST:PORT, so the socket bound to that exact
-      # address is the only one that can have accepted it.
       TARGET_ROWS="${_tied}"
       MARKER_TIED=true
     elif [ "$(printf '%s\n' "${TARGET_ROWS}" | awk -F'|' '$1=="0.0.0.0" || $1=="::" || $1=="*"' | rows_count)" = "$(printf '%s\n' "${TARGET_ROWS}" | rows_count)" ]; then
@@ -472,7 +489,7 @@ if [ "${IDENT_RC}" -eq 2 ]; then
     while IFS='|' read -r _h _p _c; do
       [ "${_c}" = "foreign" ] && continue
       ci_same_process "${_p}" "${PID}" || continue
-      if [ "${CI_HEALTH_KIND}" = "our" ] && [ "${CI_HEALTH_HOST}" = "${_h}" ]; then
+      if [ "${CI_HEALTH_KIND}" = "our" ] && ci_socket_host_matches "${_h}" "${CI_HEALTH_HOST}"; then
         OWNED_BY_TRACKED=true
       elif [ "${CI_HEALTH_KIND}" = "our" ] && [ "${_c}" = "covered" ] && [ "$(rows_pids "${TARGET_ROWS}" | rows_count)" = "1" ]; then
         OWNED_BY_TRACKED=true

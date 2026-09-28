@@ -1,5 +1,7 @@
 package com.mraibo.cminsight.connection;
 
+import com.mraibo.cminsight.core.CloseOutcomeAware;
+
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -60,7 +62,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * @param <T> pooled resource type
  */
-public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable {
+public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeAware {
 
     /** Why a resource is being taken out of service. */
     private enum Rotation {
@@ -458,6 +460,43 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
             lock.unlock();
         }
         closeAllAndFinish(drained);
+    }
+
+    /**
+     * Reports whether this pool's shutdown left physical resources in an unknown state.
+     *
+     * <p>Quarantine is the only source of uncertainty. A resource whose {@code close()} threw may still
+     * exist, so its slot deliberately stays consumed; that is invisible to a caller that only watches
+     * for a thrown exception, because this pool handles the failure internally and returns normally.
+     * Exposing it here is what lets {@code RepositoryContext} and {@code RepositoryManager} keep the
+     * fail-closed switch rule without knowing anything about pools.
+     *
+     * <p>A pool that closed everything cleanly reports false, so an ordinary shutdown is never turned
+     * into a failure.
+     */
+    @Override
+    public boolean closedWithUncertainResources() {
+        lock.lock();
+        try {
+            return quarantinedCount > 0;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public String uncertainCloseDetail() {
+        lock.lock();
+        try {
+            if (quarantinedCount == 0) {
+                return "";
+            }
+            return quarantinedCount + " pooled resource(s) of '" + name + "' were quarantined: close() "
+                    + "did not return normally, so the physical session or connection may still exist "
+                    + "and its capacity stays consumed";
+        } finally {
+            lock.unlock();
+        }
     }
 
     // ---------------------------------------------------------------- internals

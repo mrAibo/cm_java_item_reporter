@@ -24,6 +24,9 @@
 #   ci_proc_argv <pid>                  -> the real arguments, one per line
 #   ci_argv_is_cm_insight               -> stdin = argv lines; 0 for a CM Insight token
 #   ci_proc_identity <pid>              -> 0 CM Insight, 1 another process, 2 cannot tell
+#   ci_start_identity_next <state> <rc> <grace_elapsed>
+#                                       -> the next startup identity state or a verdict:
+#                                          positive | provisional | recycle (Goal 01B B)
 #   ci_proc_cmdline <pid>               -> the command line as one line (display only)
 #   ci_listener_rows <port>             -> "host|pid" per LISTENing TCP socket on port
 #                                          (pid "-" when the platform hides the owner)
@@ -212,6 +215,64 @@ ci_proc_cmdline() {
   ci_proc_argv "$1" | tr '\n' ' '
 }
 
+# ---------------------------------------------------------------------------
+# startup identity state (Goal 01B section B)
+# ---------------------------------------------------------------------------
+ci_start_identity_next() {
+  # $1 = current state: provisional | positive
+  # $2 = ci_proc_identity result for the tracked pid: 0 (ours) | 1 (different) | 2 (cannot tell)
+  # $3 = "true" when the bounded launch grace has elapsed (the caller owns the clock)
+  # prints one of:
+  #   positive     an observation proved this pid is this application
+  #   provisional  the state is unchanged; a contradictory reading is NOT proof yet
+  #   recycle      a contradictory reading is now proof of PID reuse: refuse and never signal
+  #
+  # WHY this state exists at all (evidence, Actions run 36443449216 on SHA 9c7168aa):
+  # bin/start.sh backgrounds the launcher and only then samples the identity. Until that
+  # child has exec'd its FIRST image it still carries the FORKED PARENT's command line
+  # (measured: a child blocked before its first execve reports the parent's argv, and
+  # ci_proc_identity correctly answers 1 for it). At that moment the sample says "a
+  # different process" about a PID that becomes this application a moment later - in that
+  # run the log was still 0 bytes when the verdict was reached, and the SAME PID 3451 was
+  # our JVM a fraction of a second later. One early negative sample is therefore not proof
+  # of PID reuse; the identity stays PROVISIONAL until either one POSITIVE observation
+  # occurs or the caller's bounded grace elapses. After that, a contradictory reading IS
+  # recycle (see the table below), so a genuinely recycled or foreign PID is still refused
+  # - only later, and by a bounded amount.
+  #
+  # Transition table (all three inputs are caller-supplied; this function is pure):
+  #   provisional + 0 + any   -> positive      our command line: settled
+  #   provisional + 1 + false -> provisional   the launch transition is not over: not proof
+  #   provisional + 1 + true  -> recycle        the whole bounded grace produced no positive
+  #                                             identity observation: refuse (fail closed)
+  #   provisional + 2 + any   -> provisional   an uninspectable command line proves nothing
+  #   positive    + 0 + any   -> positive
+  #   positive    + 1 + any   -> recycle       a LATER contradiction: proof of reuse
+  #   positive    + 2 + any   -> positive      "cannot tell" never revokes a positive identity
+  # "Cannot tell" (2) never moves the state in either direction: it is neither evidence of
+  # identity nor evidence of reuse, so it can neither adopt a foreign pid nor destroy a
+  # proven one.
+  _ci_si_state="${1:-provisional}"
+  _ci_si_rc="${2:-2}"
+  _ci_si_grace_elapsed="${3:-false}"
+  case "${_ci_si_rc}" in
+    0) printf 'positive' ;;
+    1)
+      case "${_ci_si_state}${_ci_si_grace_elapsed}" in
+        positive*) printf 'recycle' ;;
+        provisionaltrue) printf 'recycle' ;;
+        *) printf 'provisional' ;;
+      esac
+      ;;
+    *)
+      case "${_ci_si_state}" in
+        positive) printf 'positive' ;;
+        *) printf 'provisional' ;;
+      esac
+      ;;
+  esac
+}
+
 ci_process_exists() {
   # $1 = pid; 0 when the OS still has that process, in EITHER pid namespace.
   # SECURITY/RELIABILITY (review findings H-3/H-4): `kill -0` plus /proc alone is not
@@ -370,6 +431,22 @@ ci_pid_owns_serving_socket() {
   return 1
 }
 
+ci_socket_host_matches() {
+  # $1, $2 = socket hosts (a socket-table host, a configured bind, or a probe host).
+  # 0 when both denote the SAME socket address, compared in ci_addr_socket_normalize()
+  # form so the spellings of one address are equal (Goal 01B sections C and D):
+  #   127.0.0.1 and ::ffff:127.0.0.1      (IPv4-mapped IPv6 representation)
+  #   [::ffff:127.0.0.1] and ::ffff:127.0.0.1  (bracketed tool output)
+  #   127.0.0.1 and 127.0.0.01/127.000.000.001 (the same address, differently padded)
+  # This is a SOCKET-EQUIVALENCE helper for ownership/attribution ONLY: it decides
+  # whether the row a health answer arrived on is the row that is about to be tied to a
+  # PID. It never grants loopback privilege - ci_addr_is_loopback stays the one exposure
+  # rule, and a mapped spelling of a non-loopback address still normalises to that
+  # non-loopback address (::ffff:192.0.2.10 is 192.0.2.10, never 127.0.0.1).
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+  [ "$(ci_addr_socket_normalize "$1")" = "$(ci_addr_socket_normalize "$2")" ]
+}
+
 ci_signalable_pid() {
   # $1 = pid; prints the pid that `kill` accepts for it on this platform, or nothing
   # when the value cannot be resolved into the local process namespace. NOTHING is
@@ -480,6 +557,12 @@ ci_describe_socket() {
         fi
       elif [ "${_ci_ds_wild}" = true ]; then
         printf 'socket %s (a wildcard form that serves the configured bind %s)' "${_ci_ds_display}" "${_ci_ds_bind}"
+      elif [ "$(ci_addr_socket_normalize "${_ci_ds_host}")" = "$(ci_addr_socket_normalize "${_ci_ds_bind}")" ]; then
+        # Two spellings of one socket address: a Linux socket table may report a 127.0.0.1
+        # listener as ::ffff:127.0.0.1. Saying "one of the addresses the bind resolves to"
+        # would read as if these were two different sockets (Goal 01B section C/D). The
+        # wording stays direction-neutral: either spelling may be the mapped one.
+        printf 'socket %s (the SAME socket address as the configured bind %s, only spelled differently: %s and %s denote one socket - an IPv4-mapped IPv6 spelling and its IPv4 form are the same listener)' "${_ci_ds_display}" "${_ci_ds_bind}" "${_ci_ds_host}" "${_ci_ds_bind}"
       else
         printf 'socket %s (one of the addresses the configured bind %s resolves to)' "${_ci_ds_display}" "${_ci_ds_bind}"
       fi

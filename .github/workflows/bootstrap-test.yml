@@ -10,13 +10,16 @@ permissions:
 jobs:
   java17-bootstrap:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Bounded total runtime. The committed shell suite has its own bounds (300s per
+    # test file, 600s suite budget) and the lifecycle step runs three bounded cycles,
+    # so this ceiling is only the backstop for a hung JVM or a hung step.
+    timeout-minutes: 20
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -27,7 +30,12 @@ jobs:
                    bin/stop.sh bin/restart.sh bin/status.sh bin/doctor.sh bin/clean.sh; do
             test -x "$f" || { echo "ERROR: $f is not executable"; exit 1; }
           done
-          echo "OK: all operational scripts are executable"
+          # Committed regression tests are executed directly, so they carry the bit too.
+          for f in tests/shell/*.sh; do
+            test -f "$f" || { echo "ERROR: no tests/shell/*.sh was found"; exit 1; }
+            test -x "$f" || { echo "ERROR: $f is not executable"; exit 1; }
+          done
+          echo "OK: all operational scripts and committed tests are executable"
 
       - name: Shell syntax check
         run: |
@@ -42,12 +50,19 @@ jobs:
             test -f "$f" || { echo "ERROR: $f is missing"; exit 1; }
             bash -n "$f" || { echo "ERROR: $f has a syntax error"; exit 1; }
           done
+          # Committed regression tests: same rule, and a missing directory is an error
+          # rather than a silently empty loop.
+          for f in tests/shell/*.sh; do
+            test -f "$f" || { echo "ERROR: no tests/shell/*.sh was found"; exit 1; }
+            bash -n "$f" || { echo "ERROR: $f has a syntax error"; exit 1; }
+          done
           echo "OK: script syntax is valid"
 
       - name: Script help smoke test
         run: |
           ./build.sh --help >/dev/null
           ./tests/selftest.sh --help >/dev/null
+          ./tests/shell/run.sh --help >/dev/null
           ./bin/compile.sh --help >/dev/null
           ./bin/cm-insight --help >/dev/null
           ./bin/start.sh --help >/dev/null
@@ -69,9 +84,9 @@ jobs:
 
       # Bounded, offline guards for the Goal 01A safety rules (review finding F6). No network,
       # no new dependency, no extra port: the runtime lifecycle is exercised by the
-      # Start/Status/Stop steps below. These checks fail the build if a future change weakens
-      # the exact-marker rule, the structural identity rule, the wildcard/specific address
-      # classification or the non-loopback plain-HTTP refusal.
+      # committed suite and the repeated lifecycle step below. These checks fail the build if
+      # a future change weakens the exact-marker rule, the structural identity rule, the
+      # wildcard/specific address classification or the non-loopback plain-HTTP refusal.
       #
       # ORDER MATTERS: this step invokes ./bin/cm-insight, which needs build/cm-insight.jar. It
       # must therefore run AFTER the Build step above; executed before it, the launcher exits 2
@@ -140,15 +155,72 @@ jobs:
           [ "${guard_run}" -eq 3 ] || fail "the runtime did not refuse a non-loopback plain-HTTP config (exit ${guard_run}, expected 3)"
           echo "OK: non-loopback plain HTTP refused without web.allowInsecureHttp (validator 1, runtime 3)"
 
+      # The committed suite (tests/shell/, Goal 01B section F) is the gate for the shell
+      # behaviour this goal touches: the exact health marker, structural argv identity,
+      # IPv4-mapped IPv6 listener classification, "an unrelated process/JVM is never an
+      # ownership proof", and a bounded repeated Linux start/status/stop soak. Its exit
+      # code is the step result: no `|| true`, no tolerated failures. A suite that
+      # discovers nothing also fails, so this step can never silently become a no-op.
+      - name: Committed shell regression suite (tests/shell/run.sh)
+        run: ./tests/shell/run.sh
+
       - name: Doctor
         run: ./bin/doctor.sh
 
-      - name: Start
-        run: ./bin/start.sh --timeout 60
+      # The lifecycle step that failed intermittently on Goal 01A's reviewed SHA now runs
+      # SEVERAL bounded cycles instead of one, against the repository's own configuration
+      # (the flow an operator actually runs), so a startup race cannot hide behind a single
+      # lucky pass. Every cycle must start healthy, report RUNNING/healthy while it serves
+      # the exact marker, stop cleanly, remove its PID file and release the port. The first
+      # failed assertion ends the step with a non-zero exit; `set -u` only, so each command's
+      # status is checked explicitly rather than trusted.
+      - name: Lifecycle reliability (bounded start/status/stop cycles)
+        run: |
+          set -u
+          cycles="${CI_LIFECYCLE_CYCLES:-3}"
+          fail() { echo "ERROR: $1"; exit 1; }
+
+          for cycle in $(seq 1 "${cycles}"); do
+            echo "=== cycle ${cycle}/${cycles}: start ==="
+            ./bin/start.sh --timeout 60 || fail "cycle ${cycle}: start.sh did not confirm a healthy instance"
+
+            echo "=== cycle ${cycle}/${cycles}: status ==="
+            status_out="$(./bin/status.sh 2>&1)"
+            status_rc=$?
+            printf '%s\n' "${status_out}"
+            [ "${status_rc}" -eq 0 ] || fail "cycle ${cycle}: status.sh exited ${status_rc}"
+            printf '%s\n' "${status_out}" | grep -q '^Status: RUNNING$' || fail "cycle ${cycle}: status is not RUNNING"
+            printf '%s\n' "${status_out}" | grep -q '^Health: OK' || fail "cycle ${cycle}: the health check is not OK"
+
+            health_url="$(printf '%s\n' "${status_out}" | sed -n 's/^Health: OK (\(.*\))$/\1/p' | head -n 1)"
+            [ -n "${health_url}" ] || fail "cycle ${cycle}: status.sh did not print the health URL"
+            body="$(curl -sS --max-time 5 "${health_url}" 2>&1)"
+            [ "${body}" = '{"status":"UP","service":"cm-insight"}' ] \
+              || fail "cycle ${cycle}: ${health_url} did not return the exact CM Insight marker (got: ${body})"
+            echo "marker: OK (${health_url})"
+
+            port="${health_url##*:}"
+            port="${port%%/*}"
+            case "${port}" in ''|*[!0-9]*) fail "cycle ${cycle}: cannot derive the port from ${health_url}" ;; esac
+
+            echo "=== cycle ${cycle}/${cycles}: stop ==="
+            ./bin/stop.sh --force --timeout 20 || fail "cycle ${cycle}: stop.sh did not stop the instance"
+            [ ! -f run/cm-insight.pid ] || fail "cycle ${cycle}: run/cm-insight.pid survived the stop"
+
+            waited=0
+            while [ "${waited}" -lt 15 ]; do
+              if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then break; fi
+              sleep 1
+              waited=$((waited + 1))
+            done
+            [ "${waited}" -lt 15 ] || fail "cycle ${cycle}: 127.0.0.1:${port} still accepts connections after the stop"
+            echo "=== cycle ${cycle}/${cycles}: clean (PID file removed, port ${port} released) ==="
+          done
+          echo "OK: ${cycles} bounded lifecycle cycles passed (start, status, exact marker, stop, port released)"
 
       # GitHub renders `::error::` workflow commands as check-run ANNOTATIONS, which are
       # readable through the API without repository admin rights, unlike raw step logs.
-      # This turns a red Start step into a self-describing failure instead of "exit code 1".
+      # This turns a red lifecycle step into a self-describing failure instead of "exit code 1".
       - name: Diagnose a failed start
         if: failure()
         run: |
@@ -171,14 +243,22 @@ jobs:
           echo "::error::start-diagnostic: run dir -> $(ls -la run 2>&1 | tr '\n' ' ')"
           echo "::error::start-diagnostic: our procs -> $(ps -eo pid,etimes,args 2>/dev/null | grep '[c]m-insight' | head -n 3 | tr '\n' ' ')"
           echo "::error::start-diagnostic: listeners -> $( (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep -E ':8080' | tr '\n' ' ' || echo none)"
-
-      - name: Status and local health
-        run: ./bin/status.sh
+          if [ -f run/cm-insight.pid ]; then
+            echo "::error::start-diagnostic: pid file -> $(cat run/cm-insight.pid 2>&1 | tr '\n' ' ')"
+          fi
 
       - name: Application log on failure
         if: failure()
         run: tail -n 200 logs/cm-insight.out || true
 
+      # Cleanup, not a gate: it runs whatever happened above. It is NOT hidden behind
+      # `|| true` - a stop that cannot stop the instance it started is a real failure of
+      # this job, and it must be visible instead of silently leaving a JVM on the runner.
+      # `--untracked` adds exactly one capability: when a test or a failed cycle left an
+      # instance WITHOUT its PID file, the stop can still reach it - and only with the
+      # same positive ownership evidence as always (the exact CM Insight marker on a
+      # socket it owns, or a command line that names CM Insight). No evidence means a
+      # refusal and a red job, never a permissive kill.
       - name: Stop (always)
         if: always()
-        run: ./bin/stop.sh --force --timeout 15 || true
+        run: ./bin/stop.sh --untracked --force --timeout 20

@@ -40,6 +40,23 @@
 # reporting truthful without letting a different process's socket in the other family
 # authorise a stop.
 #
+# IPv4-MAPPED IPv6 SPELLINGS (Goal 01B section C/H) - SOCKET EQUIVALENCE ONLY:
+# a dual-stack JVM reports the listener of an IPv4 configuration in the IPv4-MAPPED
+# IPv6 spelling. Measured on Linux (failed push Actions run 36443449216): a live
+# web.bind=127.0.0.1 listener appears in `ss -ltnp` as ::ffff:127.0.0.1:8080, and the
+# plain string comparison called that row FOREIGN, so bin/stop.sh discarded the socket
+# that carried the live CM Insight marker and refused ownership of the instance it had
+# itself started. ci_addr_socket_normalize() therefore canonicalises a socket host that
+# is an IPv4-mapped IPv6 literal to the IPv4 address that literal SERVES (RFC 4291
+# 2.5.5.2: ::ffff:a.b.c.d is the IPv4 address a.b.c.d in the IPv6 family), and
+# ci_addr_socket_class() compares canonical forms on BOTH sides. The class names and
+# the wildcard/sibling rules are untouched; only the spelling of the same address
+# stops being treated as a different one.
+# That is equivalence, NOT exposure policy: ci_addr_is_loopback() is the shell mirror of
+# SecurityPolicy.isLoopbackLiteral and stays deliberately UNCHANGED, so a configured
+# `web.bind=::ffff:127.0.0.1` still gains no loopback privilege merely because the
+# socket parser understands the mapping.
+#
 # Sourcing this file has NO side effects: no output, no exit, no files, no network.
 # Every function is pure string/parse logic except ci_health_marker_ok, which the
 # CALLER decides to invoke and which performs at most one loopback HTTP probe.
@@ -52,6 +69,9 @@
 #   ci_addr_listen_hosts <bind>              -> socket hosts that ARE this bind's listener
 #   ci_addr_wildcard_hosts <bind>            -> wildcard sockets that serve <bind>
 #   ci_addr_sibling_hosts <bind>             -> the OTHER family's wildcard on the same port
+#   ci_addr_is_ipv4_quad <value>             -> 0 for a dotted-quad IPv4 literal
+#   ci_addr_mapped_ipv4 <host>               -> the IPv4 address an ::ffff: literal serves
+#   ci_addr_socket_normalize <host>          -> socket-equivalence spelling of a socket host
 #   ci_addr_socket_class <host> <bind>       -> prints exact | covered | sibling | foreign
 #   ci_health_url <host> <port>              -> http://host:port/api/health (IPv6 bracketed)
 #   ci_health_body_is_marker <body>          -> 0 ONLY for the EXACT CM Insight marker
@@ -213,24 +233,162 @@ ci_addr_sibling_hosts() {
   esac
 }
 
+ci_addr_is_ipv4_quad() {
+  # $1 = value; 0 when it is a dotted-quad IPv4 literal: exactly four decimal octets,
+  # each one 1-3 digits and 0-255 (the same strictness ci_addr_is_loopback applies to a
+  # 127/8 literal). A parser helper for ci_addr_mapped_ipv4, nothing else.
+  _ci_iq="$1"
+  case "${_ci_iq}" in ''|*[!0-9.]*) return 1 ;; esac
+  _ci_iq_count=0
+  _ci_iq_rest="${_ci_iq}"
+  while : ; do
+    case "${_ci_iq_rest}" in
+      *.*) _ci_iq_octet="${_ci_iq_rest%%.*}"; _ci_iq_rest="${_ci_iq_rest#*.}" ;;
+      *) _ci_iq_octet="${_ci_iq_rest}"; _ci_iq_rest="" ;;
+    esac
+    case "${_ci_iq_octet}" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#_ci_iq_octet}" -le 3 ] || return 1
+    [ "$((10#${_ci_iq_octet}))" -le 255 ] || return 1
+    _ci_iq_count=$((_ci_iq_count + 1))
+    [ -n "${_ci_iq_rest}" ] || break
+  done
+  [ "${_ci_iq_count}" -eq 4 ]
+}
+
+ci_addr_mapped_ipv4() {
+  # $1 = host (a socket-table host or a configured bind); prints the IPv4 dotted quad
+  # that an IPv4-MAPPED IPv6 literal SERVES, or nothing when the value is not one.
+  #
+  # OWNERSHIP-EQUIVALENCE ONLY. This answers "which IPv4 address is the socket bound
+  # to", never "may this configuration be exposed": the caller is the socket
+  # classifier, and ci_addr_is_loopback deliberately keeps the mapped spelling
+  # non-loopback for configured input (SecurityPolicy.isLoopbackLiteral mirror).
+  #
+  # The mapping is ::ffff:<ipv4>/96 (RFC 4291 2.5.5.2), so the underlying IPv4 address
+  # is exactly the last 32 bits. It is derived from that exact tail and validated - no
+  # substring search, no prefix guess: ::ffff:192.0.2.10 denotes 192.0.2.10 and can
+  # never denote 127.0.0.1 (review rule "no substring games").
+  #
+  # Accepted spellings - all of them the SAME address, i.e. what the literal means:
+  #   ::ffff:127.0.0.1                 0:0:0:0:0:ffff:127.0.0.1
+  #   0000:0000:0000:0000:0000:ffff:127.0.0.1
+  #   ::ffff:7f00:1                    0:0:0:0:0:ffff:7f00:1
+  # The two tail spellings are the dotted quad and the same 32 bits as two hex groups.
+  # Everything else yields nothing: a group that is not zero in front of the ffff group
+  # (fe80::ffff:127.0.0.1), a zone suffix (::ffff:127.0.0.1%eth0), a malformed or longer
+  # tail, or the group COUNT that would not be an address at all. An unproven
+  # equivalence must never become ownership evidence, so the parser fails closed.
+  _ci_mv="$(ci_addr_normalize "${1:-}")"
+  case "${_ci_mv}" in
+    *ffff:*) : ;;
+    *) return 1 ;;
+  esac
+  _ci_mv_pre="${_ci_mv%ffff:*}"      # the groups in front of the ffff group (shortest match)
+  _ci_mv_tail="${_ci_mv##*ffff:}"    # the 32 bits that carry the IPv4 address
+  case "${_ci_mv_pre}" in
+    *[!0:]*) return 1 ;;             # a non-zero group in front: a different address
+    *:::) return 1 ;;                # ':::' is a malformed separator run, not an elision
+  esac
+  # Group count (RFC 4291): an address with an embedded IPv4 tail has 6 groups in front
+  # of it, of which the LAST is ffff, so exactly 5 groups may precede ffff. Either they
+  # are written out as five zero groups (0:0:0:0:0:) or the "::" elision stands for the
+  # rest of them (::, 0:0::, ...). Any other count is not an IPv6 address at all - a bare
+  # "ffff:127.0.0.1" is a DIFFERENT (invalid) literal, and it must not be accepted just
+  # because its tail looks like a loopback address.
+  _ci_mv_colons="${_ci_mv_pre//0/}"
+  case "${_ci_mv_pre}" in
+    *::*) _ci_mv_groups=$(( ${#_ci_mv_colons} - 2 )) ;;
+    *) _ci_mv_groups="${#_ci_mv_colons}" ;;
+  esac
+  [ "${_ci_mv_groups}" -le 5 ] || return 1
+  case "${_ci_mv_pre}" in
+    *::*) : ;;
+    *) [ "${_ci_mv_groups}" -eq 5 ] || return 1 ;;
+  esac
+  [ -n "${_ci_mv_tail}" ] || return 1
+  case "${_ci_mv_tail}" in
+    *.*)
+      ci_addr_is_ipv4_quad "${_ci_mv_tail}" || return 1
+      printf '%s' "${_ci_mv_tail}"
+      return 0
+      ;;
+  esac
+  case "${_ci_mv_tail}" in
+    *:*)
+      _ci_mv_hi="${_ci_mv_tail%%:*}"
+      _ci_mv_lo="${_ci_mv_tail#*:}"
+      case "${_ci_mv_lo}" in *:*) return 1 ;; esac     # exactly two groups
+      case "${_ci_mv_hi}" in ''|*[!0-9a-f]*) return 1 ;; esac
+      case "${_ci_mv_lo}" in ''|*[!0-9a-f]*) return 1 ;; esac
+      [ "${#_ci_mv_hi}" -le 4 ] || return 1
+      [ "${#_ci_mv_lo}" -le 4 ] || return 1
+      _ci_mv_hi=$((16#${_ci_mv_hi}))
+      _ci_mv_lo=$((16#${_ci_mv_lo}))
+      printf '%d.%d.%d.%d' \
+        "$((_ci_mv_hi / 256))" "$((_ci_mv_hi % 256))" \
+        "$((_ci_mv_lo / 256))" "$((_ci_mv_lo % 256))"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+ci_addr_socket_normalize() {
+  # $1 = socket-table host; prints the CANONICAL spelling used for listener-ownership
+  # EQUIVALENCE, so two spellings of the same address (::ffff:127.0.0.1 and 127.0.0.1)
+  # compare equal:
+  #   * an IPv4-mapped IPv6 literal becomes the IPv4 address it serves;
+  #   * everything else is only normalised (trimmed / lowercased / unbracketed).
+  # This function must NEVER be used to decide exposure policy or loopback privilege:
+  # ci_addr_is_loopback is the only such rule and it is untouched. See the module
+  # header (IPv4-MAPPED IPv6 SPELLINGS).
+  _ci_sn="$(ci_addr_normalize "${1:-}")"
+  # Defensive: a caller may hand over the raw LOCAL ADDRESS field of a socket table,
+  # which some tools spell "[::ffff:127.0.0.1]:8080". bin/lib/cm-insight-lifecycle.sh
+  # already strips the port and the brackets, so this only makes the classifier usable
+  # on the unfiltered field; it can never widen a class, because the port was already
+  # used to select the rows.
+  case "${_ci_sn}" in
+    \[*\]:*) _ci_sn="${_ci_sn#\[}"; _ci_sn="${_ci_sn%%\]*}" ;;
+  esac
+  _ci_sn_v4="$(ci_addr_mapped_ipv4 "${_ci_sn}")" || _ci_sn_v4=""
+  if [ -n "${_ci_sn_v4}" ]; then printf '%s' "${_ci_sn_v4}"; else printf '%s' "${_ci_sn}"; fi
+}
+
 ci_addr_socket_class() {
   # $1 = socket-table host, $2 = configured bind; prints exact | covered | sibling | foreign.
-  #   exact   the socket is bound to the configured address (its wildcard form included)
+  #   exact   the socket is bound to the configured address (its wildcard form included).
+  #           A configured 127.0.0.1 socket that the table reports as ::ffff:127.0.0.1 is
+  #           the same bound address, so it is exact (Goal 01B section C), not foreign.
   #   covered a wildcard socket that serves the configured address
   #   sibling the same port in the OTHER address family (reported, never an ownership
   #           or authorization basis)
   #   foreign bound elsewhere: it cannot be the listener of this configuration
-  _ci_sh="$(ci_addr_normalize "${1:-}")"
+  #
+  # Both sides are compared in ci_addr_socket_normalize() form, so the equivalence is
+  # symmetric: a configured mapped spelling also matches the IPv4 spelling of its
+  # socket. The class rules themselves (and therefore the Goal 01A wildcard/sibling
+  # safety rules) are unchanged - only the spelling of an address is canonicalised.
+  #
+  # The lists are read line by line instead of `for _h in $(...)`: the deliberate
+  # wildcard candidate `*` is what several socket tools print for the unspecified
+  # address, and an unquoted word list lets the shell PATHNAME-EXPAND it into the files
+  # of the working directory, which silently classified a `*` socket row as foreign
+  # instead of covered for a wildcard configuration.
+  _ci_sh="$(ci_addr_socket_normalize "${1:-}")"
   _ci_sc_bind="${2:-}"
-  for _ci_h in $(ci_addr_listen_hosts "${_ci_sc_bind}"); do
-    [ "${_ci_h}" = "${_ci_sh}" ] && { printf 'exact'; return 0; }
-  done
-  for _ci_h in $(ci_addr_wildcard_hosts "${_ci_sc_bind}"); do
-    [ "${_ci_h}" = "${_ci_sh}" ] && { printf 'covered'; return 0; }
-  done
-  for _ci_h in $(ci_addr_sibling_hosts "${_ci_sc_bind}"); do
-    [ "${_ci_h}" = "${_ci_sh}" ] && { printf 'sibling'; return 0; }
-  done
+  while IFS= read -r _ci_h; do
+    [ -n "${_ci_h}" ] || continue
+    [ "$(ci_addr_socket_normalize "${_ci_h}")" = "${_ci_sh}" ] && { printf 'exact'; return 0; }
+  done <<< "$(ci_addr_listen_hosts "${_ci_sc_bind}")"
+  while IFS= read -r _ci_h; do
+    [ -n "${_ci_h}" ] || continue
+    [ "$(ci_addr_socket_normalize "${_ci_h}")" = "${_ci_sh}" ] && { printf 'covered'; return 0; }
+  done <<< "$(ci_addr_wildcard_hosts "${_ci_sc_bind}")"
+  while IFS= read -r _ci_h; do
+    [ -n "${_ci_h}" ] || continue
+    [ "$(ci_addr_socket_normalize "${_ci_h}")" = "${_ci_sh}" ] && { printf 'sibling'; return 0; }
+  done <<< "$(ci_addr_sibling_hosts "${_ci_sc_bind}")"
   printf 'foreign'
   return 0
 }
