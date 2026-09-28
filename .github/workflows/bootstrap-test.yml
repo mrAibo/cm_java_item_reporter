@@ -58,11 +58,25 @@ jobs:
           ./bin/clean.sh --help >/dev/null
           echo "OK: every script supports --help"
 
-      # Bounded, offline guards for the Goal 01A safety rules (review finding F6). No
-      # network, no new dependency, no extra port: the runtime lifecycle is exercised by
-      # the Start/Status/Stop steps below. These checks fail the build if a future change
-      # weakens the exact-marker rule, the structural identity rule, the wildcard/specific
-      # address classification or the non-loopback plain-HTTP refusal.
+      - name: Prepare local configuration
+        run: |
+          cp conf/application.properties.example conf/application.properties
+          echo "OK: conf/application.properties prepared from the example"
+          grep -c '=' conf/application.properties >/dev/null
+
+      - name: Build (offline compile + required test suite + package)
+        run: ./build.sh
+
+      # Bounded, offline guards for the Goal 01A safety rules (review finding F6). No network,
+      # no new dependency, no extra port: the runtime lifecycle is exercised by the
+      # Start/Status/Stop steps below. These checks fail the build if a future change weakens
+      # the exact-marker rule, the structural identity rule, the wildcard/specific address
+      # classification or the non-loopback plain-HTTP refusal.
+      #
+      # ORDER MATTERS: this step invokes ./bin/cm-insight, which needs build/cm-insight.jar. It
+      # must therefore run AFTER the Build step above; executed before it, the launcher exits 2
+      # ("build first") instead of the application's own code and every assertion below fails
+      # for the wrong reason.
       - name: Safety guards (marker, identity, bind classification, insecure opt-in)
         run: |
           set -u
@@ -106,7 +120,7 @@ jobs:
           # instead of tripping the separate development-default rule (F-1).
           # TWO contracts are asserted separately, because they differ by design: the validator
           # exits 1 ("refused"), while the runtime exits 3 (configuration error, before anything
-          # binds). Asserting 3 against --validate-config was wrong and would have failed here.
+          # binds). Asserting 3 against --validate-config would be wrong.
           guard_cfg="$(mktemp)"
           trap 'rm -f "${guard_cfg}"' EXIT
           { echo 'web.bind=0.0.0.0'; echo 'web.port=0'; echo 'web.auth.user=ci-operator'
@@ -125,15 +139,6 @@ jobs:
           set -e
           [ "${guard_run}" -eq 3 ] || fail "the runtime did not refuse a non-loopback plain-HTTP config (exit ${guard_run}, expected 3)"
           echo "OK: non-loopback plain HTTP refused without web.allowInsecureHttp (validator 1, runtime 3)"
-
-      - name: Prepare local configuration
-        run: |
-          cp conf/application.properties.example conf/application.properties
-          echo "OK: conf/application.properties prepared from the example"
-          grep -c '=' conf/application.properties >/dev/null
-
-      - name: Build (offline compile + required test suite + package)
-        run: ./build.sh
 
       - name: Doctor
         run: ./bin/doctor.sh
