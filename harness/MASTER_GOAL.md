@@ -95,7 +95,9 @@ A goal is not complete until:
 7. no secret/proprietary binary is committed;
 8. documentation is updated when behavior changes;
 9. STATUS.md is updated with exact state and architecture-review handoff;
-10. changes are committed as one coherent goal commit or a small reviewable series.
+10. changes are committed as one coherent goal commit or a small reviewable series;
+11. the completed goal commits are pushed by the lead agent to the current GitHub working branch;
+12. the lead agent verifies that the remote branch HEAD equals the local HEAD after push; do not ask the user to push routine goal commits.
 
 ## STATUS.md is mandatory
 
@@ -111,7 +113,9 @@ At the end, update STATUS.md with:
 - unresolved failures/risks
 - architecture decisions changed only if user-approved
 - next goal status: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED
+- local final HEAD and verified remote branch HEAD after push
 - copy/paste resume/review instruction for another session
 
 Never leave STATUS.md claiming a test passed if it was not run.
 Never proceed to a provisional goal without explicit approval after architecture review.
+Never merge the working branch or pull request unless the user explicitly asks; pushing the reviewed working branch is required, merging is not.

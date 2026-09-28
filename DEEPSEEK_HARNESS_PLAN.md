@@ -23,7 +23,9 @@ Goals after the currently approved goal are planning drafts only. They exist to 
 9. Run build/tests before declaring success.
 10. Update STATUS.md at the end.
 11. Commit one coherent goal result with a clear message.
-12. After completing the approved goal, set the next goal to NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED and stop.
+12. Push the resulting commits yourself to the current GitHub working branch and verify remote HEAD == local HEAD.
+13. Do not ask the user to perform the routine push, and do not merge the branch/PR.
+14. After completing the approved goal, set the next goal to NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED and stop.
 
 ## Architecture/code review loop
 
