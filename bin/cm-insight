@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+JAVA="${JAVA_HOME:+${JAVA_HOME}/bin/}java"
+command -v "${JAVA}" >/dev/null 2>&1 || { echo "ERROR: java not found" >&2; exit 2; }
+APP_JAR="${ROOT}/build/cm-insight.jar"
+[[ -f "${APP_JAR}" ]] || { echo "ERROR: ${APP_JAR} not found; run ./build.sh" >&2; exit 2; }
+shopt -s nullglob
+JARS=("${ROOT}"/lib/ibm/*.jar "${ROOT}"/lib/db2/*.jar "${ROOT}"/lib/oracle/*.jar "${ROOT}"/lib/app/*.jar)
+CP="${APP_JAR}"
+if (( ${#JARS[@]} > 0 )); then OLD_IFS="${IFS}"; IFS=:; CP="${CP}:${JARS[*]}"; IFS="${OLD_IFS}"; fi
+CONFIG="${CM_INSIGHT_CONFIG:-${ROOT}/conf/application.properties}"
+exec "${JAVA}" ${CM_INSIGHT_JAVA_OPTS:-} -cp "${CP}" com.mraibo.cminsight.app.Main --config "${CONFIG}" "$@"
