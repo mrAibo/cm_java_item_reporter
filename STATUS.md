@@ -16,6 +16,20 @@
 - Goals 02-05: provisional drafts; architecture review required before any is approved
 - **Next goal: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
 
+## Goal 01 checkpoint
+
+- Date/time: 2026-09-28 15:03 +02:00
+- Branch: `bootstrap/cm-insight-architecture`
+- Goal 01 commit: **`fb42a0e55e69b551bffdcf0986714b8110dbdfb6`** (`fb42a0e`)
+  "feat(goal-01): production-grade core runtime" - 82 files, 12081 insertions, 551 deletions
+- Preceding mechanical commit: `cf745cf` "chore: pin LF line endings for text files"
+  (line-ending policy only; the index already stored LF for every text file, so no content changed)
+- This STATUS.md update is the commit that follows `fb42a0e`.
+- Working tree verified clean at `fb42a0e`; no jar, archive, credential or generated directory is
+  tracked.
+- The goal commit is a small reviewable series of two commits, which MASTER_GOAL's definition of done
+  explicitly permits. Neither commit executes GOAL_02 or any other provisional goal.
+
 ## Verification of the environment (read this before trusting any test claim)
 
 - The repository was cloned fresh in this session; `main` contains only a one-line README, so all
