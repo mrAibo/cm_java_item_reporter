@@ -146,6 +146,26 @@ jobs:
       - name: Start
         run: ./bin/start.sh --timeout 30
 
+      # GitHub renders `::error::` workflow commands as check-run ANNOTATIONS, which are
+      # readable through the API without repository admin rights, unlike raw step logs.
+      # This turns a red Start step into a self-describing failure instead of "exit code 1".
+      - name: Diagnose a failed start
+        if: failure()
+        run: |
+          echo "::error::start-diagnostic: begin"
+          if [ -f logs/cm-insight.out ]; then
+            echo "--- logs/cm-insight.out (last 40 lines) ---"
+            tail -n 40 logs/cm-insight.out || true
+            tail -n 6 logs/cm-insight.out | while IFS= read -r line; do
+              echo "::error::start-log: ${line}"
+            done
+          else
+            echo "::error::start-diagnostic: no logs/cm-insight.out was created at all"
+          fi
+          echo "::error::start-diagnostic: run dir -> $(ls -la run 2>&1 | tr '\n' ' ')"
+          echo "::error::start-diagnostic: java procs -> $(ps -ef 2>/dev/null | grep -c '[c]m-insight' || true)"
+          echo "::error::start-diagnostic: listeners -> $( (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep -E ':8080' | tr '\n' ' ' || echo none)"
+
       - name: Status and local health
         run: ./bin/status.sh
 
