@@ -154,20 +154,47 @@ Exact-SHA GitHub Actions (`bootstrap-test`, both events) - all green:
 | --- | --- | --- |
 | `4b844bd` (initial Goal 01C) | `36477237772` success | `36477243761` success |
 | `dd6a34c` (review fixes) | `36479626191` success | `36479635585` success |
+| `26894a4` (STATUS.md only) | `36480132293` **failure** | `36480141960` **failure** |
+| `c1c11b3` (regression fix) | see the final handoff report | see the final handoff report |
 
-Each run executed the full job: script permissions, shell syntax, `--help` smoke tests, `./build.sh`
+The `26894a4` failure is recorded deliberately rather than hidden. A documentation-only commit cannot
+change test behaviour, so its two red runs were the first visible symptom of a REAL regression
+introduced by the review-fix commit: `RepositoryManagerTest.concurrentSwitchesNeverLeaveTwoContextsActive`
+failed with "the repository lifecycle kept changing while this switch was being evaluated". Root cause:
+the F1 mitigation above (sample outside the lock, revalidate under it, bounded re-samples). With eight
+threads queueing on the switch lock, each thread's sample was invalidated by the switch ahead of it and
+the bounded retry exhausted itself, turning a legitimate concurrent switch into a spurious failure. Two
+consequences were drawn and both are committed:
+
+- the mitigation was reverted (see risk 1) rather than papered over with a larger retry count, because
+  the correctness of a contended switch outranks the latency it avoids;
+- the single-run Java suite was NOT sufficient to catch it. The local verification for this goal now
+  includes a hammer that repeats the concurrency-sensitive suites back to back: **124 rounds / 0
+  failures** over 120 s, covering `RepositoryManagerTest`, `RepositoryClosePropagationTest` and
+  `RepositorySwitchQuiescenceTest`. That hammer also exposed a genuine flake in one of the NEW tests
+  (`anInFlightCreationRefusesTheSwitchUntilItIsRetired` asserted that the parked borrower loses a race it
+  can legitimately win); the assertion was replaced with the deterministic property that matters - no
+  lease exists while the creation is still parked, and nothing leaks whichever thread wins.
+
+Each green run executed the full job: script permissions, shell syntax, `--help` smoke tests, `./build.sh`
 (compile + SelfTest + package), the committed shell regression suite (`tests/shell/run.sh`), `doctor`,
 and the bounded 3-cycle start/status/stop lifecycle reliability step with the exact health marker.
 Both the push and the pull_request event are required; a single green event is not CI green.
 
 ## Unresolved core lifecycle risks
 
-1. **Resource-controlled blocking inside the fail-closed decision (partially mitigated).** The retained
-   context's state is now sampled OUTSIDE the switch lock and only revalidated under it, so a resource
-   that blocks in `closeState()` delays one caller instead of wedging the manager - but it still delays
-   that caller without a bound, because no timeout was added. `CloseStateAware` and
-   `ResourceFactory.isHealthy` now state the non-blocking/cheap obligation explicitly. The CM/JDBC
-   adapters (Goal 02) must honour it; a bounded probe policy is a later decision, not this goal's.
+1. **Resource-controlled blocking inside the fail-closed decision (accepted, contract-documented).**
+   Reporting a context's close state calls into its owned resources, so the read happens while the switch
+   lock is held and an implementation that blocks there delays the lifecycle. Sampling the state OUTSIDE
+   the lock and revalidating it under the lock was implemented, measured and REVERTED: with several
+   threads queueing on the lock each sample was invalidated by the switch ahead of it, and a bounded number
+   of re-samples turned an ordinary contended switch into a spurious failure (caught by CI on `26894a4`,
+   then reproduced and fixed - see the CI section). Refusing every contended switch, or looping without
+   bound, are both worse than the delay they avoid. The obligation is therefore placed and documented
+   where it belongs, as a hard requirement of `CloseStateAware.closeState()` (cheap, never blocking) and of
+   `ResourceFactory.isHealthy` (no I/O under the pool lock). Safety is unaffected: a blocked read can only
+   ever delay or refuse a switch, never let one through. The CM/JDBC adapters (Goal 02) must honour it; a
+   bounded probe policy is a later decision, not this goal's.
 2. **`CLOSED_CLEAN` is a proof only while factories keep their side of the contract.** A factory that
    opens a physical resource and then throws leaks it invisibly to the pool, which would still report
    `CLOSED_CLEAN`. The obligation is now documented on `ResourceFactory`; enforcing it is not possible
