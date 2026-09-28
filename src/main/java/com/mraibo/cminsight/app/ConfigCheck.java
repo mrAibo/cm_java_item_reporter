@@ -8,6 +8,8 @@ import com.mraibo.cminsight.config.RepositoryProfileLoader;
 import com.mraibo.cminsight.config.SecretRef;
 import com.mraibo.cminsight.config.SecretResolver;
 import com.mraibo.cminsight.config.WebAuthSettings;
+import com.mraibo.cminsight.ibm.CmAdapterSettings;
+import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
 import com.mraibo.cminsight.security.SecurityPolicy;
 
 import java.io.IOException;
@@ -36,10 +38,11 @@ import java.util.Objects;
  * <h2>Scope</h2>
  *
  * <p>Deliberately narrow: credential resolution ({@link WebAuthSettings#resolve}), the exposure policy
- * ({@link SecurityPolicy#validateWebExposure}) and the repository-profile credential verdicts
- * ({@link #inspectProfiles}) - exactly the decisions doctor and runtime must agree on - plus the
- * resolved operational path set from {@link AppPaths}. It never opens a socket, never touches the
- * network and never prints a credential value.
+ * ({@link SecurityPolicy#validateWebExposure}), the repository-profile credential verdicts
+ * ({@link #inspectProfiles}) and the CM adapter verdicts ({@link #adapterFindings}) - exactly the
+ * decisions doctor and runtime must agree on - plus the resolved operational path set from
+ * {@link AppPaths}. It never opens a socket, never touches the network and never prints a credential
+ * value.
  *
  * <p>Every verdict is produced by the runtime's own code: {@code WebAuthSettings}, {@code SecurityPolicy},
  * {@code RepositoryProfileLoader} and {@code SecretResolver}. Nothing here re-implements a rule, which is
@@ -226,6 +229,12 @@ public final class ConfigCheck {
         SecretResolver secrets = SecretResolver.system(paths.secretsDir(config));
         Report report = validate(config, secrets);
         List<Finding> profileFindings = inspectProfiles(paths, config, secrets);
+        // The doctor's report is where the two independent questions are composed: what is true of the
+        // profile files, and whether an adapter is installed to read them. inspectProfiles keeps answering
+        // only the first, so a healthy profile stays healthy in core-only mode.
+        List<Finding> doctorFindings = new ArrayList<>(profileFindings.size() + 3);
+        doctorFindings.addAll(profileFindings);
+        doctorFindings.addAll(adapterFindings(config, secrets));
 
         out.println(OK_PREFIX + "home = " + paths.describeHome());
         out.println(OK_PREFIX + "config file = " + configPath);
@@ -253,7 +262,7 @@ public final class ConfigCheck {
         List<String> profileOk = new ArrayList<>();
         List<String> profileWarn = new ArrayList<>();
         List<String> profileError = new ArrayList<>();
-        for (Finding finding : profileFindings) {
+        for (Finding finding : doctorFindings) {
             switch (finding.level()) {
                 case OK -> profileOk.add(finding.message());
                 case WARN -> profileWarn.add(finding.message());
@@ -390,10 +399,15 @@ public final class ConfigCheck {
                         + " (activated at startup)"));
             }
         } catch (ConfigException e) {
-            // Main propagates this from activateConfiguredRepository and exits 3 before it serves
-            // anything, so an unknown id is a refusal here and not a note.
+            // Main resolves auto-activation before it serves anything and refuses to start on an unknown
+            // id, so an unknown id is a refusal here and not a note.
             findings.add(new Finding(Level.ERROR, e.getMessage()));
         }
+        // Deliberately NOT the adapter findings. This method answers one question - what is true of the
+        // PROFILE FILES - and adapter availability is an independent one: a profile whose credentials all
+        // resolve is healthy whether or not an adapter happens to be installed, and folding the two lists
+        // together would make a healthy profile report a non-OK finding. The doctor composes both lists in
+        // its own report (see run()).
         for (RepositoryProfile profile : profiles) {
             findings.add(new Finding(Level.OK, "repository profile " + describeProfileSource(profile)));
             for (Map.Entry<String, SecretRef> credential : profile.credentialRefs().entrySet()) {
@@ -433,6 +447,62 @@ public final class ConfigCheck {
                         + id + "'. Configured repositories: "
                         + (profiles.isEmpty() ? "(none)" : String.join(", ", profiles.stream()
                                 .map(RepositoryProfile::id).toList()))));
+    }
+
+    /**
+     * The adapter section of the report: whether a CM adapter can be activated at all, and whether the
+     * adapter settings the runtime reads are acceptable.
+     *
+     * <p>Deliberately separate from {@link #inspectProfiles}: that method answers "what is true of the
+     * repository profile files", this one answers "can an adapter read them". A profile whose four
+     * credentials all resolve is healthy in core-only mode, so folding the two would report a healthy
+     * profile as not-OK. The doctor's report composes both lists; nothing here is ever added to
+     * {@link Report#errors()}, which stays the runtime's own refusal text.
+     *
+     * <p>Three verdicts, each the one the runtime would produce:
+     *
+     * <ul>
+     *   <li>exactly one provider - informational;</li>
+     *   <li>no provider, more than one, or an unloadable one - a WARNING while nothing is configured to
+     *       activate, because the runtime still starts and lists its repositories, and an ERROR as soon as
+     *       {@code repository.auto.activate} names one, because then startup genuinely fails. A missing
+     *       optional adapter is never a configuration error by itself;</li>
+     *   <li>an adapter setting outside its documented range - an ERROR, since the runtime reads those keys
+     *       before it serves anything.</li>
+     * </ul>
+     *
+     * <p>Discovery is the runtime's own, so the doctor cannot report an adapter the application would not
+     * find, and the finding text is produced from the same {@code Status} the startup banner prints.
+     */
+    public static List<Finding> adapterFindings(AppConfig config, SecretResolver secrets) {
+        Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(secrets, "secrets");
+
+        List<Finding> findings = new ArrayList<>(3);
+        IbmCmAdapterRegistry.Status status = IbmCmAdapterRegistry.discover().status();
+        // Read exactly as Main does, so the doctor's verdict and the runtime's refusal cannot diverge
+        // about whether auto-activation is configured at all.
+        String requested = config.get(AUTO_ACTIVATE_KEY, "");
+        boolean autoActivationConfigured = requested != null && !requested.isBlank();
+
+        if (status.available()) {
+            findings.add(new Finding(Level.OK, "CM adapter " + status.providerId() + " (adapter "
+                    + status.adapterVersion() + ", CM API " + status.sdkReleaseOrUnknown() + ") is available"));
+        } else if (autoActivationConfigured) {
+            findings.add(new Finding(Level.ERROR, status.describe() + "; " + AUTO_ACTIVATE_KEY + "='"
+                    + requested.trim() + "' is configured, so the runtime refuses to start"));
+        } else {
+            findings.add(new Finding(Level.WARN, status.describe()
+                    + "; repository profiles are listed but none can be activated"));
+        }
+        try {
+            CmAdapterSettings settings = CmAdapterSettings.from(config, secrets);
+            findings.add(new Finding(Level.OK, "adapter settings " + settings.pool() + ", "
+                    + CmAdapterSettings.METADATA_TTL_KEY + "=" + settings.metadataCacheTtlSeconds() + "s"));
+        } catch (ConfigException e) {
+            findings.add(new Finding(Level.ERROR, e.getMessage()));
+        }
+        return findings;
     }
 
     private static Finding credentialFinding(SecretResolver secrets, String key, SecretRef declared) {
@@ -505,9 +575,14 @@ public final class ConfigCheck {
         out.println();
         out.println("Usage: ConfigCheck [--config <file>] [--help]");
         out.println();
-        out.println("Validates the configuration exactly as the runtime does - credential sources and");
-        out.println("the web exposure policy - and prints the resolved operational paths. Nothing is");
-        out.println("started, no network is used, and no credential value is ever printed.");
+        out.println("Validates the configuration exactly as the runtime does - credential sources, the web");
+        out.println("exposure policy and the CM adapter - and prints the resolved operational paths. Nothing");
+        out.println("is started, no network is used, and no credential value is ever printed.");
+        out.println();
+        out.println("The adapter section reports whether exactly one CM adapter provider is installed and");
+        out.println("whether the cm.pool.*/cache.metadata.* values the runtime reads are acceptable. A missing");
+        out.println("adapter is a WARN while nothing activates a repository, and an ERROR when");
+        out.println("repository.auto.activate names one, because the runtime then refuses to start.");
         out.println();
         out.println("  --config <file>   configuration file (default <home>/conf/application.properties)");
         out.println("  --validate-config accepted and ignored (the flag that dispatches here from Main)");

@@ -211,6 +211,28 @@ public record RepositoryProfile(
     }
 
     /**
+     * Resolves <strong>only</strong> the two CM credentials of this repository.
+     *
+     * <p>The IBM CM adapter reads ItemTypes and retention policies and never opens the JDBC side, so
+     * requiring the two JDBC credentials before a repository can be activated would make an analysis
+     * feature depend on a database it does not use - and would turn a missing JDBC password into a
+     * failure of a read path that never touches it. {@link #resolveCredentials(SecretResolver)} keeps
+     * resolving all four for everything that genuinely needs both halves, and its behaviour is unchanged.
+     *
+     * <p>Fails closed in exactly the same way as the four-credential form: an unconfigured source, an
+     * unset environment variable or an unreadable secret file raises {@link ConfigException} naming the
+     * field and the source, and no partial or empty value is ever returned.
+     *
+     * @throws ConfigException when either CM credential is unconfigured or cannot be resolved
+     */
+    public CmCredentials resolveCmCredentials(SecretResolver secrets) {
+        Objects.requireNonNull(secrets, "secrets");
+        return new CmCredentials(
+                resolve(secrets, cmUserRef, CM_USER_KEY),
+                resolve(secrets, cmPasswordRef, CM_PASSWORD_KEY));
+    }
+
+    /**
      * True when the JDBC URL embeds a credential instead of referencing one by name.
      *
      * <p>{@link RepositoryProfileLoader} rejects such a profile outright; this method exists so the
@@ -309,6 +331,33 @@ public record RepositoryProfile(
                     + ", cmPassword=<redacted from " + cmPassword.describe() + ">"
                     + ", jdbcUser=" + jdbcUser.describe()
                     + ", jdbcPassword=<redacted from " + jdbcPassword.describe() + ">]";
+        }
+    }
+
+    /**
+     * The two resolved CM credentials of one activation, and only those.
+     *
+     * <p>Deliberately the same shape and the same guarantees as {@link RepositoryCredentials} - resolved
+     * {@link SecretRef} instances, never printable values, {@link #toString()} showing the sources - but
+     * without the JDBC half. Read a value with {@link SecretResolver#resolve(SecretRef)}; never log,
+     * serialise or print this object.
+     */
+    public record CmCredentials(SecretRef cmUser, SecretRef cmPassword) {
+
+        public CmCredentials {
+            cmUser = requireResolved(cmUser, CM_USER_KEY);
+            cmPassword = requireResolved(cmPassword, CM_PASSWORD_KEY);
+        }
+
+        /** True when both CM credentials carry a value. Always true for a constructed instance. */
+        public boolean usable() {
+            return cmUser.resolved() && cmPassword.resolved();
+        }
+
+        @Override
+        public String toString() {
+            return "CmCredentials[cmUser=" + cmUser.describe()
+                    + ", cmPassword=<redacted from " + cmPassword.describe() + ">]";
         }
     }
 
