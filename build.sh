@@ -21,30 +21,48 @@ TEST_CLASS_REL="com/mraibo/cminsight/test/SelfTest.class"
 
 usage() {
   cat <<'USAGE'
-Usage: ./build.sh [--help]
+Usage: ./build.sh [--require-ibm] [--check-ibm-isolation] [--help]
 
 Offline JDK 17+ build for CM Insight. Uses only javac, jar and java.
 
 Steps:
   1. resolve the toolchain (JAVA_HOME/bin first, else PATH); require javac, jar,
      java and a JDK major version >= 17
-  2. clean and recreate build/classes and build/test-classes
-  3. compile src/main/java -> build/classes   (--release 17 -encoding UTF-8 -Xlint:all)
-  4. compile src/test/java -> build/test-classes (same flags, -cp build/classes)
-  5. copy src/main/resources -> build/classes
-  6. run com.mraibo.cminsight.test.SelfTest  (the test suite is REQUIRED)
-  7. package build/cm-insight.jar (Main-Class, Implementation-Title/Version)
-     and write build/.version
+  2. enforce the source guards: no com.ibm reference under src/main/java, and no
+     IBM CM mutating call under src/ibm/java
+  3. clean and recreate the build output directories
+  4. compile src/main/java -> build/classes   (--release 17 -encoding UTF-8 -Xlint:all)
+     The core class path NEVER contains an IBM JAR or an IBM stub, so a core
+     source that needs an SDK type cannot compile - the isolation is structural,
+     not a convention.
+  5. compile src/test/java -> build/test-classes (same flags, -cp build/classes)
+  6. resolve the IBM SDK: lib/ibm/*.jar when present, otherwise the test-only
+     compile stubs in tests/ibm-stubs (signature-only, never packaged)
+  7. compile src/ibm/java -> build/ibm-classes against the SDK set
+  8. compile src/ibm-test/java -> build/ibm-test-classes when present
+  9. copy src/main/resources -> build/classes and src/ibm/resources -> build/ibm-classes
+ 10. run com.mraibo.cminsight.test.SelfTest (the test suite is REQUIRED), then the
+     IBM suites when the IBM source set was compiled
+ 11. package build/cm-insight.jar (Main-Class, Implementation-Title/Version)
+     from build/classes plus build/ibm-classes, and write build/.version
 
 Optional local jars found in lib/ibm, lib/db2, lib/oracle and lib/app are added
 to the compile and runtime class path when present; none of them are required.
+
+Options:
+  --require-ibm          fail unless a real IBM CM SDK is present in lib/ibm.
+                         Use this when the operator requires IBM support: a build
+                         that silently compiles against signature stubs and ships
+                         is exactly the outcome this flag exists to prevent.
+  --check-ibm-isolation  run only the source guards and exit. No JDK toolchain is
+                         needed. Exit 0 when both hold, 2 when one is violated.
 
 Environment:
   JAVA_HOME   JDK 17+ home directory. Accepted as /c/tools/jdk17, C:/tools/jdk17
               or C:\tools\jdk17; when unset, javac/jar/java are taken from PATH.
 
 Exit codes: 0 success, 1 build failure or the test suite's own exit code,
-            2 usage or toolchain problem.
+            2 usage, toolchain problem or a violated source guard.
 USAGE
 }
 
@@ -54,9 +72,13 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 fail_env() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 usage_fail() { printf 'ERROR: %s\n' "$*" >&2; usage >&2; exit 2; }
 
+REQUIRE_IBM=false
+CHECK_ISOLATION_ONLY=false
 for arg in "$@"; do
   case "${arg}" in
     -h|--help) usage; exit 0 ;;
+    --require-ibm) REQUIRE_IBM=true ;;
+    --check-ibm-isolation) CHECK_ISOLATION_ONLY=true ;;
     *) usage_fail "unknown argument: ${arg}" ;;
   esac
 done
@@ -65,6 +87,32 @@ SELF="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(dirname -- "${SELF}")"
 [ -d "${SCRIPT_DIR}" ] || { printf 'ERROR: cannot locate script directory: %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
 ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}" && pwd)" || { printf 'ERROR: cannot resolve repository root from %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
+
+# ---------------------------------------------------------------------------
+# Source guards (Goal 02 sections A and H).
+#
+# This runs BEFORE the toolchain is resolved, so `--check-ibm-isolation` works in
+# an environment with no JDK at all and the guard is available to a test that only
+# wants to prove the rule. One implementation, in tests/shell/ibm_guard.sh, is
+# shared with the committed shell suite so the build step and the test can never
+# disagree about what is forbidden.
+# ---------------------------------------------------------------------------
+IBM_GUARD="${ROOT}/tests/shell/ibm_guard.sh"
+if [ "${CHECK_ISOLATION_ONLY}" = true ]; then
+  [ -f "${IBM_GUARD}" ] || { printf 'ERROR: %s is missing; the source guards cannot be checked.\n' "${IBM_GUARD}" >&2; exit 2; }
+  bash "${IBM_GUARD}"
+  exit $?
+fi
+if [ -f "${IBM_GUARD}" ]; then
+  bash "${IBM_GUARD}" || { printf 'ERROR: the Goal 02 source guards refused this tree; see the messages above.\n' >&2; exit 2; }
+else
+  # A missing guard is a missing rule, not a pass. Failing here is deliberate: the
+  # read-only guarantee is a product property, so a build that cannot check it must
+  # not claim to have checked it.
+  printf 'ERROR: %s is missing; the read-only and SDK-isolation guards cannot run.\n' "${IBM_GUARD}" >&2
+  exit 2
+fi
+
 
 # ---------------------------------------------------------------------------
 # Class path separator.
@@ -163,10 +211,16 @@ log_ok "toolchain (${TOOLCHAIN_SOURCE}): ${JAVAC_VERSION_LINE}; java ${JAVA_MAJO
 BUILD_DIR="${ROOT}/build"
 CLASSES_DIR="${BUILD_DIR}/classes"
 TEST_CLASSES_DIR="${BUILD_DIR}/test-classes"
+IBM_CLASSES_DIR="${BUILD_DIR}/ibm-classes"
+IBM_TEST_CLASSES_DIR="${BUILD_DIR}/ibm-test-classes"
 JAR_FILE="${BUILD_DIR}/cm-insight.jar"
 MAIN_SRC_DIR="${ROOT}/src/main/java"
 TEST_SRC_DIR="${ROOT}/src/test/java"
 RESOURCES_DIR="${ROOT}/src/main/resources"
+IBM_SRC_DIR="${ROOT}/src/ibm/java"
+IBM_TEST_SRC_DIR="${ROOT}/src/ibm-test/java"
+IBM_RESOURCES_DIR="${ROOT}/src/ibm/resources"
+IBM_STUB_DIR="${ROOT}/tests/ibm-stubs"
 
 [ -d "${MAIN_SRC_DIR}" ] || fail_env "missing source directory ${MAIN_SRC_DIR}; run this script from the CM Insight working tree."
 [ -d "${ROOT}/src" ] || fail_env "missing ${ROOT}/src; this does not look like the CM Insight working tree."
@@ -175,11 +229,16 @@ if [ -e "${BUILD_DIR}" ] && [ ! -d "${BUILD_DIR}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Optional local jars (absent in a clean checkout - and that is fine)
+# Optional local jars.
+#
+# lib/ibm is NOT part of the core class path. The whole point of the optional
+# source set is that src/main/java compiles with no IBM type reachable at all, so
+# a core file that needs one fails here instead of drifting into the adapter. The
+# IBM jars are resolved separately, below, and only ever reach src/ibm/java.
 # ---------------------------------------------------------------------------
 LIB_CP=""
 LIB_COUNT=0
-for module in ibm db2 oracle app; do
+for module in db2 oracle app; do
   dir="${ROOT}/lib/${module}"
   [ -d "${dir}" ] || continue
   for jar_file in "${dir}"/*.jar; do
@@ -189,15 +248,46 @@ for module in ibm db2 oracle app; do
   done
 done
 if [ "${LIB_COUNT}" -gt 0 ]; then
-  log_ok "optional local jars on the class path: ${LIB_COUNT} from lib/{ibm,db2,oracle,app}"
+  log_ok "optional local jars on the core class path: ${LIB_COUNT} from lib/{db2,oracle,app}"
 else
-  log_warn "no optional jars in lib/{ibm,db2,oracle,app}; building the core runtime only (this is expected for the offline bootstrap build)"
+  log_ok "core class path carries no optional jars (expected for the offline bootstrap build)"
+fi
+
+# ---------------------------------------------------------------------------
+# IBM SDK resolution for the optional source set.
+#
+# A real SDK in lib/ibm wins, because it is the only thing that can validate the
+# adapter against reality. The test-only stubs are the fallback that keeps CI able
+# to compile src/ibm/java with zero proprietary JARs - they are signatures only,
+# and they are never added to the core class path or packaged.
+# ---------------------------------------------------------------------------
+IBM_CP=""
+IBM_CP_KIND=""
+IBM_JAR_COUNT=0
+for jar_file in "${ROOT}"/lib/ibm/*.jar; do
+  [ -e "${jar_file}" ] || continue
+  IBM_JAR_COUNT=$((IBM_JAR_COUNT + 1))
+  if [ -z "${IBM_CP}" ]; then IBM_CP="${jar_file}"; else IBM_CP="${IBM_CP}${CP_SEP}${jar_file}"; fi
+done
+
+if [ "${IBM_JAR_COUNT}" -gt 0 ]; then
+  IBM_CP_KIND="real"
+  log_ok "IBM SDK: ${IBM_JAR_COUNT} jar(s) from lib/ibm - compiling the optional source set against the REAL SDK"
+elif [ -d "${IBM_STUB_DIR}" ]; then
+  IBM_CP_KIND="stubs"
+  log_warn "IBM SDK: none in lib/ibm; compiling the optional source set against the TEST-ONLY signature stubs in tests/ibm-stubs. This is a compile check, NOT SDK validation."
+else
+  IBM_CP_KIND="none"
+fi
+
+if [ "${REQUIRE_IBM}" = true ] && [ "${IBM_CP_KIND}" != "real" ]; then
+  fail "IBM support was required (--require-ibm) but no IBM SDK jar was found in ${ROOT}/lib/ibm. Vendor JARs are never downloaded or committed, so place the IBM CM 8.7 SDK jars there (see lib/README.md) or drop --require-ibm to build the core runtime only."
 fi
 
 # ---------------------------------------------------------------------------
 # 2. clean
 # ---------------------------------------------------------------------------
-rm -rf "${CLASSES_DIR}" "${TEST_CLASSES_DIR}"
+rm -rf "${CLASSES_DIR}" "${TEST_CLASSES_DIR}" "${IBM_CLASSES_DIR}" "${IBM_TEST_CLASSES_DIR}"
 rm -f "${JAR_FILE}" "${BUILD_DIR}/.version" "${BUILD_DIR}/manifest.mf"
 mkdir -p "${CLASSES_DIR}" "${TEST_CLASSES_DIR}"
 log_ok "cleaned ${CLASSES_DIR} and ${TEST_CLASSES_DIR}"
@@ -230,6 +320,10 @@ if [ "${#TEST_SOURCES[@]}" -eq 0 ]; then
   fail "test sources are required but ${TEST_SRC_DIR} contains no .java files. Add the dependency-free test suite (entry point ${TEST_MAIN_CLASS}) - the build never silently skips tests."
 fi
 
+# The core tests see build/classes and the non-IBM optional jars ONLY. The IBM
+# jars and the stubs are deliberately absent: a Goal 01 suite that started using
+# an SDK type would stop compiling here, which is the same isolation rule the
+# source guard enforces, checked a second time by the compiler.
 TEST_JAVAC_ARGS=(--release 17 -encoding UTF-8 -Xlint:all -d "${TEST_CLASSES_DIR}")
 TEST_COMPILE_CP="${CLASSES_DIR}"
 if [ -n "${LIB_CP}" ]; then TEST_COMPILE_CP="${CLASSES_DIR}${CP_SEP}${LIB_CP}"; fi
@@ -239,6 +333,60 @@ log_ok "compiling ${#TEST_SOURCES[@]} test source file(s)"
 log_ok "test classes in ${TEST_CLASSES_DIR}"
 
 # ---------------------------------------------------------------------------
+# 4b. optional IBM source set
+#
+# Compiled AFTER the core (so it can use the core) and against the SDK set only
+# (so it cannot be reached by mistake). A missing src/ibm/java is a legitimate
+# core-only checkout and is reported, never treated as an error.
+# ---------------------------------------------------------------------------
+IBM_MAIN_SOURCES=()
+if [ -d "${IBM_SRC_DIR}" ]; then
+  while IFS= read -r -d '' file; do IBM_MAIN_SOURCES+=("${file}"); done \
+    < <(find "${IBM_SRC_DIR}" -type f -name '*.java' -print0 2>/dev/null)
+fi
+
+if [ "${#IBM_MAIN_SOURCES[@]}" -gt 0 ]; then
+  if [ "${IBM_CP_KIND}" = "none" ]; then
+    fail "src/ibm/java exists but there is no IBM SDK to compile it against: lib/ibm has no jar and ${IBM_STUB_DIR} is missing. Place the IBM CM 8.7 SDK jars in lib/ibm (see lib/README.md), or remove src/ibm/java for a core-only build."
+  fi
+  mkdir -p "${IBM_CLASSES_DIR}"
+  IBM_JAVAC_ARGS=(--release 17 -encoding UTF-8 -Xlint:all -d "${IBM_CLASSES_DIR}")
+  IBM_JAVAC_ARGS+=(-cp "${CLASSES_DIR}${CP_SEP}${IBM_CP}")
+  log_ok "compiling ${#IBM_MAIN_SOURCES[@]} IBM source file(s) against the ${IBM_CP_KIND} SDK"
+  "${JAVAC}" "${IBM_JAVAC_ARGS[@]}" "${IBM_MAIN_SOURCES[@]}"
+  log_ok "IBM adapter classes in ${IBM_CLASSES_DIR}"
+
+  # A stub compile is a syntax-and-signature check, never SDK validation. Saying
+  # so on every build is the cheapest way to stop the two being confused later,
+  # in a STATUS.md entry or a release note.
+  if [ "${IBM_CP_KIND}" = "stubs" ]; then
+    log_warn "the IBM adapter was compiled against SIGNATURE STUBS, not the real SDK; this proves it compiles, not that it matches IBM's runtime"
+  fi
+else
+  log_ok "no src/ibm/java source set present; building the core runtime only"
+fi
+
+# ---------------------------------------------------------------------------
+# 4c. optional IBM tests
+# ---------------------------------------------------------------------------
+IBM_TEST_SOURCES=()
+if [ -d "${IBM_TEST_SRC_DIR}" ]; then
+  while IFS= read -r -d '' file; do IBM_TEST_SOURCES+=("${file}"); done \
+    < <(find "${IBM_TEST_SRC_DIR}" -type f -name '*.java' -print0 2>/dev/null)
+fi
+if [ "${#IBM_TEST_SOURCES[@]}" -gt 0 ]; then
+  [ "${#IBM_MAIN_SOURCES[@]}" -gt 0 ] || fail "${IBM_TEST_SRC_DIR} has ${#IBM_TEST_SOURCES[@]} source file(s) but src/ibm/java is empty; the IBM tests have nothing to test."
+  mkdir -p "${IBM_TEST_CLASSES_DIR}"
+  IBM_TEST_JAVAC_ARGS=(--release 17 -encoding UTF-8 -Xlint:all -d "${IBM_TEST_CLASSES_DIR}")
+  IBM_TEST_CP="${TEST_CLASSES_DIR}${CP_SEP}${CLASSES_DIR}${CP_SEP}${IBM_CLASSES_DIR}${CP_SEP}${IBM_CP}"
+  if [ -n "${LIB_CP}" ]; then IBM_TEST_CP="${IBM_TEST_CP}${CP_SEP}${LIB_CP}"; fi
+  IBM_TEST_JAVAC_ARGS+=(-cp "${IBM_TEST_CP}")
+  log_ok "compiling ${#IBM_TEST_SOURCES[@]} IBM test source file(s)"
+  "${JAVAC}" "${IBM_TEST_JAVAC_ARGS[@]}" "${IBM_TEST_SOURCES[@]}"
+  log_ok "IBM test classes in ${IBM_TEST_CLASSES_DIR}"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. resources
 # ---------------------------------------------------------------------------
 if [ -d "${RESOURCES_DIR}" ]; then
@@ -246,6 +394,13 @@ if [ -d "${RESOURCES_DIR}" ]; then
   log_ok "copied src/main/resources into ${CLASSES_DIR}"
 else
   log_warn "no ${RESOURCES_DIR}; the jar will contain classes only"
+fi
+
+# The IBM source set's resources carry the ServiceLoader registration, so they are
+# merged into the same jar without joining the core class path at compile time.
+if [ -d "${IBM_RESOURCES_DIR}" ] && [ -d "${IBM_CLASSES_DIR}" ]; then
+  cp -R "${IBM_RESOURCES_DIR}/." "${IBM_CLASSES_DIR}/"
+  log_ok "copied src/ibm/resources into ${IBM_CLASSES_DIR}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -270,6 +425,39 @@ fi
 log_ok "test suite passed"
 
 # ---------------------------------------------------------------------------
+# 6b. IBM suites - only when the IBM source set was compiled
+#
+# They run on a class path that DOES carry the SDK set, because they exercise the
+# adapter. SelfTest itself stays core-only, so a broken IBM source set can never
+# make the Goal 01 suites un-runnable.
+# ---------------------------------------------------------------------------
+if [ "${#IBM_TEST_SOURCES[@]}" -gt 0 ]; then
+  IBM_TEST_RUN_CP="${IBM_TEST_CLASSES_DIR}${CP_SEP}${TEST_CLASSES_DIR}${CP_SEP}${CLASSES_DIR}${CP_SEP}${IBM_CLASSES_DIR}${CP_SEP}${IBM_CP}"
+  if [ -n "${LIB_CP}" ]; then IBM_TEST_RUN_CP="${IBM_TEST_RUN_CP}${CP_SEP}${LIB_CP}"; fi
+
+  # Discovered from the compiled output, not maintained as a second list. The
+  # package name is fixed by the layout the IBM tests live in, and the class file
+  # pattern matches the same public/no-arg/void convention SelfTest uses. A suite
+  # that discovers nothing in an existing source tree is an error, so a rename
+  # cannot quietly turn this step into a no-op.
+  IBM_TEST_MAIN_CLASS="com.mraibo.cminsight.ibmtest.IbmAdapterTest"
+  IBM_TEST_MAIN_REL="com/mraibo/cminsight/ibmtest/IbmAdapterTest.class"
+  if [ ! -f "${IBM_TEST_CLASSES_DIR}/${IBM_TEST_MAIN_REL}" ]; then
+    fail "${IBM_TEST_SRC_DIR} has ${#IBM_TEST_SOURCES[@]} source file(s) but no entry point ${IBM_TEST_MAIN_CLASS} was produced at ${IBM_TEST_MAIN_REL}. The IBM tests must expose the same dependency-free entry point the core suite does, or this step would silently test nothing."
+  fi
+  log_ok "running the IBM test suite: ${IBM_TEST_MAIN_CLASS}"
+  set +e
+  "${JAVA}" -cp "${IBM_TEST_RUN_CP}" "${IBM_TEST_MAIN_CLASS}"
+  IBM_TEST_RC=$?
+  set -e
+  if [ "${IBM_TEST_RC}" -ne 0 ]; then
+    printf 'ERROR: the IBM test suite %s failed with exit code %s.\n' "${IBM_TEST_MAIN_CLASS}" "${IBM_TEST_RC}" >&2
+    exit "${IBM_TEST_RC}"
+  fi
+  log_ok "IBM test suite passed"
+fi
+
+# ---------------------------------------------------------------------------
 # 7. package
 # ---------------------------------------------------------------------------
 MANIFEST_FILE="${BUILD_DIR}/manifest.mf"
@@ -281,6 +469,13 @@ Implementation-Version: ${APP_VERSION}
 
 MANIFEST
 "${JAR}" cfm "${JAR_FILE}" "${MANIFEST_FILE}" -C "${CLASSES_DIR}" .
+# The IBM source set is packaged into the SAME jar and the SAME JVM, which is what
+# keeps this a modular monolith: the adapter is optional at compile and at runtime,
+# not a second deployable.
+if [ -d "${IBM_CLASSES_DIR}" ]; then
+  "${JAR}" uf "${JAR_FILE}" -C "${IBM_CLASSES_DIR}" .
+  log_ok "packaged the IBM source set into ${JAR_FILE}"
+fi
 [ -s "${JAR_FILE}" ] || fail "the jar was not created correctly: ${JAR_FILE} is missing or empty."
 printf '%s\n' "${APP_VERSION}" > "${BUILD_DIR}/.version"
 log_ok "wrote ${BUILD_DIR}/.version (${APP_VERSION})"
