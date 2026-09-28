@@ -1,0 +1,32 @@
+name: bootstrap-test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  java17-bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare local configuration
+        run: cp conf/application.properties.example conf/application.properties
+      - name: Build and self-test
+        run: ./build.sh
+      - name: Doctor
+        run: ./bin/doctor.sh
+      - name: Start
+        run: ./bin/start.sh
+      - name: Status and health
+        run: ./bin/status.sh
+      - name: Stop
+        if: always()
+        run: ./bin/stop.sh --force || true
