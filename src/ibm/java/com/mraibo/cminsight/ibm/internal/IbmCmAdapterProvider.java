@@ -370,13 +370,51 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
                 // Fall through to the class-path manifest; a diagnostics value is not worth an exception.
             }
         }
-        // Fallback: the first manifest visible on the class path. On a Class-Path layout this is the
-        // launcher jar's own manifest, which is why it is only the second choice.
+        // Fallback: a manifest visible on the class path, for a directory (non-jar) SDK layout where the
+        // marker resource has no jar URL. It is only accepted when it is demonstrably the SDK's and not
+        // this application's, because on the normal Class-Path layout the first class-path manifest IS
+        // the launcher jar's own - and reporting CM Insight's own build version as the "CM API release"
+        // is worse than reporting nothing: an operator would read "CM API release: 0.1.0-SNAPSHOT" and
+        // believe the SDK was present and identified. Measured before this guard: with no SDK jar at all
+        // the adapter advertised the application's version as the release.
         try (InputStream stream = loader.getResourceAsStream("META-INF/MANIFEST.MF")) {
-            return stream == null ? null : new Manifest(stream);
+            if (stream == null) {
+                return null;
+            }
+            Manifest manifest = new Manifest(stream);
+            return looksLikeSdkManifest(manifest) ? manifest : null;
         } catch (IOException | RuntimeException ignored) {
             return null;
         }
+    }
+
+    /**
+     * True when a manifest identifies itself as the IBM Content Manager API.
+     *
+     * <p>Two independent markers are required rather than one, because this decision gates a value an
+     * operator uses to tell "no SDK" from "SDK present": a single weak match on a third-party jar that
+     * happens to sit on the class path would produce a wrong release banner. The real SDK manifest
+     * carries {@code ContentManagerAPI-Version: 0807000400} and {@code Implementation-Title: Content
+     * Manager API}, while this application's own manifest carries {@code Implementation-Title: CM
+     * Insight} and neither Content Manager attribute.
+     */
+    private static boolean looksLikeSdkManifest(Manifest manifest) {
+        Attributes attributes = manifest.getMainAttributes();
+        boolean vendorMarker = isContentManager(attributes.getValue("ContentManagerAPI-Version"))
+                || isContentManager(attributes.getValue("ContentManager-Version"));
+        boolean titleMarker = containsContentManager(attributes.getValue("Specification-Title"))
+                || containsContentManager(attributes.getValue("Implementation-Title"))
+                || containsContentManager(attributes.getValue("Application-Name"));
+        return vendorMarker && titleMarker;
+    }
+
+    private static boolean isContentManager(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    /** Case-insensitive containment, so {@code "Content Manager API"} and {@code "IBM Content Manager"} both match. */
+    private static boolean containsContentManager(String value) {
+        return value != null && value.toLowerCase(java.util.Locale.ROOT).contains("content manager");
     }
 
     private static ClassLoader classLoader() {

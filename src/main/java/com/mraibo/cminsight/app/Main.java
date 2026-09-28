@@ -240,7 +240,7 @@ public final class Main {
             repositories.switchTo(autoActivated);
         }
 
-        return serve(config, auth, repositories, adapters, warnings);
+        return serve(config, auth, repositories, profiles, adapters, warnings);
     }
 
     /**
@@ -485,10 +485,19 @@ public final class Main {
     private static int serve(AppConfig config,
                              WebAuthSettings auth,
                              RepositoryManager repositories,
+                             List<RepositoryProfile> profiles,
                              IbmCmAdapterRegistry adapters,
                              List<String> warnings) throws Exception {
         Router router = new Router();
         WebServer server = new WebServer(config, auth, router);
+
+        // Goal 02 section K: the authenticated CM read API. Installed BEFORE the socket is opened, so a
+        // route can never be missing from a served request - and unconditionally, not only when an
+        // adapter is available, because "no adapter" must still answer the repositories and diagnostics
+        // questions with the documented adapter_unavailable status instead of a 404 that reads like a
+        // path typo. Registering here also keeps every route authenticated: the registration goes through
+        // Router, which refuses any unauthenticated path except /api/health.
+        server.installCmApiRoutes(repositories, profiles, adapters);
 
         CountDownLatch shutdown = new CountDownLatch(1);
         AtomicBoolean closed = new AtomicBoolean();

@@ -1,7 +1,10 @@
 package com.mraibo.cminsight.web;
 
 import com.mraibo.cminsight.config.AppConfig;
+import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.config.WebAuthSettings;
+import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
+import com.mraibo.cminsight.repository.RepositoryManager;
 import com.mraibo.cminsight.security.Authenticator;
 import com.mraibo.cminsight.security.LoginThrottle;
 import com.mraibo.cminsight.security.SecurityPolicy;
@@ -51,6 +54,11 @@ import java.util.regex.Pattern;
  *       second time is a startup error, not a silent override;</li>
  *   <li>the router is bound to an {@link Authenticator} built from {@link WebAuthSettings} plus the
  *       brute-force guard settings from configuration;</li>
+ *   <li>the authenticated CM read API is installed by one explicit
+ *       {@link #installCmApiRoutes(RepositoryManager, List, IbmCmAdapterRegistry)} call, which also binds
+ *       the repository manager the handlers read through. It is optional: a core-only runtime that never
+ *       calls it serves the mandatory routes alone, and every CM API route is registered as an
+ *       authenticated one;</li>
  *   <li>the exposure policy runs before the socket is opened, so a refused configuration never
  *       listens at all; a non-loopback plain-HTTP bind additionally requires the explicit
  *       {@code web.allowInsecureHttp=true} opt-in (default false) and is announced as a security
@@ -105,6 +113,8 @@ public final class WebServer implements AutoCloseable {
 
     private HttpServer server;
     private ExecutorService executor;
+    /** The optional authenticated CM read API, or null when the runtime installed none. */
+    private CmApiRoutes cmApiRoutes;
 
     public WebServer(AppConfig config, WebAuthSettings auth, Router router) {
         Objects.requireNonNull(config, "config");
@@ -177,6 +187,32 @@ public final class WebServer implements AutoCloseable {
             }
             this.executor = pool;
             this.server = created;
+        }
+    }
+
+    /**
+     * Installs the authenticated CM read API and binds the repository manager it reads through.
+     *
+     * <p>Deliberately one additive call: the mandatory routes above are installed exactly as they were,
+     * and this registers the Goal 02 routes from {@link CmApiRoutes} on the same router while retaining
+     * the manager so the binding is explicit rather than implied by one handler. Calling it twice is a
+     * wiring bug and is refused instead of silently re-registering a route.
+     *
+     * @throws IllegalStateException when the CM API routes have already been installed
+     */
+    public void installCmApiRoutes(RepositoryManager repositories,
+                                   List<RepositoryProfile> profiles,
+                                   IbmCmAdapterRegistry adapters) {
+        Objects.requireNonNull(repositories, "repositories");
+        Objects.requireNonNull(profiles, "profiles");
+        Objects.requireNonNull(adapters, "adapters");
+        synchronized (this) {
+            if (cmApiRoutes != null) {
+                throw new IllegalStateException("The CM API routes are already installed");
+            }
+            CmApiRoutes installed = new CmApiRoutes(repositories, profiles, adapters);
+            installed.install(router);
+            this.cmApiRoutes = installed;
         }
     }
 

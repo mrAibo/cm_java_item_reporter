@@ -37,6 +37,84 @@ pre-flight check, and by the application itself at startup.
 
 `tests/selftest.sh` runs the same suite on its own.
 
+### Build modes
+
+`build.sh` resolves the IBM CM SDK **once** and uses the result for the rest of the build. There are
+two supported modes, and the difference matters enough to be stated plainly: a stub build proves the
+adapter compiles, it does **not** validate it against IBM's runtime.
+
+| | Core-only (the default) | IBM-enabled |
+| --- | --- | --- |
+| IBM SDK JARs | none required | present in `lib/ibm/` |
+| `src/ibm/java` | compiled against `tests/ibm-stubs` | compiled against the real SDK |
+| What it proves | the adapter typechecks | the adapter compile is checked against the real API |
+| Test suite | runs, no IBM SDK needed | runs, plus the IBM suites when `src/ibm-test/java` is present |
+
+In the core-only mode `build.sh` prints a `WARN` saying the IBM source set was compiled against
+signature stubs and that this is a compile check, not SDK validation. That line is deliberate: a build
+that silently compiled against stubs and shipped would look identical to a validated one.
+
+### The IBM source set and the compile stubs
+
+```text
+src/main/java        core runtime - IBM-JAR-free, compiled with the SDK absent by construction
+src/ibm/java         the optional IBM source set (com.mraibo.cminsight.ibm.*)
+src/ibm/resources    the ServiceLoader registration for the adapter provider
+src/test/java        dependency-free core tests
+src/ibm-test/java    IBM adapter tests (compiled against the stubs or the real SDK)
+tests/ibm-stubs      TEST-ONLY compile stubs for com.ibm.* - never packaged, never shipped
+```
+
+`tests/ibm-stubs` is a signature-only mirror of the IBM CM 8.7 API, used so the IBM source set can be
+compiled and typechecked on a machine that owns **no** proprietary JAR. It is never on the core class
+path and never packaged: `build.sh` compiles the stubs into their own `build/ibm-stub-classes`
+directory and uses them only for `src/ibm/java`. Their surface is pinned against
+`tests/ibm-stubs/EXPECTED_SIGNATURES.txt`, and `build.sh` fails when they drift, so a stub cannot be
+quietly widened into an API the real SDK does not have. Two consequences are worth knowing before you
+rely on them:
+
+- the stubs are deliberately **narrower** than the real SDK - they declare only the read-only surface,
+  so a mutating call in `src/ibm/java` does not compile at all, and the source guard in
+  `tests/shell/ibm_guard.sh` (asserted by `tests/shell/ibm_source_guard_test.sh`) stays the second line
+  of defence rather than the only one;
+- stub bodies throw `UnsupportedOperationException`, so a test that needs a live SDK object must run
+  only when a real JAR is present, or drive the adapter through a fake.
+
+### Placing the IBM JARs, strict mode and the isolation guard
+
+Put the SDK JARs in `lib/ibm/`; `lib/README.md` lists the expected name. They are proprietary and are
+never downloaded by this build and never committed (`.gitignore` excludes `*.jar`). The launcher adds
+every `*.jar` it finds there to the class path, and `CM_INSIGHT_IBM_LIBS` names an additional
+directory when the SDK lives outside the repository - a staging directory, a shared mount or a vendor
+installation - so a one-off real-SDK check needs no repository change.
+
+```bash
+./build.sh --require-ibm          # fail unless a real IBM CM SDK is present in lib/ibm
+./build.sh --check-ibm-isolation  # run only the source guards; no JDK toolchain needed
+```
+
+`--require-ibm` is for an operator who requires IBM support: it turns "silently compiled against
+stubs" into a hard failure. `--check-ibm-isolation` runs the two Goal 02 source guards - no mutating
+IBM CM call under `src/ibm/java`, and no `com.ibm.` reference under `src/main/java` - and exits `0`
+when both hold, `2` when one is violated. `build.sh` runs the same guards on every build, so they
+cannot be skipped by forgetting a test.
+
+### Smoke command
+
+```bash
+./bin/cm-insight --check-repository <repository-id>
+```
+
+This walks the **production** path - adapter provider, repository manager, context factory, context,
+bounded CM session pool - activates one repository, reports the CM API release, the ItemType count and
+the retention policy count, then closes through the repository manager and fails unless that shutdown
+is terminal-clean. It never opens a one-off SDK connection: what it proves is that the real wiring
+works. It needs an active adapter, so use `bin/cm-insight` (which puts `lib/ibm/*.jar` on the class
+path) rather than a bare `java -jar`. Exit codes: `0` clean, `1` activation or shutdown failure
+(including a shutdown that is not terminal-clean), `2` usage, `3` configuration error, `4` no usable
+adapter or a read it cannot answer. Add `CM_INSIGHT_REQUIRE_IBM=true` to refuse a launch with no SDK
+JAR on the class path, so a core-only run cannot be mistaken for a validated one.
+
 ### Application home and operational paths
 
 Every relative operational path (`profiles.dir`, `classifications.file`, `secrets.dir`, `data.dir`,
@@ -92,6 +170,17 @@ Everything except `/api/health` is authenticated, including error responses, so 
 caller cannot tell a protected path from a missing one. `/api/health` is the only path that may be
 registered without authentication; the router rejects any other attempt.
 
+The Goal 02 repository/itemtype/retention/diagnostics routes are implemented **and registered**, in
+addition to the table above: `Main.serve()` calls `WebServer.installCmApiRoutes(...)` before the socket
+is opened, so every one of them is served and every one is authenticated. Registration happens even
+when no IBM adapter is installed, because "no adapter" must answer with the documented
+`503 adapter_unavailable` rather than a `404` that reads like a path typo.
+
+`POST /api/repositories/select` mutates local runtime state and is therefore guarded by a request
+header a cross-site HTML form cannot set: a missing or wrong `X-CM-Insight-Action` value is refused
+with `403 action_forbidden` before any state changes. See [SECURITY.md](SECURITY.md) for the full route
+list.
+
 ## Configuration
 
 Configuration is plain `conf/application.properties`. There is no external configuration framework.
@@ -108,9 +197,32 @@ Read by this build:
 - `profiles.dir`, `secrets.dir`
 - `repository.auto.activate` to optionally activate one configured repository at startup
 
-Reserved for later goals: `cm.pool.*`, `jdbc.pool.*`, `statistics.*`, `cache.*`, `data.dir`,
-`reports.dir`, `logs.dir`. They are accepted and carried in the example so the configuration shape is
-stable, but no Goal 01 code reads them yet.
+### CM adapter, pool and metadata cache
+
+These keys are read by `CmAdapterSettings.from(...)`, the single reader, which range-checks each value
+and fails closed on an out-of-range one instead of clamping it. A bad value is a configuration error
+(exit `3`) on every path, including `--print-config` and the doctor.
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `cm.pool.size` | `4` | `1..64` | hard bound of the per-repository CM session pool |
+| `cm.pool.borrow.timeout.ms` | `5000` | `1..600000` | how long a borrow waits before it times out |
+| `cm.pool.max.age.minutes` | `30` | `1..1440` | a session is retired when it is returned after this age |
+| `cm.pool.max.operations` | `1000` | `1..1000000` | a session is retired after this many uses |
+| `cache.metadata.ttl.seconds` | `600` | `0..86400` | how long a metadata snapshot stays fresh; `0` disables caching |
+
+`repository.auto.activate=<id>` activates one configured repository at startup. It **fails closed**:
+if the key names a repository that is not configured the runtime refuses with exit `3`, and if it is
+set while no adapter is available - absent, ambiguous or unloadable - startup refuses with exit `4`
+rather than publishing an empty placeholder context. Without the key, repository profiles are still
+listed and nothing is activated. `bin/doctor.sh` reports the same verdict as a `WARN` when nothing is
+configured to activate and an `ERROR` as soon as this key names a repository.
+
+Reserved for later goals: `jdbc.pool.*`, `statistics.*` and `cache.statistics.ttl.seconds`. They are
+accepted and carried in the example so the configuration shape is stable, but no code reads them yet.
+`data.dir`, `reports.dir` and `logs.dir` are also not read as directory values by any code: they are
+declared as home-relative path keys with their own defaults, and the shell scripts create the
+directories without resolving them from this file.
 
 Unknown keys are reported at startup instead of being ignored, matched against an exact key list so
 that a typo such as `web.prt=8080` is caught rather than passing as part of the `web.` family.

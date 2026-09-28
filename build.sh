@@ -211,9 +211,17 @@ log_ok "toolchain (${TOOLCHAIN_SOURCE}): ${JAVAC_VERSION_LINE}; java ${JAVA_MAJO
 BUILD_DIR="${ROOT}/build"
 CLASSES_DIR="${BUILD_DIR}/classes"
 TEST_CLASSES_DIR="${BUILD_DIR}/test-classes"
-IBM_CLASSES_DIR="${BUILD_DIR}/ibm-classes"
-IBM_TEST_CLASSES_DIR="${BUILD_DIR}/ibm-test-classes"
 JAR_FILE="${BUILD_DIR}/cm-insight.jar"
+# The optional-source-set outputs deliberately live OUTSIDE build/. A concurrent build in the same tree
+# runs `rm -rf build/classes build/test-classes`, and sharing one directory meant a second build could
+# delete the IBM stub classes between this build's javac and its signature check - which then reported a
+# signature mismatch for stubs that were perfectly correct. That happened repeatedly while several
+# members built at once and cost real diagnosis time, so the fix is structural rather than a re-run:
+# nothing another build deletes lives under the path these artifacts use.
+OUT_DIR="${ROOT}/target"
+IBM_CLASSES_DIR="${OUT_DIR}/ibm-classes"
+IBM_TEST_CLASSES_DIR="${OUT_DIR}/ibm-test-classes"
+IBM_STUB_CLASSES_DIR="${OUT_DIR}/ibm-stub-classes"
 MAIN_SRC_DIR="${ROOT}/src/main/java"
 TEST_SRC_DIR="${ROOT}/src/test/java"
 RESOURCES_DIR="${ROOT}/src/main/resources"
@@ -286,7 +294,9 @@ fi
 # itself compile (which would otherwise look like the adapter being broken), and
 # it keeps the stubs out of build/classes and out of the packaged jar by
 # construction rather than by a copy step somebody has to remember.
-IBM_STUB_CLASSES_DIR="${BUILD_DIR}/ibm-stub-classes"
+#
+# IBM_STUB_CLASSES_DIR is defined with the layout above, under target/ rather than
+# build/, for the concurrency reason documented there.
 STUB_SOURCES=()
 if [ -d "${IBM_STUB_DIR}" ]; then
   while IFS= read -r -d '' file; do STUB_SOURCES+=("${file}"); done \
@@ -300,7 +310,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. clean
 # ---------------------------------------------------------------------------
-rm -rf "${CLASSES_DIR}" "${TEST_CLASSES_DIR}" "${IBM_CLASSES_DIR}" "${IBM_TEST_CLASSES_DIR}"
+rm -rf "${CLASSES_DIR}" "${TEST_CLASSES_DIR}" "${IBM_CLASSES_DIR}" "${IBM_TEST_CLASSES_DIR}" "${IBM_STUB_CLASSES_DIR}"
 rm -f "${JAR_FILE}" "${BUILD_DIR}/.version" "${BUILD_DIR}/manifest.mf"
 mkdir -p "${CLASSES_DIR}" "${TEST_CLASSES_DIR}"
 log_ok "cleaned ${CLASSES_DIR} and ${TEST_CLASSES_DIR}"

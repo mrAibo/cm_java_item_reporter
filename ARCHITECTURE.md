@@ -82,17 +82,74 @@ There is exactly one capacity path. Nothing in the codebase may bypass the pool 
 ```text
 RepositoryContext
 ├── RepositoryProfile
-├── CmSessionPool
-├── JdbcConnectionPool
-├── MetadataRepository
-├── StatisticsRepository
-├── RetentionRepository
-└── caches
+├── CmSessionPool              (the IBM adapter's hard-bounded session pool)
+├── JdbcConnectionPool         (target shape - later analytics goal)
+├── MetadataRepository         (adapter-provided, read-only, IBM-JAR-free interface)
+├── StatisticsRepository       (target shape - later analytics goal)
+├── RetentionRepository        (adapter-provided, read-only, IBM-JAR-free interface)
+└── caches                     (metadata cache, per context)
 ```
 
 Modules borrow resources from this context and do not create ad-hoc connections.
 
-Goal 01 ships the generic `BoundedPool`, the `RepositoryContext` resource container and the `RepositoryContextFactory` seam. The named CM and JDBC pools and the metadata, statistics and retention repositories in the tree above are the target shape for the later adapter and analytics goals; those types do not exist yet.
+Goal 02 implements the CM half of that tree. The named CM pool is real and hard bounded, and the
+metadata and retention repositories exist as **types**, not as a `Map<String,Object>` locator:
+`RepositoryContext` exposes them through explicit typed accessors (`metadata()`, `retention()`,
+`cmPool()`), each returning an `Optional`, so a context can still be built without them and Goal 03 can
+add a statistics service without redesigning anything. The JDBC pool and the statistics repository are
+the remaining target shape and do not exist yet.
+
+### The IBM source set and the provider boundary
+
+The adapter is a **compile-time-optional source set**, not a second deployable:
+
+```text
+src/main/java       core runtime - no com.ibm.* type is reachable, by construction
+src/ibm/java        the adapter  (com.mraibo.cminsight.ibm.*)  -> build/ibm-classes
+src/ibm/resources   META-INF/services/com.mraibo.cminsight.ibm.CmAdapterProvider
+tests/ibm-stubs     signature-only com.ibm.* stubs, test-only and never packaged
+```
+
+`src/main/java` is compiled with no IBM JAR and no stub on its class path, so a core source that needs
+an SDK type does not compile rather than drifting across the boundary. The adapter is discovered at
+runtime through `java.util.ServiceLoader` against the core-owned `CmAdapterProvider` interface:
+`IbmCmAdapterRegistry.discover()` reports exactly one of `ABSENT`, `AVAILABLE`, `AMBIGUOUS` or
+`UNAVAILABLE`, and two or more providers is an explicit failure rather than a silent pick. Both the
+source set and the registration are packaged into the single jar, so the adapter is optional at
+compile time and at runtime - not a separate process and not a plugin directory.
+
+The adapter knows only the vendor-neutral core contracts (`CmSessionFactory`, `MetadataRepository`,
+`RetentionRepository`, `RepositoryContextFactory`, `CmPoolDiagnostics`). Nothing else in the tree may
+name an IBM type: rule 3 above is enforced twice, by a source guard and by the compiler.
+
+### Per-context metadata cache
+
+One `MetadataCache` is created with a `RepositoryContext`, published with it and released with it; it
+is never shared between repositories and holds only immutable DTOs. A snapshot is fresh for
+`cache.metadata.ttl.seconds` (that TTL's `0` disables caching), at most one refresh per key runs at a
+time so a burst of requests cannot become a burst of CM sessions, and a failed refresh never replaces
+a known-good snapshot with partial data - the previous snapshot keeps being served with a growing age
+and a recorded reason. Every load happens outside the CM session pool's lock, so a refresh can never
+stall a borrow.
+
+### The read-only guarantee is structural
+
+V1/V2 rule 6 above is enforced two ways, and the first one is stronger than a text scan: the compile
+stubs under `tests/ibm-stubs` declare **only** the read-only getters on `DKItemTypeDefICM`,
+`DKRetentionPolicyDefICM` and `DKPolicyMgmtICM`, so a call such as `policy.add(...)`,
+`itemType.update()` or `itemType.setName(...)` does not compile against the IBM source set at all. The
+stub surface is pinned against `tests/ibm-stubs/EXPECTED_SIGNATURES.txt`, so removing that protection
+fails the build rather than passing quietly. On top of it, a committed source guard
+(`tests/shell/ibm_guard.sh`, run by `build.sh` and by `ibm_source_guard_test.sh`) refuses the
+unambiguously IBM-specific mutating calls - `commit(`, `rollback(`, `checkIn(`, `checkOut(`,
+`backfill(`, `migrate(`, `moveObject(`, `changePassword(`, `makeActive(`, `makeInactive(`, `reorg(`,
+`recreate(`, `clearCache(`, `assign(` and `unassign(` - plus native JDBC extraction through
+`connection()`, and a second guard refuses any `com.ibm.` reference under `src/main/java`. Names that
+are also ordinary JDK methods (`add`, `remove`, `update`, `set*`) are deliberately not text-matched,
+because a guard that refuses the adapter's own `List`/`Map`/`AtomicBoolean` bookkeeping cannot pass and
+would end up disabled; those members are excluded one layer earlier by the stubs' omission, which is
+the stronger guarantee. The retention *administration* module stays disabled by default and cannot be
+enabled.
 
 ## Statistics
 
