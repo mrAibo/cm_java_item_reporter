@@ -5,6 +5,7 @@ import com.mraibo.cminsight.connection.CreationFailure;
 import com.mraibo.cminsight.connection.Lease;
 import com.mraibo.cminsight.connection.PoolException;
 import com.mraibo.cminsight.connection.ResourceFactory;
+import com.mraibo.cminsight.core.CloseState;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -105,6 +106,63 @@ public final class UncertainCreationTest {
             Assert.assertNotNull(lease.value(), "C: the pool recovers once the factory works again");
         }
         Assert.assertEquals(1, factory.liveCount(), "C: exactly one resource is live after recovery");
+    }
+
+    /**
+     * A pool whose slot was quarantined by a CREATION failure must report its shutdown as UNCERTAIN, which
+     * is what stops a repository switch from opening the next repository's sessions beside a possibly-live
+     * one.
+     *
+     * <p>This crosses sections C and the Goal 01C contract, and it was the one high-value gap the tests
+     * member found in this suite: the create-quarantine path was previously covered only up to
+     * {@code metrics().quarantined()}, never up to the {@link CloseState} that the switch rule actually
+     * reads. {@code RepositoryManager} refuses a switch when the previous context is
+     * {@code CLOSED_UNCERTAIN}, and it learns that from the owned pool's state, so a creation quarantine
+     * that reported {@code CLOSED_CLEAN} would let the next repository open a session while the physical
+     * outcome of this one is still unknown - the exact bound breach section C exists to prevent.
+     *
+     * <p>Also pinned: the quarantine is what makes it uncertain, not merely that close() was called.
+     * {@code closedWithUncertainResources()} is derived from the same state, so the two must agree.
+     */
+    public void aCreationQuarantineMakesThePoolShutdownUncertain() throws Exception {
+        FakePoolFactory factory = new FakePoolFactory();
+        BoundedPool<FakeResource> pool = new BoundedPool<>("cm", 2, IMPATIENT, factory);
+
+        Assert.assertEquals(CloseState.NOT_CLOSED, pool.closeState(),
+                "C: an in-service pool is NOT_CLOSED, which refuses reuse without claiming a leak");
+        Assert.assertFalse(pool.closedWithUncertainResources(),
+                "C: an open pool with nothing quarantined is not uncertain");
+
+        factory.failNextCreatesAfterAllocation(1, false);
+        Assert.assertThrows(PoolException.class, pool::borrow,
+                "C: the initial creation fails with an unproven cleanup");
+        Assert.assertEquals(1, pool.metrics().quarantined(), "C: the slot is quarantined");
+
+        // The pool is still OPEN here, so the question "did close() leave anything" is not yet being asked.
+        Assert.assertEquals(CloseState.NOT_CLOSED, pool.closeState(),
+                "C: open with a quarantined slot still reports NOT_CLOSED - the state describes the last"
+                        + " shutdown, and there has not been one yet");
+        Assert.assertEquals(1, pool.metrics().capacityInUse(),
+                "C: but the quarantined slot still consumes capacity while the pool is open");
+
+        pool.close();
+
+        Assert.assertEquals(CloseState.CLOSED_UNCERTAIN, pool.closeState(),
+                "C: a close after a CREATION quarantine is UNCERTAIN, not clean - the pool cannot prove the"
+                        + " session the failed attempt left behind is gone");
+        Assert.assertTrue(pool.closedWithUncertainResources(),
+                "C: closedWithUncertainResources() must agree with closeState(), because the switch rule"
+                        + " reads one and the context derives the other");
+        Assert.assertTrue(pool.metrics().degraded(),
+                "C: the pool reports itself degraded so an operator can see why capacity is missing");
+        Assert.assertTrue(pool.closeState().refusesReuse(),
+                "C: an uncertain shutdown must refuse reuse - this is the predicate a repository switch"
+                        + " relies on before it opens the next repository's sessions");
+        Assert.assertEquals(1, pool.metrics().createQuarantineFailures(),
+                "C: the event is attributed to a creation quarantine, not to a close failure");
+        Assert.assertEquals(0L, pool.metrics().closeFailures(),
+                "C: no close failed here, so the close counters stay clean - the uncertainty did not come"
+                        + " from this shutdown");
     }
 
     /**
