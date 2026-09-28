@@ -377,6 +377,16 @@ if [ "${#IBM_MAIN_SOURCES[@]}" -gt 0 ]; then
     # otherwise surface only on a machine that owns the proprietary JAR.
     if [ -x "${IBM_STUB_DIR}/check-signatures.sh" ]; then
       log_ok "checking the stub signatures against tests/ibm-stubs/EXPECTED_SIGNATURES.txt"
+      # Distinguish the two failures, because they have completely different causes and
+      # the checker's own message names only the second one. An empty classes directory
+      # means the javac above produced nothing - typically because a CONCURRENT build in
+      # the same tree wiped build/ between the compile and this check - and reporting
+      # that as "the stubs no longer match" sends the reader to edit a file that is
+      # perfectly correct. Measured: exactly that happened while two members built at
+      # once, and the misleading line cost a diagnosis.
+      if [ -z "$(find "${IBM_STUB_CLASSES_DIR}" -name '*.class' -print -quit 2>/dev/null)" ]; then
+        fail "the stub compile above produced no class files under ${IBM_STUB_CLASSES_DIR}, so the signature check has nothing to inspect. Nothing is wrong with tests/ibm-stubs: this usually means another build in the same tree deleted build/ while this one was running. Re-run ./build.sh when no other build is active."
+      fi
       if ! bash "${IBM_STUB_DIR}/check-signatures.sh" --classes "${IBM_STUB_CLASSES_DIR}"; then
         fail "the IBM compile stubs no longer match tests/ibm-stubs/EXPECTED_SIGNATURES.txt. The stubs must mirror the real IBM CM 8.7 SDK; if the change was deliberate, re-run tests/ibm-stubs/check-signatures.sh --write and commit the result."
       fi
