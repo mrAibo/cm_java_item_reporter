@@ -8,230 +8,108 @@
 - Repository: mrAibo/cm_java_item_reporter
 - Active branch: `bootstrap/cm-insight-architecture`
 - Goal 01 implementation commit: `fb42a0e55e69b551bffdcf0986714b8110dbdfb6`
-- Goal 01A/01B: completed and externally reviewed through `3499129d8a851e07cd5a4cee03bdbd5d81fa224c`
-- **Goal 01C implementation/work commits (the commits this file describes):**
-  - `4b844bd18b48a3b09edbeab2b713fa03f9e007f9` - quiescent repository shutdown before switching
-  - `dd6a34cb7ba0dacb6f0e1c36bf453c40349e880a` - review-finding fixes (latch, lock scope, states)
-  - `98a97e3dc6aaf97e18b0463760579112f12bbe59` - revert of the F1 lock-scope mitigation and the
-    test-flake fix that hides the regression it caused
-- Stage: **Goal 01C executed, adversarially reviewed and pushed; awaiting architecture review before Goal 02**
+- Goal 01A: accepted after review-hardening
+- Goal 01B: accepted after Linux lifecycle / close-propagation review
+- Goal 01C reviewed remote HEAD: `8dcea7222178fd95aa8b123994187187aa2bd192`
+- Stage: **Goal 01C ACCEPTED; Goal 02 IBM CM read-only integration is APPROVED**
 - Runtime target: Java 17 LTS / OpenJDK-compatible
 - Build/deployment: javac + jar + bash; single JVM
 - Product safety mode: read-only V1/V2
-- Current approved goal: `harness/GOAL_01C_QUIESCENT_REPOSITORY_SHUTDOWN.md` (executed)
-- Goals 02-05: PROVISIONAL; do not execute
-- Next goal: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+- Current approved goal: `harness/GOAL_02_IBM_CM_RETENTION.md`
+- Goals 03-05: PROVISIONAL; do not execute
+- Next goal after Goal 02: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
 
-## Checkpoint protocol
+## Goal 01C review verdict
 
-A commit cannot truthfully contain its own SHA. Therefore:
+**ACCEPTED.**
 
-- this file records the last completed **implementation/work** commits it describes, above;
-- the authoritative current branch head is read from Git:
-  `git rev-parse HEAD` / `git ls-remote origin refs/heads/bootstrap/cm-insight-architecture`;
-- the final handoff report records the exact local and verified remote HEAD after the STATUS
-  commit itself has been pushed;
-- no SHA field in this file is a placeholder or describes "the commit that follows".
+Reviewed pushed SHA:
 
-## Goal 01C: the defect that was closed
+`8dcea7222178fd95aa8b123994187187aa2bd192`
 
-`BoundedPool.close()` returned as soon as the IDLE resources were released. A resource still out on a
-lease is closed later, by the thread that returns it - so at the instant `close()` returned the pool was
-"closed" while a physical session it owned was demonstrably alive, `quarantinedCount` was still 0 and
-`closedWithUncertainResources()` said **false**. `RepositoryContext` snapshotted that as a clean close,
-and `RepositoryManager` was then free to create the next context on top of a live old connection. That
-is Goal 01B review finding F3, and it is broader than a late quarantine: even a lease that comes back
-perfectly cleanly comes back too late.
+Exact-SHA GitHub Actions:
 
-Reproduced against the reviewed pre-goal code before the fix (probe kept out of the repository):
-`factoryCalls=[alpha, beta]`, manager `ACTIVE`, alpha's leased resource still physically live. Fixed:
-`factoryCalls=[alpha]`, switch refused, `manager latched = true`.
+- push run `36482320243`: **success**
+- pull_request run `36482326265`: **success**
 
-## Close-state semantics implemented
+Accepted core safety properties:
 
-New vendor-neutral vocabulary in `src/main/java/com/mraibo/cminsight/core/`:
+- BoundedPool cannot report terminal-clean while leased/creating/retiring/quarantined physical capacity remains.
+- RepositoryContext derives close state on every read instead of freezing a stale clean snapshot.
+- late clean lease return can move a closing context to terminal-clean.
+- late failed return/quarantine moves it to terminal-uncertain.
+- uncertainty is latched monotonically.
+- RepositoryManager retains an unpublished previous context and checks it before every retry.
+- pending/uncertain previous repository prevents the next-context factory from being called.
+- terminal-clean is checked before the retained context is forgotten.
+- Goal 01B Linux/process/socket/security behavior remains intact.
 
-- `CloseState`: `NOT_CLOSED`, `CLOSING`, `CLOSED_CLEAN`, `CLOSED_UNCERTAIN` with
-  `isTerminal()`, `isTerminalClean()`, `isPending()`, `refusesReuse()`;
-- `CloseStateAware.closeState()`, a sibling of `CloseOutcomeAware` (which is unchanged).
-- No IBM CM or JDBC type appears in either contract.
+No new fail-open or physical-bound blocker was found in the reviewed Goal 01C diff.
 
-`BoundedPool`:
+## Accepted Goal 02 obligations
 
-- `CLOSING` = close initiated AND `leased > 0 || creating > 0 || retiring > 0` - an outstanding physical
-  resource, so it is neither clean nor uncertain;
-- `CLOSED_UNCERTAIN` = finished with `quarantined > 0`; terminal, never improves;
-- `CLOSED_CLEAN` = close initiated, every one of leased/creating/retiring/quarantined zero;
-- a physically outstanding resource is never reported `CLOSED_CLEAN`, and pending is never called
-  uncertainty (an outstanding lease is recoverable, a quarantine is not).
-- `closedWithUncertainResources()` is now `closeState() == CLOSED_UNCERTAIN`. **Deliberate narrowing:**
-  an OPEN pool with a quarantined slot used to answer true and now answers false, because the question is
-  tied to the last shutdown. Audited: no in-repo caller depends on the old reading; `closeState()` is the
-  honest question for an in-service pool. Recorded here rather than changed silently.
-- `awaitQuiescence()` is deliberately UNCHANGED: it answers "has everything settled", which an open pool
-  may legitimately answer true to, and it has zero production callers. The shutdown question is
-  `closeState()`.
+### Adapter state/health reads
 
-`RepositoryContext`:
+RepositoryManager reads close state under its lifecycle lock. A broken adapter whose closeState() blocks
+can delay switching, but cannot authorize a fail-open switch. Goal 02 must keep closeState and pool
+health checks cheap/local and perform network validation outside pool locks.
 
-- close outcome is DERIVED on every read, never frozen: `closeState()` walks the owned close-aware
-  resources plus a monotone uncertainty latch. No final clean verdict is published by `close()`;
-- uncertainty is a real LATCH: uncertainty seen by ANY read - recorded at close time, reported now, or
-  observed in between - is permanent. This is deliberately stronger than trusting every implementation to
-  be monotone, because a resource whose state flaps would otherwise be refused once and allowed through
-  on the retry: a fail-open window across retries;
-- `uncertainCloseReports()` is derived the same way, keeping resource REFERENCES so a slot that only
-  becomes quarantined after `close()` returned still produces value-free reason text;
-- diagnostics remain value-free: counts and sources only.
+### Physical uncertainty during create()
 
-## Retry behaviour after pending clean completion and after quarantine
+A real SDK factory can allocate/connect and then fail cleanup. Goal 02 must add a generic
+uncertain-creation signal so BoundedPool quarantines that reservation instead of silently freeing it.
 
-`RepositoryManager` retains a previous context it unpublished but could not prove released, in
-`unpublishedClosing`, and re-checks it on EVERY switch before the factory is reached:
+### Partial repository activation
 
-| Retained context state | Result |
-| --- | --- |
-| `CLOSING` (lease/creation/retirement outstanding) | refused, `Refusal.PENDING`, state `FAILED` - recoverable, retry once released |
-| `CLOSED_UNCERTAIN` (quarantine) | refused, `Refusal.UNCERTAIN`, state `FAILED` - permanent while the process lives |
-| `CLOSED_CLEAN` | latch released, the switch proceeds |
+If the production repository factory allocates resources and fails before returning a context, those
+resources must remain visible to RepositoryManager. Goal 02 must add a cleanup-context/equivalent
+failure path and apply the same pending/uncertain latch rules.
 
-- A failed switch can no longer be forgotten merely because the context was unpublished, and the refusal
-  is repeatable: the same latch is re-checked on every attempt, so "refused once" cannot become "allowed
-  next time".
-- `releaseLatch()` is the single place a previous repository is forgotten and it guards on the state, so
-  a caller that gets it wrong downgrades to "retained", never to "lost".
-- No automatic emergency reset and no force-open path exists.
-- `deactivate()` sweeps a retained context instead of reporting `NONE` over a live resource; `close()`
-  stays best-effort and terminal.
-- `statusSnapshot()` gained `closingRepositoryId`, `closingState` and `refusal`.
-- No bounded drain wait was added: the non-blocking "still draining; retry later" design the goal
-  explicitly permits was chosen, so there is no new timeout to tune and no unbounded wait.
+## IBM source evidence
 
-## Deterministic tests and results
+Reviewed working CM_Migrator connection/pool code and CM_retention CmService.
 
-New committed suite `src/test/java/com/mraibo/cminsight/test/RepositorySwitchQuiescenceTest.java`
-(9 tests). Each owns a REAL `BoundedPool<FakeResource>` inside repository context A and drives the
-interleaving with latches from `FakePoolFactory` - no sleeps to create a race, no scheduler luck:
+Useful from CM_Migrator:
+- DKDatastoreICM lifecycle and cleanup patterns;
+- age/usage ideas.
 
-- E1 `anOutstandingLeaseRefusesTheSwitchAndEveryRetry`
-- E2 `aLateCleanReturnPermitsOnlyALaterSafeSwitch` (ordering evidence sampled INSIDE the factory:
-  B was built while zero of A's resources were alive)
-- E3 `aLateFailedReturnStaysRefusedAndCreatesNothing`
-- E4a `anInFlightCreationRefusesTheSwitchUntilItIsRetired`
-- E4b `aRetryCannotBypassAStillPendingPreviousContext`
-- E5 `anOrdinaryContextStillClosesAndSwitchesWithoutPendingStates`
-- `thePoolDistinguishesPendingFromUncertainAndFromClean`
-- `anUncertaintyObservedOnceIsLatchedAndNeverRevoked`
-- `deactivatingAPendingContextNeverClaimsItWasReleased`
+Rejected:
+- emergency connections;
+- source/destination pool architecture;
+- native JDBC extraction/ad-hoc connections;
+- swallowed cleanup failures.
 
-Commands and results (JDK 17.0.20.1, offline, no bash needed for the Java suite):
+Confirmed read paths from CM_retention:
+- DKDatastoreICM.connect(ssid,user,password,"")
+- DKDatastoreDefICM.listEntities(...)
+- retrieveEntity(name)
+- DKDatastoreAdminICM.datastoreAdmin().policyMgmt()
+- listRetentionPolicyNames()
+- listRetentionPolicies()
+- retrieveRetentionPolicy(name)
+- listItemTypeNamesByRetentionPolicy(name)
+- ItemType property getters.
 
-- `./build.sh` (javac --release 17 -encoding UTF-8 -Xlint:all, then SelfTest, then jar):
-  **Tests run: 182, failures: 0** (173 before this goal), jar packaged. Local equivalent driver used
-  because MSYS `bash` cannot allocate its shared-memory object in this session's file sandbox.
-- Discrimination, not assumed: against the pre-goal main classes the new suite does not compile
-  (100 errors - it asks for the vocabulary this goal introduces), so a minimal probe that compiles
-  against BOTH revisions was used: pre-goal `RESULT=DEFECT_REPRODUCED` (beta created while alpha's
-  resource was live), fixed `RESULT=INVARIANT_HELD`.
-- No existing assertion was weakened: every pre-existing test file is byte-identical to `3499129`
-  except `SelfTest.java`, whose only change is one added line registering the new suite.
-
-## Independent adversarial review
-
-Performed against the frozen revision by a reviewer that did not write the code (verdict: **YES**, the
-critical invariant holds). Held under attack: 15,625 exhaustive operation sequences (depth 6) with an
-invariant checkpoint at every factory call; ~5M concurrent factory-call checkpoints under switch /
-deactivate / diagnostics hammering; 280k pool state samples (176k of them `CLOSED_CLEAN`) with
-concurrent borrowers and an uncertain-close poisoner - zero violations, and the pre-goal code
-demonstrably violated. Findings raised were fixed in `dd6a34c`: the latch gap (F2, a real fail-open
-window across retries), the lock-scope wedge (F1, measured blocking), inconsistent refusal states (F3),
-a non-atomic diagnostics snapshot (F4), a stuck `INITIALIZING` after an `Error` (F6), the undocumented
-factory leak obligation (F7), an unused import (F8) and two uncovered routes (F9).
-
-## CI status
-
-Exact-SHA GitHub Actions (`bootstrap-test`, both events) - all green:
-
-| Commit | push run | pull_request run |
-| --- | --- | --- |
-| `4b844bd` (initial Goal 01C) | `36477237772` success | `36477243761` success |
-| `dd6a34c` (review fixes) | `36479626191` success | `36479635585` success |
-| `26894a4` (STATUS.md only) | `36480132293` **failure** | `36480141960` **failure** |
-| `98a97e3` + `2df7c3c` (regression fix + checkpoint) | `36481356205` success | `36481361254` success |
-| `9e7fdf0` (final checkpoint) | `36481852057` success | `36481856632` success |
-
-Each of these runs is exact-SHA: the run's `headSha` equals the commit in the row, so a green row is
-evidence about that revision and no other.
-
-The `26894a4` failure is recorded deliberately rather than hidden. A documentation-only commit cannot
-change test behaviour, so its two red runs were the first visible symptom of a REAL regression
-introduced by the review-fix commit: `RepositoryManagerTest.concurrentSwitchesNeverLeaveTwoContextsActive`
-failed with "the repository lifecycle kept changing while this switch was being evaluated". Root cause:
-the F1 mitigation above (sample outside the lock, revalidate under it, bounded re-samples). With eight
-threads queueing on the switch lock, each thread's sample was invalidated by the switch ahead of it and
-the bounded retry exhausted itself, turning a legitimate concurrent switch into a spurious failure. Two
-consequences were drawn and both are committed:
-
-- the mitigation was reverted (see risk 1) rather than papered over with a larger retry count, because
-  the correctness of a contended switch outranks the latency it avoids;
-- the single-run Java suite was NOT sufficient to catch it. The local verification for this goal now
-  includes a hammer that repeats the concurrency-sensitive suites back to back: **124 rounds / 0
-  failures** over 120 s, covering `RepositoryManagerTest`, `RepositoryClosePropagationTest` and
-  `RepositorySwitchQuiescenceTest`. That hammer also exposed a genuine flake in one of the NEW tests
-  (`anInFlightCreationRefusesTheSwitchUntilItIsRetired` asserted that the parked borrower loses a race it
-  can legitimately win); the assertion was replaced with the deterministic property that matters - no
-  lease exists while the creation is still parked, and nothing leaks whichever thread wins.
-
-Each green run executed the full job: script permissions, shell syntax, `--help` smoke tests, `./build.sh`
-(compile + SelfTest + package), the committed shell regression suite (`tests/shell/run.sh`), `doctor`,
-and the bounded 3-cycle start/status/stop lifecycle reliability step with the exact health marker.
-Both the push and the pull_request event are required; a single green event is not CI green.
-
-## Unresolved core lifecycle risks
-
-1. **Resource-controlled blocking inside the fail-closed decision (accepted, contract-documented).**
-   Reporting a context's close state calls into its owned resources, so the read happens while the switch
-   lock is held and an implementation that blocks there delays the lifecycle. Sampling the state OUTSIDE
-   the lock and revalidating it under the lock was implemented, measured and REVERTED: with several
-   threads queueing on the lock each sample was invalidated by the switch ahead of it, and a bounded number
-   of re-samples turned an ordinary contended switch into a spurious failure (caught by CI on `26894a4`,
-   then reproduced and fixed - see the CI section). Refusing every contended switch, or looping without
-   bound, are both worse than the delay they avoid. The obligation is therefore placed and documented
-   where it belongs, as a hard requirement of `CloseStateAware.closeState()` (cheap, never blocking) and of
-   `ResourceFactory.isHealthy` (no I/O under the pool lock). Safety is unaffected: a blocked read can only
-   ever delay or refuse a switch, never let one through. The CM/JDBC adapters (Goal 02) must honour it; a
-   bounded probe policy is a later decision, not this goal's.
-2. **`CLOSED_CLEAN` is a proof only while factories keep their side of the contract.** A factory that
-   opens a physical resource and then throws leaks it invisibly to the pool, which would still report
-   `CLOSED_CLEAN`. The obligation is now documented on `ResourceFactory`; enforcing it is not possible
-   from inside the pool.
-3. **Quarantine is still unrecoverable in-process** (by design): a `CLOSED_UNCERTAIN` previous repository
-   refuses every later switch until the process is replaced. Recovering that capacity is an operational
-   decision, not a code path - and there is deliberately no emergency reset.
-4. **`deactivate()` publishes `FAILED` (not `NONE`) for a pending or uncertain close.** Honest, but a UI
-   that treats `FAILED` as "the repository is broken" would over-report; Goal 04 should map states to
-   messages.
+CM_retention mutating assign/unassign/create/delete/update/commit paths remain forbidden.
 
 ## IBM / DB live status
 
-**No IBM CM, DB2 or Oracle live validation has been performed.** Vendor JARs are absent. Goal 01C is
-vendor-neutral core work and claims no live validation.
+No IBM CM / DB2 / Oracle live validation has yet been performed for CM Insight.
+Goal 02 is the first goal allowed to compile/use local IBM SDK JARs when available.
+JDBC analytics remains Goal 03.
 
 ## Exact next goal
 
-**NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.**
+Execute only:
 
-Do not execute `harness/GOAL_02_IBM_CM_RETENTION.md` or any other provisional goal. Review the Goal 01C
-commits first; the architecture owner decides whether to approve, replace, split, merge or rewrite the
-next goal.
+1. `harness/MASTER_GOAL.md`
+2. `harness/GOAL_02_IBM_CM_RETENTION.md`
+
+Do not execute Goal 03.
 
 ## Resume instruction
 
-"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture. Fetch
-and fast-forward to the current remote state. Read STATUS.md, harness/MASTER_GOAL.md and
-harness/GOAL_01C_QUIESCENT_REPOSITORY_SHUTDOWN.md. Goal 01C is executed, pushed and green on both
-Actions events; do not re-execute it and do not execute Goal 02. Wait for the architecture review of the
-Goal 01C commits, then implement only the next goal the architecture owner approves."
+"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture. Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md, harness/MASTER_GOAL.md and harness/GOAL_02_IBM_CM_RETENTION.md completely. Goal 01C is accepted. Execute only the approved Goal 02. Preserve every Goal 01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Do not implement JDBC analytics or Goal 03. At completion run all required validation, commit coherently, push the branch yourself, verify local/remote HEAD equality, require both exact-SHA Actions events green, update STATUS.md, set the next goal to NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED, do not merge PR #1, and stop."
 
 ## Mandatory checkpoint rule
 
@@ -239,11 +117,12 @@ At the end of every approved goal record:
 
 - date/time;
 - branch;
-- last completed implementation/work commit described by STATUS;
+- last completed work commit described by STATUS;
 - exact work completed;
-- tests actually run/results;
-- Actions run IDs/results where required;
-- live IBM/DB tests actually run or explicitly not run;
+- tests/results;
+- real IBM SDK compile performed or explicitly not performed;
+- live IBM CM smoke performed or explicitly not performed;
+- Actions run IDs/results;
 - unresolved risks;
 - architecture changes only when approved;
 - next goal status;
