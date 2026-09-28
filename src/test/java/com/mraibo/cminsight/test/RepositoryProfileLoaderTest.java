@@ -4,6 +4,7 @@ import com.mraibo.cminsight.config.ConfigException;
 import com.mraibo.cminsight.config.DatabaseVendor;
 import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.config.RepositoryProfileLoader;
+import com.mraibo.cminsight.config.SecretRef;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -11,6 +12,23 @@ import java.util.List;
 
 /** Repository profile loading: valid profiles, fail-closed validation and secret rejection. */
 public class RepositoryProfileLoaderTest {
+
+    /**
+     * The four credential references used by the programmatic fixtures. Goal 01A section C: a profile
+     * declares where a credential comes from (a {@link SecretRef}), never the value itself.
+     */
+    private static final SecretRef CM_USER = RepositoryProfile.credentialFromEnvironment(
+            RepositoryProfile.CM_USER_KEY, "CM_USER");
+    private static final SecretRef CM_PASSWORD = RepositoryProfile.credentialFromEnvironment(
+            RepositoryProfile.CM_PASSWORD_KEY, "CM_PASSWORD");
+    private static final SecretRef JDBC_USER = RepositoryProfile.credentialFromEnvironment(
+            RepositoryProfile.JDBC_USER_KEY, "JDBC_USER");
+    private static final SecretRef JDBC_PASSWORD = RepositoryProfile.credentialFromEnvironment(
+            RepositoryProfile.JDBC_PASSWORD_KEY, "JDBC_PASSWORD");
+
+    private static SecretRef envRef(String key, String envName) {
+        return RepositoryProfile.credentialFromEnvironment(key, envName);
+    }
 
     private static final String VALID_PROFILE = """
             repository.id=crm
@@ -147,20 +165,20 @@ public class RepositoryProfileLoaderTest {
     public void jdbcUrlsWithAnEmbeddedCredentialAreRejected() throws IOException {
         RepositoryProfile userInfo = new RepositoryProfile("crm", "CRM", "SSID", DatabaseVendor.DB2,
                 "jdbc:db2://cmuser:Credential-5521@db.example:50000/CRM", null,
-                "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null);
+                CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null);
         Assert.assertTrue(userInfo.jdbcUrlEmbedsCredential(), "//user:password@host is detected");
         RepositoryProfile oracleThin = new RepositoryProfile("crm", "CRM", "SSID", DatabaseVendor.ORACLE,
                 "jdbc:oracle:thin:cmuser/Credential-5521@db.example:1521/CRMSVC", null,
-                "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null);
+                CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null);
         Assert.assertTrue(oracleThin.jdbcUrlEmbedsCredential(), "the Oracle thin :user/password@host is detected");
         RepositoryProfile property = new RepositoryProfile("crm", "CRM", "SSID", DatabaseVendor.DB2,
                 "jdbc:db2://db.example:50000/CRM;password=Credential-5521", null,
-                "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null);
+                CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null);
         Assert.assertTrue(property.jdbcUrlEmbedsCredential(), ";password=value is detected");
 
         RepositoryProfile clean = new RepositoryProfile("crm", "CRM", "SSID", DatabaseVendor.ORACLE,
                 "jdbc:oracle:thin:@//db.example:1521/CRMSVC", null,
-                "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null);
+                CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null);
         Assert.assertFalse(clean.jdbcUrlEmbedsCredential(), "a credential-free Oracle service URL passes");
         Assert.assertEquals("jdbc:oracle:thin:@//db.example:1521/CRMSVC", clean.safeJdbcUrl(),
                 "a clean URL is returned unchanged");
@@ -263,15 +281,42 @@ public class RepositoryProfileLoaderTest {
         }
     }
 
+    /**
+     * Goal 01A (C): the {@code .file} indirection keys are accepted AND survive loading as file
+     * references.
+     *
+     * <p>Fails against the pre-Goal-01A model, which accepted the key and then kept only the
+     * environment-variable fields: the loaded profile reported no reference for the file at all.
+     */
     public void environmentIndirectionKeysAreAccepted() throws IOException {
         Path dir = TestSupport.newTempDir("cminsight-profiles-indirection-");
         try {
-            TestSupport.writeFile(dir.resolve("crm.properties"), VALID_PROFILE
-                    + "repository.cm.password.file=cm-password.txt\n"
-                    + "repository.jdbc.password.file=jdbc-password.txt\n");
+            TestSupport.writeFile(dir.resolve("crm.properties"), """
+                    repository.id=crm
+                    repository.name=CRM Production
+                    repository.ssid=ICMCRM
+                    repository.db.vendor=db2
+                    repository.jdbc.url=jdbc:db2://db.example:50000/CRM
+                    repository.cm.user.env=CM_CRM_USER
+                    repository.cm.password.file=cm-password.txt
+                    repository.jdbc.user.env=CM_CRM_JDBC_USER
+                    repository.jdbc.password.file=jdbc-password.txt
+                    """);
             RepositoryProfileLoader loader = new RepositoryProfileLoader(dir);
             List<RepositoryProfile> profiles = loader.loadAll();
             Assert.assertEquals(1, profiles.size(), "keys ending in .env or .file are not secrets");
+
+            RepositoryProfile profile = profiles.get(0);
+            Assert.assertEquals(SecretRef.Source.FILE, profile.cmPasswordRef().source(),
+                    "the .file key survives loading as a FILE reference");
+            Assert.assertEquals("cm-password.txt", profile.cmPasswordRef().locator(),
+                    "the file name survives loading for the future adapter");
+            Assert.assertEquals(SecretRef.Source.FILE, profile.jdbcPasswordRef().source(),
+                    "every credential key keeps its .file reference");
+            Assert.assertEquals(SecretRef.Source.ENVIRONMENT, profile.cmUserRef().source(),
+                    "the .env keys still win where they are the only source");
+            Assert.assertEquals(2, profile.credentialEnvNames().size(),
+                    "only the .env references are reported as environment variable names");
         } finally {
             TestSupport.deleteRecursively(dir);
         }
@@ -327,32 +372,43 @@ public class RepositoryProfileLoaderTest {
     public void profileValidationRejectsIncompleteOrUnsafeValues() {
         Assert.assertThrows(ConfigException.class,
                 () -> new RepositoryProfile(null, "name", "ssid", DatabaseVendor.DB2, "jdbc:db2://h/1", null,
-                        "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null),
+                        CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
                 "a missing repository id is rejected");
         Assert.assertThrows(ConfigException.class,
                 () -> new RepositoryProfile("bad id", "name", "ssid", DatabaseVendor.DB2, "jdbc:db2://h/1", null,
-                        "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null),
+                        CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
                 "an invalid id is rejected");
         Assert.assertThrows(ConfigException.class,
                 () -> new RepositoryProfile("crm", null, "ssid", DatabaseVendor.DB2, "jdbc:db2://h/1", null,
-                        "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null),
+                        CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
                 "a missing name is rejected");
         Assert.assertThrows(ConfigException.class,
                 () -> new RepositoryProfile("crm", "name", null, DatabaseVendor.DB2, "jdbc:db2://h/1", null,
-                        "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null),
+                        CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
                 "a missing ssid is rejected");
         Assert.assertThrows(ConfigException.class,
                 () -> new RepositoryProfile("crm", "name", "ssid", null, "jdbc:db2://h/1", null,
-                        "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null),
+                        CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
                 "a missing vendor is rejected");
         Assert.assertThrows(ConfigException.class,
                 () -> new RepositoryProfile("crm", "name", "ssid", DatabaseVendor.DB2, null, null,
-                        "CM_USER", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null),
+                        CM_USER, CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
                 "a missing JDBC URL is rejected");
         Assert.assertThrows(ConfigException.class,
                 () -> new RepositoryProfile("crm", "name", "ssid", DatabaseVendor.DB2, "jdbc:db2://h/1", null,
-                        "not a name", "CM_PASSWORD", "JDBC_USER", "JDBC_PASSWORD", null, null),
+                        envRef(RepositoryProfile.CM_USER_KEY, "not a name"), CM_PASSWORD, JDBC_USER, JDBC_PASSWORD,
+                        null, null),
                 "an invalid environment variable name is rejected");
+        Assert.assertThrows(ConfigException.class,
+                () -> new RepositoryProfile("crm", "name", "ssid", DatabaseVendor.DB2, "jdbc:db2://h/1", null,
+                        RepositoryProfile.credentialFromSecretFile(RepositoryProfile.CM_USER_KEY, "../escape.txt"),
+                        CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
+                "a traversing secret file reference is rejected while the profile is built");
+        Assert.assertThrows(ConfigException.class,
+                () -> new RepositoryProfile("crm", "name", "ssid", DatabaseVendor.DB2, "jdbc:db2://h/1", null,
+                        RepositoryProfile.credentialFromSecretFile(RepositoryProfile.CM_USER_KEY, "/etc/passwd"),
+                        CM_PASSWORD, JDBC_USER, JDBC_PASSWORD, null, null),
+                "an absolute secret file reference is rejected while the profile is built");
 
         RepositoryProfile minimal = new RepositoryProfile("crm", "name", "ssid", DatabaseVendor.ORACLE,
                 "jdbc:oracle:thin:@h:1521/X", null, null, null, null, null, null, null);

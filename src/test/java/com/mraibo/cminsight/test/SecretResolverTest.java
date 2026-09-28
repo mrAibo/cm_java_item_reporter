@@ -7,6 +7,7 @@ import com.mraibo.cminsight.config.SecretResolver;
 import com.mraibo.cminsight.config.WebAuthSettings;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -165,6 +166,65 @@ public class SecretResolverTest {
             TestSupport.deleteRecursively(dir);
         }
     }
+
+    /**
+     * Goal 01A (C): the containment of a secret file is REAL, not lexical - a link, junction or any
+     * other reparse point placed inside the secrets directory must not extend it.
+     *
+     * <p>Fails against a resolver that trusts the lexical check alone: the name looks inside the
+     * directory, but the file it names really lives outside it, and its value must therefore not be
+     * returned. A symbolic link is used where the platform allows it (Linux, macOS, Windows with
+     * Developer Mode); where that needs privileges the test falls back to a Windows directory junction,
+     * which does not. If neither can be created, the platform-independent lexical half is asserted at the
+     * resolver itself instead of letting the test pass silently.
+     */
+    public void aLinkInsideTheSecretsDirectoryCannotEscapeIt() throws IOException {
+        Path dir = TestSupport.newTempDir("cminsight-secrets-link-");
+        try {
+            Path secrets = Files.createDirectories(dir.resolve("secrets"));
+            Path outside = Files.createDirectories(dir.resolve("outside"));
+            TestSupport.writeFile(outside.resolve("real.txt"), "Outside-Secret-8823\n");
+
+            String name = null;
+            if (TestSupport.createSymbolicLink(secrets.resolve("linked.txt"), outside.resolve("real.txt"))) {
+                name = "linked.txt";
+            } else if (TestSupport.createWindowsJunction(secrets.resolve("linked-dir"), outside)) {
+                name = "linked-dir/real.txt";
+            }
+
+            SecretResolver resolver = new SecretResolver(Map.of(), secrets);
+            if (name != null) {
+                SecretRef linked = resolver.classify(null, name, null, "web.auth.password");
+                Assert.assertFalse(linked.resolved(),
+                        "a secret file reached through a link outside the secrets directory must not resolve");
+                Assert.assertNull(resolver.resolve(linked), "the outside file is never read");
+                Assert.assertTrue(
+                        resolver.warnings().stream().anyMatch(w -> w.contains("outside the secrets directory")),
+                        "the refusal names the containment rule: " + resolver.warnings());
+                Assert.assertFalse(linked.describe().contains("Outside-Secret-8823"),
+                        "the refusal never describes a value: " + linked.describe());
+            } else {
+                // No link could be created in this environment: assert the lexical half where it is
+                // enforced - inside the resolver, not only in the profile loader.
+                SecretRef traversal = resolver.classify(null, "../outside/real.txt", null, "web.auth.password");
+                Assert.assertFalse(traversal.resolved(),
+                        "without link support the lexical traversal check is still enforced by the resolver");
+                Assert.assertNull(resolver.resolve(traversal), "the outside file is never read");
+                Assert.assertTrue(resolver.warnings().stream().anyMatch(w -> w.contains("Refusing secret file")),
+                        "the refusal is reported: " + resolver.warnings());
+            }
+
+            // Positive control: the same kind of content placed INSIDE the directory keeps resolving.
+            TestSupport.writeFile(secrets.resolve("inside.txt"), "Inside-Secret-4419\n");
+            SecretResolver control = new SecretResolver(Map.of(), secrets);
+            SecretRef allowed = control.classify(null, "inside.txt", null, "web.auth.password");
+            Assert.assertTrue(allowed.resolved(), "a regular file inside the secrets directory still resolves");
+            Assert.assertEquals("Inside-Secret-4419", control.resolve(allowed), "and its value is available");
+        } finally {
+            TestSupport.deleteRecursively(dir);
+        }
+    }
+
 
     public void missingSecretsDirectoryProducesNoValue() {
         SecretResolver resolver = new SecretResolver(Map.of(), null);

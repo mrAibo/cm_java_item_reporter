@@ -15,7 +15,8 @@
 #
 # With web.bind on loopback and no password configured, the application starts
 # with the built-in admin/admin fallback and prints a warning. On a non-loopback
-# bind it refuses to start (fail closed) until a password is configured.
+# bind it refuses to start (fail closed) until a real password is configured AND
+# web.allowInsecureHttp=true has been set deliberately.
 
 app.name=CM Insight
 
@@ -26,6 +27,19 @@ app.mode=bootstrap-read-only
 web.bind=127.0.0.1
 web.port=8080
 web.threads=8
+
+# --- Remote exposure ----------------------------------------------------------
+# Do NOT enable this just to reach the console from another machine. HTTP Basic
+# sends reusable credentials in cleartext, so a non-loopback bind over plain HTTP
+# is refused by default; web.allowInsecureHttp=true is an explicitly accepted
+# insecure test/development exposure that prints a SECURITY WARNING at startup.
+# For production remote access, keep web.bind=127.0.0.1 and terminate HTTPS in a
+# reverse proxy or an equivalent secure tunnel in front of the application (this
+# build has no TLS listener). Development credentials stay refused beyond loopback
+# either way: admin/admin, a password set to admin, and a blank web.auth.password
+# or web.auth.user (a blank value is treated as unset and silently falls back to
+# the published development default). Default shown; safe to delete.
+# web.allowInsecureHttp=false
 
 # Optional hardening for the built-in basic-auth throttle (defaults shown).
 # web.backlog is the listen backlog, 0..4096 (0 = JDK default).
@@ -39,7 +53,12 @@ web.auth.maxTrackedKeys=4096
 # With NONE of the web.auth.user*/web.auth.password* keys present, the application
 # starts with the built-in admin/admin development credentials on a loopback bind
 # and prints a warning; on a non-loopback bind it refuses to start until a real
-# password is configured.
+# password is configured (and web.allowInsecureHttp=true is set deliberately).
+#
+# A BLANK value is not a configured value: web.auth.password= (or a blank
+# web.auth.user=) is treated as unset and silently falls back to the published
+# development default. That credential is refused on a non-loopback bind even
+# with web.allowInsecureHttp=true, so fill in both fields for a remote bind.
 #
 # If you DO configure a source, that source must resolve. The application fails
 # closed rather than silently falling back to admin/admin, so only uncomment the

@@ -31,8 +31,15 @@ jobs:
 
       - name: Shell syntax check
         run: |
+          # Invoked scripts (their executability is checked in the step above).
           for f in build.sh tests/selftest.sh bin/compile.sh bin/cm-insight bin/start.sh \
                    bin/stop.sh bin/restart.sh bin/status.sh bin/doctor.sh bin/clean.sh; do
+            bash -n "$f" || { echo "ERROR: $f has a syntax error"; exit 1; }
+          done
+          # Sourced modules: never executed directly, so no permission check applies, but
+          # their syntax must be verified like everything else (review finding F7).
+          for f in bin/lib/cm-insight-addr.sh bin/lib/cm-insight-lifecycle.sh; do
+            test -f "$f" || { echo "ERROR: $f is missing"; exit 1; }
             bash -n "$f" || { echo "ERROR: $f has a syntax error"; exit 1; }
           done
           echo "OK: script syntax is valid"
@@ -50,6 +57,74 @@ jobs:
           ./bin/doctor.sh --help >/dev/null
           ./bin/clean.sh --help >/dev/null
           echo "OK: every script supports --help"
+
+      # Bounded, offline guards for the Goal 01A safety rules (review finding F6). No
+      # network, no new dependency, no extra port: the runtime lifecycle is exercised by
+      # the Start/Status/Stop steps below. These checks fail the build if a future change
+      # weakens the exact-marker rule, the structural identity rule, the wildcard/specific
+      # address classification or the non-loopback plain-HTTP refusal.
+      - name: Safety guards (marker, identity, bind classification, insecure opt-in)
+        run: |
+          set -u
+          . bin/lib/cm-insight-addr.sh
+          . bin/lib/cm-insight-lifecycle.sh
+          fail() { echo "ERROR: $1"; exit 1; }
+
+          # H-1: ONLY the exact health body is CM Insight; anything merely containing the
+          # fields must be rejected (this is what authorises a signal).
+          ci_health_body_is_marker '{"status":"UP","service":"cm-insight"}' \
+            || fail "the exact CM Insight marker was not accepted"
+          for body in \
+            '{"status":"UP","service":"cm-insight","note":"this is not cm insight"}' \
+            '{"service":"cm-insight","status":"UP"}' \
+            '{"status":"UP","service":"cm-insight-alike"}' \
+            '{"status":"UP","service":"tomcat"}' \
+            '{"status":"DOWN","service":"cm-insight"}' ; do
+            if ci_health_body_is_marker "${body}"; then fail "a lookalike body was accepted: ${body}"; fi
+          done
+          echo "OK: exact health marker only"
+
+          # H-2: identity is structural over argv tokens; an option value is never it.
+          if printf '%s\n' 'java' '-Dreview.archive.name=cm-insight.jar' '-cp' '/tmp/unrelated.jar' 'com.example.Main' | ci_argv_is_cm_insight; then
+            fail "an unrelated JVM with the marker text in an option value was treated as CM Insight"
+          fi
+          printf '%s\n' 'java' '-cp' '/srv/cminsight/build/cm-insight.jar' 'com.mraibo.cminsight.app.Main' | ci_argv_is_cm_insight \
+            || fail "a real CM Insight command line was not recognised"
+          echo "OK: structural command-line identity"
+
+          # G-1: a specific-address socket is never the listener of a wildcard bind, and
+          # the other address family is reported but never an ownership basis.
+          [ "$(ci_addr_socket_class 127.0.0.1 0.0.0.0)" = "foreign" ] || fail "a 127.0.0.1 socket was accepted for a wildcard bind"
+          [ "$(ci_addr_socket_class '::' 0.0.0.0)" = "sibling" ] || fail "the other address family is not classified as sibling"
+          [ "$(ci_addr_socket_class 0.0.0.0 127.0.0.1)" = "covered" ] || fail "a wildcard socket no longer covers a specific bind"
+          ci_addr_is_loopback 127.0.0.5 || fail "127.0.0.5 is not recognised as loopback"
+          if ci_addr_is_loopback 0.0.0.0; then fail "0.0.0.0 was classified as loopback"; fi
+          echo "OK: bind classification"
+
+          # F: non-loopback plain HTTP is refused unless the operator sets the explicit insecure
+          # opt-in. A REAL user is configured on purpose so this isolates the plain-HTTP rule
+          # instead of tripping the separate development-default rule (F-1).
+          # TWO contracts are asserted separately, because they differ by design: the validator
+          # exits 1 ("refused"), while the runtime exits 3 (configuration error, before anything
+          # binds). Asserting 3 against --validate-config was wrong and would have failed here.
+          guard_cfg="$(mktemp)"
+          trap 'rm -f "${guard_cfg}"' EXIT
+          { echo 'web.bind=0.0.0.0'; echo 'web.port=0'; echo 'web.auth.user=ci-operator'
+            echo 'web.auth.password.env=CM_INSIGHT_CI_PASSWORD'; } > "${guard_cfg}"
+          CM_INSIGHT_CI_PASSWORD=ci-test-value
+          export CM_INSIGHT_CI_PASSWORD
+          set +e
+          guard_out="$(./bin/cm-insight --validate-config --config "${guard_cfg}" 2>&1)"
+          guard_rc=$?
+          set -e
+          [ "${guard_rc}" -eq 1 ] || fail "the validator did not refuse a non-loopback plain-HTTP config (exit ${guard_rc}, expected 1)"
+          printf '%s' "${guard_out}" | grep -q 'plain HTTP' || fail "the validator's refusal did not name the plain-HTTP rule"
+          set +e
+          ./bin/cm-insight --config "${guard_cfg}" > /dev/null 2>&1
+          guard_run=$?
+          set -e
+          [ "${guard_run}" -eq 3 ] || fail "the runtime did not refuse a non-loopback plain-HTTP config (exit ${guard_run}, expected 3)"
+          echo "OK: non-loopback plain HTTP refused without web.allowInsecureHttp (validator 1, runtime 3)"
 
       - name: Prepare local configuration
         run: |

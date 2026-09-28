@@ -13,7 +13,10 @@ public enum RepositoryState {
     SWITCHING("switching"),
     /** The manager itself is shutting down. */
     CLOSING("closing"),
-    /** The last activation attempt failed. No context is published. */
+    /**
+     * The last activation attempt failed, or a switch was refused because the previous context could not
+     * be closed with certainty. No context is published.
+     */
     FAILED("failed"),
     /** The manager is closed and can no longer be used. */
     CLOSED("closed");

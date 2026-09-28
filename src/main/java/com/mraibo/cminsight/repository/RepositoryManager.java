@@ -22,13 +22,22 @@ import java.util.concurrent.locks.ReentrantLock;
  *   <li>the previous context is closed <em>first</em>, which is what ARCHITECTURE.md rule 10 requires
  *       and what keeps the number of live connections at the configured bound instead of momentarily
  *       doubling it;</li>
+ *   <li>if that close was uncertain - a resource refused to close, or {@code close()} threw - the switch
+ *       FAILS CLOSED: no factory call, no new context, nothing published. Opening new connections on top
+ *       of resources that may still be open is exactly how the physical bound is exceeded. A quarantined
+ *       pool resource reaches this rule the same way: the adapter that attaches the pool must report the
+ *       uncertainty through {@link RepositoryContext} (a close failure, or a throw), because a pool's own
+ *       {@code close()} may swallow the failures it quarantines;</li>
  *   <li>a new context is created and published only after it is fully initialized and validated;</li>
  *   <li>if initialization fails, nothing is published: the manager reports {@link RepositoryState#FAILED}
  *       and the failure, and never keeps a half-initialized context.</li>
  * </ol>
  *
- * <p>Consequence of (2) and (4): a failed switch does not resurrect the previous repository. That is
- * the fail-closed behaviour the architecture asks for, and the diagnostics record why.
+ * <p>Consequence of (2), (3) and (5): a failed switch does not resurrect the previous repository. That
+ * is the fail-closed behaviour the architecture asks for, and the diagnostics record why.
+ *
+ * <p>{@link #close()} is deliberately exempt from (3): shutdown must remain best-effort and release
+ * every resource it can, so an uncertain close is recorded and not escalated.
  */
 public final class RepositoryManager implements AutoCloseable {
 
@@ -145,7 +154,15 @@ public final class RepositoryManager implements AutoCloseable {
     /**
      * Activates exactly one repository, closing whatever was active before.
      *
-     * @throws RepositoryException when the manager is closed or activation fails
+     * <p>Fails closed after an uncertain close of the previous context: when a resource refused to
+     * close (or {@code close()} threw), the manager publishes {@link RepositoryState#FAILED} with a
+     * diagnostic naming the failures and throws - <em>without</em> calling
+     * {@link RepositoryContextFactory#create(RepositoryProfile)}. Swallowing a cleanup failure to
+     * continue would open new CM/JDBC connections while the old ones may still be alive, which is the
+     * physical bound the pool work exists to keep.
+     *
+     * @throws RepositoryException when the manager is closed, the previous context could not be closed
+     *         with certainty, or activation fails
      */
     public void switchTo(RepositoryProfile profile) throws RepositoryException {
         Objects.requireNonNull(profile, "profile");
@@ -158,7 +175,11 @@ public final class RepositoryManager implements AutoCloseable {
                 // Publish SWITCHING and clear the context in one store, so no reader can observe
                 // ACTIVE together with nothing published.
                 lifecycle.set(new Lifecycle(RepositoryState.SWITCHING, null));
-                closeContext(previous, "switch away from '" + previous.profileUnchecked().id() + "'");
+                String previousId = previous.profileUnchecked().id();
+                CloseOutcome outcome = closeContext(previous, "switch away from '" + previousId + "'");
+                if (outcome.uncertain()) {
+                    throw failClosed(profile, previousId, outcome);
+                }
             }
 
             lifecycle.set(new Lifecycle(RepositoryState.INITIALIZING, null));
@@ -187,6 +208,11 @@ public final class RepositoryManager implements AutoCloseable {
     /**
      * Closes the active context without activating another one.
      *
+     * <p>There is no activation to refuse here, so an uncertain close does not throw: the resources
+     * were asked to close, the diagnostics name what refused, and the state becomes
+     * {@link RepositoryState#FAILED} rather than {@link RepositoryState#NONE} - reporting a clean
+     * "nothing is active" after a resource refused to close would be a lie about the physical state.
+     *
      * @return true when something was actually closed
      */
     public boolean deactivate() {
@@ -197,11 +223,18 @@ public final class RepositoryManager implements AutoCloseable {
                 return false;
             }
             lifecycle.set(new Lifecycle(RepositoryState.SWITCHING, null));
-            closeContext(previous, "explicit deactivate");
+            String previousId = previous.profileUnchecked().id();
+            CloseOutcome outcome = closeContext(previous, "explicit deactivate");
             if (lifecycle.get().state() != RepositoryState.CLOSED) {
-                lifecycle.set(new Lifecycle(RepositoryState.NONE, null));
+                if (outcome.uncertain()) {
+                    lastFailure = uncertainDetail(previousId, "Deactivating the active repository", outcome);
+                    lifecycle.set(new Lifecycle(RepositoryState.FAILED, null));
+                    record(lastFailure);
+                } else {
+                    lifecycle.set(new Lifecycle(RepositoryState.NONE, null));
+                }
             }
-            record("Deactivated repository '" + previous.profileUnchecked().id() + "'.");
+            record("Deactivated repository '" + previousId + "'.");
             return true;
         } finally {
             switchLock.unlock();
@@ -246,6 +279,50 @@ public final class RepositoryManager implements AutoCloseable {
         }
     }
 
+    /**
+     * What one close attempt actually achieved, in the terms the fail-closed rule needs.
+     *
+     * @param uncertain    true when the outcome is not certain: the context reported at least one
+     *                     resource failure, or {@code close()} itself threw
+     * @param failures     the resource failures the context recorded, in its own order
+     * @param thrownDetail description of the throwable {@code close()} raised, or {@code null}
+     */
+    private record CloseOutcome(boolean uncertain, List<String> failures, String thrownDetail) {
+    }
+
+    /**
+     * Reports the refused switch and returns the exception to throw.
+     *
+     * <p>Order matters: the diagnostic and {@code lastFailure} are published before the caller sees the
+     * exception, so a console that logs the failure already has the reason.
+     */
+    private RepositoryException failClosed(RepositoryProfile requested, String previousId, CloseOutcome outcome) {
+        String detail = uncertainDetail(previousId, "Switch to '" + requested.id() + "' refused", outcome);
+        lastFailure = detail;
+        lifecycle.set(new Lifecycle(RepositoryState.FAILED, null));
+        record(detail);
+        return new RepositoryException(detail);
+    }
+
+    /**
+     * One message for every uncertain close, so the switch, the deactivate path and the diagnostics
+     * cannot drift apart. Names the failures, which is what an operator needs to find the leak.
+     */
+    private static String uncertainDetail(String previousId, String action, CloseOutcome outcome) {
+        StringBuilder detail = new StringBuilder(action)
+                .append(": closing the previous repository '").append(previousId)
+                .append("' left resources in an uncertain state");
+        if (!outcome.failures().isEmpty()) {
+            detail.append(" (").append(outcome.failures().size()).append(" resource close failure(s): ")
+                    .append(String.join("; ", outcome.failures())).append(')');
+        }
+        if (outcome.thrownDetail() != null) {
+            detail.append(" [close() also threw: ").append(outcome.thrownDetail()).append(']');
+        }
+        return detail.append(". No new repository context was created; connections that refused to close"
+                + " may still be open.").toString();
+    }
+
     private static void validate(RepositoryContext created, RepositoryProfile requested) {
         if (created == null) {
             throw new IllegalStateException("RepositoryContextFactory returned no context");
@@ -260,19 +337,29 @@ public final class RepositoryManager implements AutoCloseable {
         }
     }
 
-    private void closeContext(RepositoryContext context, String reason) {
+    /**
+     * Closes a context and reports what the close achieved.
+     *
+     * <p>The throwable is caught rather than propagated: cleanup must never escape a switch, not even as
+     * an Error. It is not swallowed either - it makes the outcome uncertain, which the switch treats as
+     * a refusal to activate another repository.
+     */
+    private CloseOutcome closeContext(RepositoryContext context, String reason) {
+        String thrownDetail = null;
         try {
             context.close();
         } catch (Throwable e) {
-            // Cleanup must never escape a switch, not even as an Error: the lifecycle is already
-            // fail-closed, and the failure belongs in diagnostics rather than in the caller's face.
-            record("Error closing repository context during " + reason + ": " + describe(e));
+            thrownDetail = describe(e);
+            record("Error closing repository context during " + reason + ": " + thrownDetail);
         }
         List<String> failures = context.closeFailures();
         if (!failures.isEmpty()) {
             record("Closing repository '" + context.profileUnchecked().id() + "' during " + reason
                     + " reported " + failures.size() + " resource failure(s): " + String.join("; ", failures));
         }
+        boolean uncertain = thrownDetail != null || context.closedWithUncertainResources()
+                || !failures.isEmpty();
+        return new CloseOutcome(uncertain, failures, thrownDetail);
     }
 
     private static String describe(Throwable throwable) {

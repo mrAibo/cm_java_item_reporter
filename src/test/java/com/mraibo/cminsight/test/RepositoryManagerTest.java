@@ -284,25 +284,104 @@ public class RepositoryManagerTest {
         Assert.assertEquals(1, context.closeFailures().size(), "the failure list is unchanged");
     }
 
-    public void diagnosticsRecordResourceCloseFailuresOnASwitch() throws Exception {
+    /**
+     * Goal 01A (B): an uncertain close of the previous context must fail the switch CLOSED - no new
+     * context, nothing published, state FAILED, and a diagnostic that names the failures.
+     *
+     * <p>This test replaces the Goal 01 test {@code diagnosticsRecordResourceCloseFailuresOnASwitch},
+     * which asserted the OLD semantics: the manager recorded the close failure and activated the new
+     * repository anyway. Opening new connections while the previous ones may still hold a physical CM
+     * session is exactly how the configured physical bound is exceeded, so section B turns that into a
+     * refusal.
+     *
+     * <p>Fails against the pre-Goal-01A {@link RepositoryManager}, which published 'beta' as ACTIVE
+     * after the failed close.
+     */
+    public void anUncertainCloseOfThePreviousContextFailsTheSwitchClosed() throws Exception {
         List<String> events = Collections.synchronizedList(new ArrayList<>());
+        List<String> created = Collections.synchronizedList(new ArrayList<>());
         AutoCloseable failing = () -> {
             events.add("close-requested");
             throw new IOException("closing failed for a resource");
         };
-        RepositoryManager manager = new RepositoryManager(profile ->
-                new RepositoryContext(profile, List.of(failing)));
+        RepositoryManager manager = new RepositoryManager(profile -> {
+            created.add(profile.id());
+            return new RepositoryContext(profile, List.of(failing));
+        });
 
         manager.switchTo(profile("crm"));
         Assert.assertEquals("crm", manager.activeRepositoryId(), "the first repository is active");
-        manager.switchTo(profile("beta"));
-        Assert.assertEquals("beta", manager.activeRepositoryId(), "the second repository is active");
-        Assert.assertTrue(events.contains("close-requested"), "the previous context was closed");
+        Assert.assertEquals(List.of("crm"), List.copyOf(created), "only the first context was created");
+
+        RepositoryException failure = Assert.assertThrows(RepositoryException.class,
+                () -> manager.switchTo(profile("beta")),
+                "an uncertain close of the previous context must refuse the switch");
+        Assert.assertTrue(events.contains("close-requested"), "the previous context was still closed first");
+        Assert.assertEquals(List.of("crm"), List.copyOf(created),
+                "the factory was never called for the refused switch");
+        Assert.assertEquals(RepositoryState.FAILED, manager.state(), "the manager reports FAILED");
+        Assert.assertTrue(manager.activeContext().isEmpty(), "nothing is published");
+        Assert.assertTrue(manager.activeRepositoryId() == null, "no repository id is published");
+        Assert.assertFalse(manager.status().usable(), "there is no usable context after the refused switch");
+        Assert.assertTrue(failure.getMessage().contains("closing the previous repository 'crm'"),
+                "the failure names the previous repository: " + failure.getMessage());
+        Assert.assertTrue(failure.getMessage().contains("closing failed for a resource"),
+                "the failure names the resource failure: " + failure.getMessage());
         Assert.assertTrue(manager.diagnostics().stream()
                         .anyMatch(d -> d.contains("closing failed for a resource")),
                 "the close failure is recorded: " + manager.diagnostics());
         Assert.assertTrue(manager.diagnostics().stream().anyMatch(d -> d.contains("resource failure")),
                 "the number of failures is summarised: " + manager.diagnostics());
+        Assert.assertTrue(manager.lastFailure().orElseThrow().contains("uncertain"),
+                "lastFailure explains the refusal: " + manager.lastFailure());
+
+        manager.close();
+        Assert.assertEquals(RepositoryState.CLOSED, manager.state(),
+                "shutdown still works after a refused switch");
+    }
+
+    /**
+     * Goal 01A (B): {@code close()} stays best-effort - an uncertain shutdown close is recorded but
+     * must not abort the shutdown or leave the manager in a non-CLOSED state.
+     */
+    public void closeStaysBestEffortWhenAContextCloseThrows() throws Exception {
+        AutoCloseable fatal = () -> {
+            throw new ResourceCloseError("fatal resource close");
+        };
+        RepositoryManager manager = new RepositoryManager(profile ->
+                new RepositoryContext(profile, List.of(fatal)));
+        manager.switchTo(profile("crm"));
+
+        manager.close();
+        Assert.assertEquals(RepositoryState.CLOSED, manager.state(), "close() still ends CLOSED");
+        Assert.assertTrue(manager.activeContext().isEmpty(), "nothing stays published");
+        Assert.assertTrue(manager.diagnostics().stream()
+                        .anyMatch(d -> d.contains("Error closing repository context during shutdown")),
+                "the uncertain shutdown close is recorded: " + manager.diagnostics());
+
+        manager.close();
+        Assert.assertEquals(RepositoryState.CLOSED, manager.state(), "close() stays idempotent");
+    }
+
+    /**
+     * Goal 01A (B): {@code deactivate()} must not claim "nothing is active" after an uncertain close.
+     */
+    public void deactivateAfterAnUncertainCloseReportsFailedInsteadOfNone() throws Exception {
+        AutoCloseable failing = () -> {
+            throw new IOException("closing failed for a resource");
+        };
+        RepositoryManager manager = new RepositoryManager(profile ->
+                new RepositoryContext(profile, List.of(failing)));
+        manager.switchTo(profile("crm"));
+
+        Assert.assertTrue(manager.deactivate(), "deactivate reports that it closed the context");
+        Assert.assertEquals(RepositoryState.FAILED, manager.state(),
+                "a resource that refused to close means the manager must not report NONE");
+        Assert.assertTrue(manager.activeContext().isEmpty(), "nothing is published");
+        Assert.assertTrue(manager.lastFailure().orElseThrow().contains("uncertain"),
+                "lastFailure explains the uncertain close: " + manager.lastFailure());
+        Assert.assertTrue(manager.diagnostics().stream().anyMatch(d -> d.contains("resource failure")),
+                "the diagnostic names the failure count: " + manager.diagnostics());
         manager.close();
     }
 

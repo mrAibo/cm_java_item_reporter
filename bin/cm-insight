@@ -8,6 +8,14 @@
 # adding any local jars from lib/{ibm,db2,oracle,app} to the class path. No
 # network access. Exits with the application's own exit code.
 #
+# Application home: every RELATIVE operational path in the configuration
+# (profiles.dir, classifications.file, secrets.dir, data.dir, reports.dir,
+# logs.dir) is resolved against the application home - never against the
+# directory this launcher happened to be invoked from. The home is this
+# installation's root unless CM_INSIGHT_HOME names another one, and it is passed
+# to the JVM both as -Dcminsight.home (the resolver's primary source) and as the
+# environment variable CM_INSIGHT_HOME (its secondary source).
+#
 # Message prefixes: "OK:" informational, "WARN:" non-fatal, "ERROR:" fatal.
 # Exit codes: 2 usage/environment problem, otherwise the application's code.
 
@@ -22,12 +30,23 @@ Launches CM Insight (build/cm-insight.jar) after checking the environment.
 Environment:
   JAVA_HOME                  JDK 17+ home (accepted as /c/tools/jdk17, C:/tools/jdk17
                              or C:\tools\jdk17); falls back to PATH
-  CM_INSIGHT_CONFIG          configuration file (default conf/application.properties)
+  CM_INSIGHT_CONFIG          configuration file (default conf/application.properties).
+                             A relative value is resolved against the application home,
+                             so systemd units (WorkingDirectory=/) and interactive shells
+                             behave identically
+  CM_INSIGHT_HOME            application home used for every relative operational path
+                             (profiles.dir, classifications.file, secrets.dir, ...).
+                             Default: this installation's root, i.e. the directory that
+                             contains bin/ and conf/. It is passed to the JVM as
+                             -Dcminsight.home and exported as CM_INSIGHT_HOME
   CM_INSIGHT_JAVA_OPTS       extra JVM options, word-split on spaces
-                             (e.g. "-Xmx512m -Dfile.encoding=UTF-8")
+                             (e.g. "-Xmx512m -Dfile.encoding=UTF-8"); a
+                             -Dcminsight.home here is overridden by the launcher
 
 Common application arguments:
   --config <file>            configuration file
+  --validate-config          check credentials and the exposure policy, print the
+                             resolved operational paths, then exit
   --version                  print the version and exit
   --self-test                run the in-process self-test and exit
 
@@ -98,7 +117,29 @@ for module in ibm db2 oracle app; do
   done
 done
 
-CONFIG="${CM_INSIGHT_CONFIG:-${ROOT}/conf/application.properties}"
+# ---------------------------------------------------------------------------
+# Application home (Goal 01A section D).
+#
+# The home is this installation's root unless the operator names another one.
+# It is exported as CM_INSIGHT_HOME and passed to the JVM as -Dcminsight.home,
+# which is what makes a relative profiles.dir/classifications.file/secrets.dir
+# resolve to the same place no matter where this launcher was started from.
+# A relative CM_INSIGHT_HOME is deliberately left relative: it then resolves
+# against the working directory in exactly the same way in the shell below and
+# in AppPaths.
+# ---------------------------------------------------------------------------
+APP_HOME="${CM_INSIGHT_HOME:-${ROOT}}"
+export CM_INSIGHT_HOME="${APP_HOME}"
+
+CONFIG="${CM_INSIGHT_CONFIG:-${APP_HOME}/conf/application.properties}"
+# Same one rule for the shell's own file check: a relative CM_INSIGHT_CONFIG is
+# resolved against the application home. Without this, a systemd unit with
+# CM_INSIGHT_CONFIG=conf/application.properties would fail here even though the
+# JVM below would have resolved it correctly.
+case "${CONFIG}" in
+  /*|[A-Za-z]:[\\/]*) : ;;
+  *) CONFIG="${APP_HOME}/${CONFIG}" ;;
+esac
 if [ ! -f "${CONFIG}" ]; then
   printf 'ERROR: configuration file not found: %s\n       Create it with: cp conf/application.properties.example conf/application.properties\n' "${CONFIG}" >&2
   exit 2
@@ -111,4 +152,8 @@ if [ -n "${CM_INSIGHT_JAVA_OPTS:-}" ]; then
   JAVA_OPTS=(${CM_INSIGHT_JAVA_OPTS})
 fi
 
-exec "${JAVA}" ${JAVA_OPTS[@]+"${JAVA_OPTS[@]}"} -cp "${CP}" com.mraibo.cminsight.app.Main --config "${CONFIG}" "$@"
+# -Dcminsight.home comes after CM_INSIGHT_JAVA_OPTS on purpose: the launcher, not a
+# stray option in the environment, decides where the application home is.
+exec "${JAVA}" ${JAVA_OPTS[@]+"${JAVA_OPTS[@]}"} \
+  -Dcminsight.home="${APP_HOME}" \
+  -cp "${CP}" com.mraibo.cminsight.app.Main --config "${CONFIG}" "$@"

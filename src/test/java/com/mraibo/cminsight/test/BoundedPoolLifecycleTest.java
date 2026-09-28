@@ -36,7 +36,7 @@ public class BoundedPoolLifecycleTest {
 
         pool.close();
         Assert.assertEquals(0, factory.liveCount(), "close released every idle resource");
-        Assert.assertEquals(3L, pool.metrics().closed(), "every resource was closed exactly once");
+        Assert.assertEquals(3L, pool.metrics().closeSuccesses(), "every resource was closed exactly once");
     }
 
     public void initializeFailureClosesWhatItCreatedAndLeavesThePoolRetryable() throws Exception {
@@ -107,12 +107,12 @@ public class BoundedPoolLifecycleTest {
         outstanding.close();
         Assert.assertTrue(leasedResource.isClosed(), "returning the lease closes the resource");
         Assert.assertTrue(pool.awaitQuiescence(GENEROUS), "the pool becomes quiescent once the lease is back");
-        Assert.assertEquals(2L, pool.metrics().closed(), "both resources were closed exactly once");
+        Assert.assertEquals(2L, pool.metrics().closeSuccesses(), "both resources were closed exactly once");
         Assert.assertEquals(1, leasedResource.closeCalls(), "the returned lease closes its resource once");
         Assert.assertEquals(1, idleResource.closeCalls(), "close() closes an idle resource once");
 
         pool.close();
-        Assert.assertEquals(2L, pool.metrics().closed(), "close() is idempotent");
+        Assert.assertEquals(2L, pool.metrics().closeSuccesses(), "close() is idempotent");
         Assert.assertEquals(1, leasedResource.closeCalls(), "an idempotent close re-closes nothing");
         Assert.assertEquals(1, idleResource.closeCalls(), "an idempotent close re-closes nothing");
         Assert.assertTrue(pool.isClosed(), "the pool stays closed");
@@ -140,7 +140,11 @@ public class BoundedPoolLifecycleTest {
 
         Assert.assertEquals(0, pool.metrics().leased(), "the resource was returned to the idle set");
         Assert.assertEquals(1, pool.metrics().available(), "the resource is idle again");
-        Assert.assertEquals(3L, pool.metrics().operations(), "the pool counted the recorded operations");
+        // Goal 01A (A3): the borrow itself is one automatic usage; the three explicit operations are
+        // reported separately and operations() is their sum (3 explicit + 1 automatic = 4).
+        Assert.assertEquals(1L, pool.metrics().automaticUsages(), "the borrow/use/close cycle is one usage");
+        Assert.assertEquals(3L, pool.metrics().explicitOperations(), "the pool counted the explicit operations");
+        Assert.assertEquals(4L, pool.metrics().operations(), "the reported total is the sum of both sources");
         pool.close();
     }
 
@@ -168,9 +172,17 @@ public class BoundedPoolLifecycleTest {
         pool.close();
     }
 
+    /**
+     * Goal 01A (A3) re-derivation: the usage budget counts real usage, and a plain borrow/use/close
+     * cycle is itself one usage.
+     *
+     * <p>Before Goal 01A an explicit {@code recordOperation()} was the only thing that advanced the
+     * budget, so this scenario needed a budget of two. With automatic usage counting the same scenario
+     * needs a budget of three: two automatic usages plus the one explicit operation.
+     */
     public void anOperationBudgetRetiresTheResourceWhenItIsReturned() throws Exception {
         FakePoolFactory factory = new FakePoolFactory();
-        BoundedPool<FakeResource> pool = new BoundedPool<>("ops", 1, Duration.ofSeconds(2), factory, null, 2);
+        BoundedPool<FakeResource> pool = new BoundedPool<>("ops", 1, Duration.ofSeconds(2), factory, null, 3);
 
         Lease<FakeResource> first = pool.borrow();
         FakeResource resource = first.value();
@@ -178,17 +190,20 @@ public class BoundedPoolLifecycleTest {
         Assert.assertEquals(1L, first.operations(), "one operation is recorded on the lease");
         first.close();
         Assert.assertFalse(resource.isClosed(), "a resource below its operation budget stays in service");
+        Assert.assertEquals(2L, pool.metrics().operations(),
+                "one automatic usage plus one explicit operation are below the budget of three");
 
         Lease<FakeResource> second = pool.borrow();
         Assert.assertEquals(resource.id(), second.value().id(), "the same resource is lent again");
-        second.recordOperation();
         second.close();
 
         Assert.assertTrue(resource.isClosed(), "reaching the operation budget retires the resource");
         Assert.assertEquals(1L, pool.metrics().operationRotations(), "the operation rotation is counted");
-        Assert.assertEquals(2L, pool.metrics().operations(), "both operations are counted");
+        Assert.assertEquals(2L, pool.metrics().automaticUsages(), "both cycles are counted automatically");
+        Assert.assertEquals(1L, pool.metrics().explicitOperations(), "the explicit operation is counted separately");
+        Assert.assertEquals(3L, pool.metrics().operations(), "the reported total is the sum of both sources");
         Assert.assertEquals(0, pool.metrics().available(), "the retired resource left the idle set");
-        Assert.assertEquals(1L, pool.metrics().closed(), "the retired resource was closed once");
+        Assert.assertEquals(1L, pool.metrics().closeSuccesses(), "the retired resource was closed once");
         pool.close();
     }
 
@@ -221,7 +236,7 @@ public class BoundedPoolLifecycleTest {
         Assert.assertEquals(0, pool.rotateStale(), "without a budget nothing rotates");
         Assert.assertEquals(2, pool.metrics().available(), "both resources stay idle");
         Assert.assertEquals(2, factory.liveCount(), "both resources stay alive");
-        Assert.assertEquals(0L, pool.metrics().closed(), "nothing was closed");
+        Assert.assertEquals(0L, pool.metrics().closeSuccesses(), "nothing was closed");
         pool.close();
     }
 
@@ -255,7 +270,7 @@ public class BoundedPoolLifecycleTest {
         Assert.assertEquals(1L, pool.metrics().unhealthyRotations(), "the unhealthy rotation is counted");
         Assert.assertEquals(1L, pool.metrics().validationFailures(), "the failed health check is counted");
         Assert.assertEquals(1, pool.metrics().available(), "the healthy resource is still idle");
-        Assert.assertEquals(1L, pool.metrics().closed(), "exactly one resource has been closed");
+        Assert.assertEquals(1L, pool.metrics().closeSuccesses(), "exactly one resource has been closed");
         Assert.assertEquals(1, factory.liveCount(), "only the healthy resource is alive");
 
         long attemptsBefore = pool.metrics().createAttempts();
@@ -279,9 +294,9 @@ public class BoundedPoolLifecycleTest {
         Assert.assertTrue(pool.awaitQuiescence(GENEROUS), "the pool returns to quiescence");
         Assert.assertEquals(2, pool.metrics().available(), "the idle set recovered to the configured size");
         Assert.assertEquals(2, factory.liveCount(), "one live resource per slot");
-        Assert.assertEquals(1L, pool.metrics().closed(), "only the unhealthy resource was ever closed");
+        Assert.assertEquals(1L, pool.metrics().closeSuccesses(), "only the unhealthy resource was ever closed");
         pool.close();
-        Assert.assertEquals(3L, pool.metrics().closed(), "close() retires the two surviving resources");
+        Assert.assertEquals(3L, pool.metrics().closeSuccesses(), "close() retires the two surviving resources");
         Assert.assertEquals(0, factory.liveCount(), "nothing is left alive after close()");
     }
 
@@ -397,21 +412,28 @@ public class BoundedPoolLifecycleTest {
         Assert.assertTrue(pool.awaitQuiescence(GENEROUS), "the pool is quiescent once the closes completed");
         Assert.assertEquals(0, pool.metrics().capacityInUse(), "no capacity is left accounted after close()");
         Assert.assertEquals(0, factory.liveCount(), "every resource was really closed");
-        Assert.assertEquals(pool.metrics().created(), pool.metrics().closed(),
+        Assert.assertEquals(pool.metrics().created(), pool.metrics().closeSuccesses(),
                 "every created resource was closed exactly once");
     }
 
     /**
-     * Regression (t4 F3): an {@link Error} thrown by a resource's {@code close()} must still reach the
-     * caller, but the retiring slot must be released anyway.
+     * Goal 01A (A2): an {@link Error} from a resource's {@code close()} leaves the physical outcome
+     * UNCERTAIN, so the slot must be QUARANTINED - never freed and never refilled.
      *
-     * <p>Fails against the pre-fix code, where {@code finishRetirement()} was skipped when
-     * {@code closeEntry()} threw, leaving {@code retiring()==1} and {@code capacityInUse()==1}, so the
-     * next borrow blocked until the borrow timeout.
+     * <p>This test replaces the Goal 01 test {@code anErrorFromAResourceCloseDoesNotBurnACapacitySlot},
+     * which asserted the OLD, unsafe assumption: every close failure was treated as "the resource is
+     * gone", the slot was released and a replacement was created into it. Goal 01A A2 removes exactly
+     * that assumption, because a close exception proves nothing about the underlying session or
+     * connection - freeing the slot would authorise a replacement while the old resource may still
+     * exist, which is how a hard-bounded pool overshoots.
+     *
+     * <p>Fails against the pre-Goal-01A code, where {@code closeEntry()} swallowed the close failure and
+     * {@code finishRetirement()} always returned the slot: {@code quarantined()} would be 0,
+     * {@code capacityInUse()} would be 0 and the following borrow would create a replacement.
      */
-    public void anErrorFromAResourceCloseDoesNotBurnACapacitySlot() throws Exception {
+    public void anErrorFromAResourceCloseQuarantinesTheSlotInsteadOfRefillingIt() throws Exception {
         FakePoolFactory factory = new FakePoolFactory();
-        BoundedPool<FakeResource> pool = new BoundedPool<>("error-close", 1, Duration.ofMillis(400), factory);
+        BoundedPool<FakeResource> pool = new BoundedPool<>("error-close", 1, Duration.ofMillis(300), factory);
         Lease<FakeResource> lease = pool.borrow();
         FakeResource resource = lease.value();
         resource.setHealthy(false);
@@ -420,18 +442,32 @@ public class BoundedPoolLifecycleTest {
         ResourceCloseError thrown = Assert.assertThrows(ResourceCloseError.class, lease::close,
                 "an Error from the resource close still reaches the caller of lease.close()");
         Assert.assertTrue(thrown.getMessage().contains("resource close failed"), "the same Error is rethrown");
-        Assert.assertEquals(0, pool.metrics().retiring(),
-                "the retiring slot was released even though close() threw an Error");
-        Assert.assertEquals(0, pool.metrics().capacityInUse(), "no capacity stays burned");
-        Assert.assertTrue(resource.isClosed(), "the resource was released before the Error was rethrown");
 
-        Lease<FakeResource> replacement = pool.borrow();
-        Assert.assertNotNull(replacement, "a later borrow succeeds instead of timing out");
-        Assert.assertTrue(replacement.value().id() != resource.id(), "the replacement is a fresh resource");
-        Assert.assertEquals(2, factory.createAttempts(), "the freed slot was refilled on demand");
-        Assert.assertEquals(0L, pool.metrics().borrowTimeoutCount(), "nobody timed out");
-        replacement.close();
+        PoolMetrics metrics = pool.metrics();
+        Assert.assertEquals(0, metrics.retiring(), "the retirement itself ended");
+        Assert.assertEquals(1, metrics.quarantined(), "the uncertain slot is quarantined instead of freed");
+        Assert.assertTrue(metrics.degraded(), "the pool reports the degraded state");
+        Assert.assertEquals(1, metrics.capacityInUse(), "the quarantined slot still consumes capacity");
+        Assert.assertEquals(pool.configuredSize(), metrics.capacityInUse(),
+                "the pool stays at its configured size with one slot quarantined");
+        Assert.assertEquals(1L, metrics.closeAttempts(), "the close was attempted once");
+        Assert.assertEquals(0L, metrics.closeSuccesses(), "the close did not succeed");
+        Assert.assertEquals(1L, metrics.closeFailures(), "an Error from close() is counted as a failure too");
+        Assert.assertEquals(metrics.closeAttempts(), metrics.closeSuccesses() + metrics.closeFailures(),
+                "closeAttempts == closeSuccesses + closeFailures, even for a fatal close");
+        Assert.assertTrue(resource.isClosed(), "this fake did release itself before throwing the Error");
+        Assert.assertEquals(0, factory.liveCount(), "nothing is left alive in this scenario");
+
+        // The decisive invariant: a quarantined slot authorises no replacement, even though this
+        // particular fake really did release the resource. The pool cannot know that, and safety wins.
+        Assert.assertThrows(java.util.concurrent.TimeoutException.class, pool::borrow,
+                "a fully quarantined pool applies backpressure instead of creating a replacement");
+        Assert.assertEquals(1, factory.createAttempts(), "no replacement was created into the quarantined slot");
+        Assert.assertEquals(1, factory.peakLive(), "the physical bound held");
+
         pool.close();
+        Assert.assertEquals(1, pool.metrics().quarantined(), "quarantine survives the shutdown");
+        Assert.assertEquals(1L, pool.metrics().closeAttempts(), "shutdown does not re-close a quarantined slot");
     }
 
     /**
@@ -486,7 +522,7 @@ public class BoundedPoolLifecycleTest {
         Assert.assertEquals(0, pool.metrics().leased(), "no lease is outstanding");
         Assert.assertEquals(0, pool.metrics().available(), "nothing was parked in the closed pool's idle set");
         Assert.assertEquals(0, pool.metrics().capacityInUse(), "the capacity slot was released");
-        Assert.assertEquals(1L, pool.metrics().closed(), "the pool counted the resource as closed");
+        Assert.assertEquals(1L, pool.metrics().closeSuccesses(), "the pool counted the resource as closed");
         Assert.assertTrue(pool.awaitQuiescence(GENEROUS), "the pool reports quiescence");
         Assert.assertTrue(resource.isClosed(), "quiescence is never reported while a resource is still open");
     }

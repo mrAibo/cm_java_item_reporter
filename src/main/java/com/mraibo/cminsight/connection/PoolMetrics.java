@@ -3,11 +3,23 @@ package com.mraibo.cminsight.connection;
 /**
  * Point-in-time pool state.
  *
- * <p>{@code available + leased + creating + retiring} is the number of capacity slots currently
- * accounted for and can never exceed {@link #configuredSize}.
+ * <p>{@code available + leased + creating + retiring + quarantined} is the number of capacity slots
+ * currently consumed and can never exceed {@link #configuredSize}.
  *
- * <p>Creation counters double as the reconnect counters required by ARCHITECTURE.md: replacing a
- * retired resource is exactly the reconnect attempt.
+ * <h2>Why quarantine exists</h2>
+ *
+ * A resource whose {@code close()} threw has an <em>uncertain</em> physical outcome: the exception does
+ * not prove that the underlying CM session or JDBC connection is gone. Such a resource must therefore
+ * keep consuming its capacity slot instead of authorising a replacement, or the pool could exceed the
+ * configured physical hard bound. Those slots are reported as {@link #quarantined}; a non-zero value
+ * means the pool is degraded, which is the safe direction.
+ *
+ * <h2>Creation and close counters are deliberately specific</h2>
+ *
+ * Initial population and replacement creation are different events, so they are counted separately and
+ * there is no "reconnect" alias: only the future CM/JDBC adapter can say whether a creation was a
+ * reconnect. Close attempts, successes and failures are likewise separated, because "attempted to
+ * close" and "provably closed" are not the same statement.
  */
 public record PoolMetrics(
         String name,
@@ -16,37 +28,41 @@ public record PoolMetrics(
         int leased,
         int creating,
         int retiring,
+        int quarantined,
         long borrowCount,
         long borrowTimeoutCount,
         double averageBorrowWaitMs,
         double maxBorrowWaitMs,
         long createAttempts,
+        long initialCreations,
+        long replacementCreations,
         long created,
         long createFailures,
-        long closed,
+        long closeAttempts,
+        long closeSuccesses,
+        long closeFailures,
         long validationFailures,
         long ageRotations,
         long operationRotations,
         long unhealthyRotations,
-        long operations) {
+        long automaticUsages,
+        long explicitOperations) {
 
-    /** Capacity slots accounted for right now. Never greater than {@link #configuredSize}. */
+    /** Capacity slots consumed right now. Never greater than {@link #configuredSize}. */
     public int capacityInUse() {
-        return available + leased + creating + retiring;
+        return available + leased + creating + retiring + quarantined;
     }
 
-    /** Reconnect attempts: creations attempted while replacing or growing toward capacity. */
-    public long reconnectAttempts() {
-        return createAttempts;
+    /**
+     * True when at least one slot is quarantined, i.e. the pool is running below its configured
+     * capacity because a close outcome is uncertain. Visible so the degraded state cannot be silent.
+     */
+    public boolean degraded() {
+        return quarantined > 0;
     }
 
-    /** Reconnect successes. */
-    public long reconnectSuccesses() {
-        return created;
-    }
-
-    /** Reconnect failures. */
-    public long reconnectFailures() {
-        return createFailures;
+    /** Total usage recorded against resources: automatic borrow/use/close cycles plus explicit calls. */
+    public long operations() {
+        return automaticUsages + explicitOperations;
     }
 }

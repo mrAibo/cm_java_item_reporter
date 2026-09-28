@@ -57,7 +57,21 @@ Pool metrics: configured size, available, leased, borrow count, average/max wait
 
 ### Capacity accounting
 
-Every capacity slot is accounted for under a single lock as one of four states: idle, leased, being created, or retiring. A borrow either takes an idle resource, or, when that sum is below the configured size, reserves a slot and creates one. Because that sum is the only thing that authorises a creation, the bound cannot be exceeded under any interleaving, no capacity is overshot during a refill and no emergency or overflow resource is ever created. Refill is lazy rather than eager: retiring a resource frees its slot and the next borrow creates the replacement, so there are no refill worker threads to explode and no refill race to lose.
+Every capacity slot is accounted for under a single lock as exactly one of five states: idle, leased, being created, retiring, or quarantined. A borrow either takes an idle resource, or, when that sum is below the configured size, reserves a slot and creates one. Because that sum is the only thing that authorises a creation, the bound cannot be exceeded under any interleaving, no capacity is overshot during a refill and no emergency or overflow resource is ever created. Refill is lazy rather than eager: retiring a resource frees its slot and the next borrow creates the replacement, so there are no refill worker threads to explode and no refill race to lose.
+
+### An uncertain close never frees physical capacity
+
+A resource whose `close()` throws has an **unknown** physical outcome: the exception does not prove that the underlying CM session or JDBC connection is gone. Such a slot moves to **quarantine** and stays consumed, so no replacement can be created while the old resource may still exist. This deliberately degrades the pool instead of risking a breach of the configured physical hard bound - safety outranks availability. Only a `close()` that returned normally frees a slot.
+
+`PoolMetrics` keeps the two outcomes distinct and visible: `quarantined`, `degraded`, and the separate `closeAttempts` / `closeSuccesses` / `closeFailures` counters. Initial population and replacement creation are counted separately (`initialCreations`, `replacementCreations`) and there is deliberately **no** "reconnect" counter, because only the CM/JDBC adapter can know whether a creation was a reconnect.
+
+A creation that is still in flight when `close()` begins is never handed out: it is retired through the same path as any other retirement, so its slot is freed or quarantined exactly once.
+
+### Usage rotation cannot be forgotten
+
+Every completed borrow/use/close cycle counts as one usage automatically, so a caller that only uses try-with-resources still advances the operation budget. Explicit counting through the lease adds on top, and `automaticUsages` / `explicitOperations` are reported separately.
+
+### Strictness versus promptness
 
 A retiring resource keeps its slot until its `close()` has returned. A slow close therefore delays capacity instead of letting a replacement open while the old resource is still alive: the hard bound takes precedence over promptness.
 

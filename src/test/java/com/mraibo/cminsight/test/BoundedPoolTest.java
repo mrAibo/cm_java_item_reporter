@@ -68,14 +68,13 @@ public class BoundedPoolTest {
             Assert.assertEquals(SIZE, pool.metrics().leased(), "every slot is accounted for as leased");
             Assert.assertEquals(0, pool.metrics().available(), "no idle resource is left");
             Assert.assertEquals(SIZE, pool.metrics().capacityInUse(), "capacity in use equals the configured size");
-            Assert.assertEquals(SIZE, pool.metrics().reconnectSuccesses(),
-                    "the reconnect alias mirrors the creation counter");
-            Assert.assertEquals(pool.metrics().created(), pool.metrics().reconnectSuccesses(),
-                    "created and reconnectSuccesses agree");
-            Assert.assertEquals(pool.metrics().createAttempts(), pool.metrics().reconnectAttempts(),
-                    "createAttempts and reconnectAttempts agree");
-            Assert.assertEquals(pool.metrics().createFailures(), pool.metrics().reconnectFailures(),
-                    "createFailures and reconnectFailures agree");
+            // Goal 01A (A4): the pool no longer publishes "reconnect" counters - only the future CM/JDBC
+            // adapter can say whether a creation was a reconnect. Initial population and replacement
+            // creation are now counted separately and truthfully.
+            Assert.assertEquals(SIZE, pool.metrics().created(), "every initial resource was created");
+            Assert.assertEquals(pool.metrics().createAttempts(), pool.metrics().created(),
+                    "every creation attempt succeeded here");
+            Assert.assertEquals(0L, pool.metrics().createFailures(), "no creation failed");
         } finally {
             release.countDown();
             for (Thread holder : holders) {
@@ -149,7 +148,14 @@ public class BoundedPoolTest {
                     "no more than the configured number of leases was ever held (peak " + peakHolders.get() + ")");
             Assert.assertEquals(0L, pool.metrics().borrowTimeoutCount(), "nobody timed out while others released");
             Assert.assertEquals(threads * iterations, pool.metrics().borrowCount(), "every borrow is counted");
-            Assert.assertEquals(threads * iterations, pool.metrics().operations(), "every operation is counted");
+            // Goal 01A (A3): a borrow/use/close cycle is one AUTOMATIC usage, the explicit
+            // recordOperation() in the loop body is counted separately, and operations() is their sum.
+            Assert.assertEquals(threads * iterations, pool.metrics().automaticUsages(),
+                    "every borrow/use/close cycle is one automatic usage");
+            Assert.assertEquals(threads * iterations, pool.metrics().explicitOperations(),
+                    "every explicit recordOperation() is counted on its own");
+            Assert.assertEquals(2L * threads * iterations, pool.metrics().operations(),
+                    "the reported total is the sum of both usage sources");
             Assert.assertEquals(SIZE, factory.liveCount(), "after the storm one resource per slot is alive");
         } finally {
             for (Thread worker : workers) {

@@ -20,6 +20,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>{@link #close()} is idempotent and closes resources in reverse acquisition order. A failing
  * resource never prevents the remaining ones from being released; failures are recorded on
  * {@link #closeFailures()} so a switch can report what went wrong.
+ *
+ * <p>A recorded failure also marks the close as uncertain ({@link #closedWithUncertainResources()}).
+ * "Uncertain" is the honest description: a resource that refused to close may still hold a physical
+ * connection, so a caller that is about to open new connections of the same kind must fail closed
+ * instead of assuming the previous ones are gone. {@link RepositoryManager} is that caller.
  */
 public final class RepositoryContext implements AutoCloseable {
 
@@ -28,6 +33,7 @@ public final class RepositoryContext implements AutoCloseable {
     private final Instant createdAt = Instant.now();
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile List<String> closeFailures = List.of();
+    private volatile boolean closedWithUncertainResources;
 
     public RepositoryContext(RepositoryProfile profile) {
         this(profile, List.of());
@@ -78,6 +84,24 @@ public final class RepositoryContext implements AutoCloseable {
         return closeFailures;
     }
 
+    /**
+     * True when {@link #close()} released this context but at least one resource refused to close, so
+     * the physical resources of this context are not proven gone.
+     *
+     * <p>Deliberately a separate question from {@link #isClosed()}: the context IS closed - its own
+     * bookkeeping is final, {@code close()} is idempotent and the remaining resources were still
+     * released - but the outcome is uncertain, and new connections of the same kind must therefore not
+     * be opened on the strength of it.
+     *
+     * <p>False before {@code close()} runs, false after a fully successful close, and immutable once the
+     * first {@code close()} call completed: a later {@code close()} is a no-op. An {@link Error} thrown
+     * by a resource is recorded as a failure too, so the flag is visible even when {@code close()}
+     * rethrows.
+     */
+    public boolean closedWithUncertainResources() {
+        return closedWithUncertainResources;
+    }
+
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) {
@@ -101,6 +125,10 @@ public final class RepositoryContext implements AutoCloseable {
             }
         }
         this.closeFailures = List.copyOf(failures);
+        // Publish the outcome BEFORE a possible rethrow, so a caller that unwinds on the Error still
+        // sees an accurate answer, and never AFTER the loop, so a partially released context is never
+        // described as a clean one.
+        this.closedWithUncertainResources = !failures.isEmpty();
         if (fatal != null) {
             throw fatal;
         }

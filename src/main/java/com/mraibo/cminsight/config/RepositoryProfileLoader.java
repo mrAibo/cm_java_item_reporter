@@ -15,9 +15,22 @@ import java.util.stream.Stream;
 /**
  * Loads {@code conf/profiles/*.properties} into {@link RepositoryProfile} instances.
  *
- * <p>Fails closed: a malformed profile, a duplicate repository id or an inline password aborts
+ * <p>Fails closed: a malformed profile, a duplicate repository id or an inline credential aborts
  * loading with a message naming the offending file, because silently skipping a repository would
  * present an operator with an incomplete list of systems.
+ *
+ * <p>Every credential is loaded as a {@link SecretRef} that declares its source: {@code
+ * repository.<cm|jdbc>.<user|password>.env} names an environment variable, {@code
+ * repository.<cm|jdbc>.<user|password>.file} names a file below {@code secrets.dir}. Both shapes are
+ * preserved and both are resolvable later by {@link SecretResolver}; nothing is dropped at load time.
+ *
+ * <p><strong>Precedence when a credential has both shapes:</strong> {@code .env} wins and is
+ * authoritative - it is never allowed to fall back to the {@code .file} source, matching the rule the
+ * web credentials already follow. A load-time diagnostic names the shadowed {@code .file} key, and if
+ * the environment variable is unset, resolution fails closed instead of quietly using the file. An
+ * inline value is not part of the model at all: {@code repository.cm.user=<value>} and every inline
+ * password form are rejected below, with a message naming the profile file and the {@code .env}/{@code
+ * .file} key to use instead.
  */
 public final class RepositoryProfileLoader {
 
@@ -128,10 +141,10 @@ public final class RepositoryProfileLoader {
                     vendor,
                     config.find("repository.jdbc.url").orElse(null),
                     config.find("repository.jdbc.schema").orElse(null),
-                    config.find("repository.cm.user.env").orElse(null),
-                    config.find("repository.cm.password.env").orElse(null),
-                    config.find("repository.jdbc.user.env").orElse(null),
-                    config.find("repository.jdbc.password.env").orElse(null),
+                    credential(config, file, RepositoryProfile.CM_USER_KEY),
+                    credential(config, file, RepositoryProfile.CM_PASSWORD_KEY),
+                    credential(config, file, RepositoryProfile.JDBC_USER_KEY),
+                    credential(config, file, RepositoryProfile.JDBC_PASSWORD_KEY),
                     config.find("repository.icn.base.url").orElse(null),
                     file.toAbsolutePath().normalize());
         } catch (ConfigException e) {
@@ -140,22 +153,66 @@ public final class RepositoryProfileLoader {
     }
 
     /**
+     * Declares where one repository credential comes from, applying the documented precedence.
+     *
+     * <p>{@code .env} wins over {@code .file}, and the winning source is authoritative: a configured
+     * environment variable that happens to be unset does NOT fall back to the secret file, it fails
+     * closed at resolution time. Both sources are therefore never merged and never silently dropped -
+     * when both are present the shadowed one is reported in {@link #diagnostics()}.
+     */
+    private SecretRef credential(AppConfig config, Path file, String key) {
+        String envName = config.find(key + ".env").orElse(null);
+        String fileName = config.find(key + ".file").orElse(null);
+        if (envName != null && fileName != null) {
+            diagnostics.add(file.getFileName() + ": '" + key + "' configures both '" + key + ".env' ("
+                    + envName + ") and '" + key + ".file' (" + fileName + "); the environment variable is"
+                    + " authoritative and the secret file is ignored.");
+        }
+        if (envName != null) {
+            return RepositoryProfile.credentialFromEnvironment(key, envName);
+        }
+        if (fileName != null) {
+            return RepositoryProfile.credentialFromSecretFile(key, fileName);
+        }
+        return RepositoryProfile.credentialNotConfigured(key);
+    }
+
+    /**
      * A profile must reference secrets, never contain them. This is the one place where a committed
-     * password would be caught before it reaches Git.
+     * credential would be caught before it reaches Git.
+     *
+     * <p>Two rules, because the old key-name heuristic covered only half of the model:
+     *
+     * <ul>
+     *   <li>a key ending in {@code .user} under {@code repository.} is an inline credential value - the
+     *       loader never read it, so before Goal 01A it was silently ignored and the operator's real
+     *       user name never reached the connection;</li>
+     *   <li>anything else whose name looks like a secret (password/passwd/secret/token) must use the
+     *       {@code .env} or {@code .file} indirection.</li>
+     * </ul>
+     *
+     * <p>Neither message echoes the value: a rejected credential must not be printed by the very
+     * diagnostic that rejects it.
      */
     private static void rejectInlineSecrets(AppConfig config, Path file) {
         for (String key : config.keys()) {
             String lower = key.toLowerCase(Locale.ROOT);
+            boolean indirection = SECRET_INDIRECTIONS.stream().anyMatch(lower::endsWith);
+            if (indirection) {
+                continue;
+            }
+            if (isInlineCredentialValueKey(lower)) {
+                throw new ConfigException(file.getFileName() + ": key '" + key
+                        + "' holds a repository credential value directly. Repository profiles must reference"
+                        + " credentials by name; use '" + key + ".env' or '" + key + ".file' instead.");
+            }
             boolean looksSecret = SECRET_MARKERS.stream().anyMatch(lower::contains);
             if (!looksSecret) {
                 continue;
             }
-            boolean indirection = SECRET_INDIRECTIONS.stream().anyMatch(lower::endsWith);
-            if (!indirection) {
-                throw new ConfigException(file.getFileName() + ": key '" + key
-                        + "' looks like an inline secret. Repository profiles must reference credentials by name;"
-                        + " use '" + key + ".env' or '" + key + ".file' instead.");
-            }
+            throw new ConfigException(file.getFileName() + ": key '" + key
+                    + "' looks like an inline secret. Repository profiles must reference credentials by name;"
+                    + " use '" + key + ".env' or '" + key + ".file' instead.");
         }
 
         // A key-name check is not enough: JDBC URLs routinely carry a password in the URL itself, and
@@ -168,6 +225,14 @@ public final class RepositoryProfileLoader {
                     + " Put the user and password in repository.jdbc.user.env / repository.jdbc.password.env"
                     + " (or the matching '.file' keys) instead of inside the URL.");
         }
+    }
+
+    /**
+     * True for {@code repository.*.user} - the one credential shape whose name carries no secret marker,
+     * so the marker heuristic below would let it through as an ignored key.
+     */
+    private static boolean isInlineCredentialValueKey(String lowerKey) {
+        return lowerKey.startsWith("repository.") && lowerKey.endsWith(".user");
     }
 
     /**

@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 /** Shared fixtures: temporary directories, credentials and repository profiles. No network, no DB. */
@@ -89,7 +90,55 @@ final class TestSupport {
         return "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
     }
 
-    /** A syntactically valid, fully populated repository profile with no credentials in it. */
+    /**
+     * Creates a symbolic link, or reports {@code false} when the platform or the process privileges do
+     * not allow it (for example a Windows session without Developer Mode or elevation).
+     *
+     * <p>Used to build the containment case a purely lexical check cannot see: a name that looks inside
+     * the secrets directory while the file it names really lives outside it.
+     */
+    static boolean createSymbolicLink(Path link, Path target) {
+        try {
+            Files.createSymbolicLink(link, target);
+            return Files.isSymbolicLink(link);
+        } catch (IOException | UnsupportedOperationException | SecurityException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Creates a Windows directory junction, which needs no privileges, and reports whether it worked.
+     *
+     * <p>A junction is a reparse point too - an inside-looking name with an outside-resolving location -
+     * so it is the portable fallback for the containment tests, and it is exactly the shape a Bash
+     * {@code [ -r ... ]} probe gets wrong.
+     */
+    static boolean createWindowsJunction(Path link, Path target) {
+        if (!System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")) {
+            return false;
+        }
+        try {
+            Process process = new ProcessBuilder("cmd", "/c", "mklink", "/J", link.toString(), target.toString())
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+            if (!process.waitFor(20, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return false;
+            }
+            return process.exitValue() == 0 && Files.isDirectory(link);
+        } catch (IOException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /**
+     * A syntactically valid, fully populated repository profile whose four credentials all come from
+     * environment variables. No credential VALUE is ever part of a profile (Goal 01A section C).
+     */
     static RepositoryProfile profile(String id) {
         String envId = id.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]", "_");
         return new RepositoryProfile(
@@ -99,10 +148,13 @@ final class TestSupport {
                 DatabaseVendor.DB2,
                 "jdbc:db2://db.example:50000/" + envId,
                 "ICMADMIN",
-                "CM_" + envId + "_USER",
-                "CM_" + envId + "_PASSWORD",
-                "JDBC_" + envId + "_USER",
-                "JDBC_" + envId + "_PASSWORD",
+                RepositoryProfile.credentialFromEnvironment(RepositoryProfile.CM_USER_KEY, "CM_" + envId + "_USER"),
+                RepositoryProfile.credentialFromEnvironment(RepositoryProfile.CM_PASSWORD_KEY,
+                        "CM_" + envId + "_PASSWORD"),
+                RepositoryProfile.credentialFromEnvironment(RepositoryProfile.JDBC_USER_KEY,
+                        "JDBC_" + envId + "_USER"),
+                RepositoryProfile.credentialFromEnvironment(RepositoryProfile.JDBC_PASSWORD_KEY,
+                        "JDBC_" + envId + "_PASSWORD"),
                 "https://icn.example/icn",
                 null);
     }

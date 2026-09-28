@@ -32,6 +32,9 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
     private volatile CountDownLatch closeGate;
     private volatile CountDownLatch healthGate;
     private volatile CountDownLatch healthEntered;
+    private volatile CountDownLatch createGate;
+    private volatile CountDownLatch createEntered;
+    private volatile Error healthError;
 
     @Override
     public FakeResource create() throws Exception {
@@ -45,12 +48,24 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
         created.add(resource);
         int now = live.incrementAndGet();
         peak.accumulateAndGet(now, Math::max);
+        awaitCreateGate();
         return resource;
     }
 
     @Override
     public boolean isHealthy(FakeResource resource) {
         awaitHealthGate();
+        Error error = healthError;
+        if (error != null) {
+            // An Error is not a RuntimeException, so the pool's "the probe said no" path cannot catch
+            // it: this is the case that must not lose the resource's capacity slot.
+            throw error;
+        }
+        if (resource != null && resource.probeError() != null) {
+            // A probe that fails for ONE resource only, so a multi-resource pool can prove that a scan
+            // which continues past the failure does not abandon a healthy neighbour.
+            throw resource.probeError();
+        }
         return resource != null && resource.isHealthy();
     }
 
@@ -86,6 +101,46 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
     void gateHealthChecks(CountDownLatch gate, CountDownLatch entered) {
         this.healthGate = gate;
         this.healthEntered = entered;
+    }
+
+    /**
+     * Makes every {@code create()} park after the resource physically exists (live count raised, peak
+     * recorded) but before it is returned to {@code BoundedPool}, and counts down {@code entered} as
+     * soon as one parks.
+     *
+     * <p>That is the only window in which {@code pool.close()} can race an in-flight lazy creation, so
+     * a test can prove that the just-created resource is retired instead of being handed out.
+     */
+    void gateCreates(CountDownLatch entered, CountDownLatch gate) {
+        this.createEntered = entered;
+        this.createGate = gate;
+    }
+
+    /**
+     * Makes every {@code isHealthy()} probe throw this {@link Error}.
+     *
+     * <p>The pool catches a {@code RuntimeException} from the probe as "unhealthy", but an Error escapes
+     * that path entirely - so this is the case in which the resource's capacity slot used to be lost
+     * while the resource was still physically alive. Pass {@code null} to restore normal probing.
+     */
+    void failHealthChecksWith(Error error) {
+        this.healthError = error;
+    }
+
+    private void awaitCreateGate() {
+        CountDownLatch gate = createGate;
+        if (gate == null) {
+            return;
+        }
+        CountDownLatch entered = createEntered;
+        if (entered != null) {
+            entered.countDown();
+        }
+        try {
+            gate.await(20, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void awaitHealthGate() {

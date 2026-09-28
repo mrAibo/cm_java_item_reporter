@@ -6,7 +6,17 @@
 #
 # Refuses to delete anything while CM Insight is running (verified by the PID
 # file and the process command line). Build output (build/) is always removed;
-# --all also removes runtime state (run/ and logs/).
+# --all also removes the runtime state directories (run/ and logs/).
+#
+# Paths (Goal 01A section D): the runtime state follows the SAME application home as
+# bin/start.sh, bin/status.sh, bin/stop.sh and bin/cm-insight:
+#   APP_HOME = ${CM_INSIGHT_HOME:-<repository root>}
+#   run directory = ${CM_INSIGHT_RUN_DIR:-${APP_HOME}/run}
+#   log directory = ${CM_INSIGHT_LOG_DIR:-${APP_HOME}/logs}
+# so a relocated home is cleaned in place instead of deleting the installation's run/
+# and logs/. build/ is an installation path and always stays on the repository root.
+# The PID file is read from the run directory above - the one that decides whether it
+# is safe to delete.
 #
 # Message prefixes: "OK:" / "WARN:" / "ERROR:".
 # Exit codes: 0 cleaned, 1 refused (application running) or cleaning incomplete, 2 usage error.
@@ -22,17 +32,22 @@ Usage: ./bin/clean.sh [--all] [--help]
 Removes build output:
   build/     classes, test-classes, jar, .version
 
-With --all it also removes runtime state:
-  run/       PID file
-  logs/      application log
+With --all it also removes the runtime state the lifecycle scripts use:
+  <home>/run/    PID file        (CM_INSIGHT_RUN_DIR overrides <home>)
+  <home>/logs/   application log (CM_INSIGHT_LOG_DIR overrides <home>)
 
 Options:
-  --all     also remove run/ and logs/
+  --all     also remove the run/ and logs/ directories
   --help    show this help
 
-Safety: the command refuses to delete anything while the PID file points at a
-live CM Insight process. A PID file that points at a dead or unrelated process
-is removed as stale and cleaning continues.
+Safety: the command refuses to delete anything while the PID file in the run
+directory points at a live CM Insight process. A PID file that points at a dead or
+unrelated process is removed as stale and cleaning continues.
+
+Environment:
+  CM_INSIGHT_HOME        application home (default: the repository root)
+  CM_INSIGHT_RUN_DIR     PID file directory (default <home>/run)
+  CM_INSIGHT_LOG_DIR     log directory (default <home>/logs)
 
 Exit codes: 0 cleaned, 1 refused (application is running) or cleaning incomplete, 2 usage error.
 USAGE
@@ -51,39 +66,22 @@ SCRIPT_DIR="$(dirname -- "${SELF}")"
 [ -d "${SCRIPT_DIR}" ] || { printf 'ERROR: cannot locate script directory: %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
 ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)" || { printf 'ERROR: cannot resolve repository root from %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
 
-PID_FILE="${ROOT}/run/cm-insight.pid"
+LIB_DIR="${SCRIPT_DIR}/lib"
+for module in cm-insight-addr.sh cm-insight-lifecycle.sh; do
+  [ -r "${LIB_DIR}/${module}" ] || { printf 'ERROR: required module is missing: %s\n' "${LIB_DIR}/${module}" >&2; exit 2; }
+done
+# shellcheck source=/dev/null
+. "${LIB_DIR}/cm-insight-lifecycle.sh"
 
-is_alive() {
-  _pid="$1"
-  kill -0 "${_pid}" 2>/dev/null || return 1
-  if [ -r "/proc/${_pid}/stat" ]; then
-    _state="$(sed -n 's/^[^)]*) \([A-Za-z]\).*/\1/p' "/proc/${_pid}/stat" 2>/dev/null)"
-    [ "${_state}" = "Z" ] && return 1
-  fi
-  return 0
-}
-
-proc_cmdline() {
-  _pid="$1"
-  if [ -r "/proc/${_pid}/cmdline" ]; then
-    tr '\0' ' ' < "/proc/${_pid}/cmdline" 2>/dev/null || true
-    return 0
-  fi
-  if command -v ps >/dev/null 2>&1; then
-    ps -p "${_pid}" -o args= 2>/dev/null || true
-  fi
-}
-
-proc_is_ours() {
-  # 0 = our application, 1 = a different process, 2 = cannot tell
-  _cmd="$(proc_cmdline "$1")"
-  _cmd="${_cmd%%$'\n'*}"
-  if [ -z "${_cmd}" ]; then return 2; fi
-  case "${_cmd}" in
-    *cm-insight.jar*|*cminsight.app.Main*|*bin/cm-insight*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# One path rule (Goal 01A section D), shared with bin/cm-insight and the lifecycle
+# scripts: the application home is CM_INSIGHT_HOME when set, else the repository root.
+APP_HOME="$(ci_effective_home "${ROOT}")"
+RUN_DIR="${CM_INSIGHT_RUN_DIR:-${APP_HOME}/run}"
+LOG_DIR="${CM_INSIGHT_LOG_DIR:-${APP_HOME}/logs}"
+PID_FILE="${RUN_DIR}/cm-insight.pid"
+CONFIG="$(ci_effective_config "${APP_HOME}")"
+PORT="$(ci_effective_port "${CONFIG}")"
+BIND="$(ci_effective_bind "${CONFIG}")"
 
 if [ -f "${PID_FILE}" ]; then
   PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
@@ -94,9 +92,12 @@ if [ -f "${PID_FILE}" ]; then
       rm -f "${PID_FILE}"
       ;;
     *)
-      if is_alive "${PID}"; then
+      # Refuse while the instance is behind that PID in EITHER pid namespace or owns a
+      # listening socket that serves the configured bind: "not in the process table" is
+      # not proof that nothing is running (see ci_process_exists / H-3, H-4).
+      if ci_pid_is_running "${PID}" "${PORT}" "${BIND}"; then
         set +e
-        proc_is_ours "${PID}"
+        ci_proc_identity "${PID}"
         IDENT_RC=$?
         set -e
         if [ "${IDENT_RC}" -eq 1 ]; then
@@ -130,13 +131,13 @@ remove_path() {
   return 1
 }
 
-remove_path "${ROOT}/build" "build/" || CLEAN_FAILED=1
+remove_path "${ROOT}/build" "build/ (${ROOT}/build)" || CLEAN_FAILED=1
 
 if [ "${ALL}" = true ]; then
-  remove_path "${ROOT}/run" "run/" || CLEAN_FAILED=1
-  remove_path "${ROOT}/logs" "logs/" || CLEAN_FAILED=1
+  remove_path "${RUN_DIR}" "run/ (${RUN_DIR})" || CLEAN_FAILED=1
+  remove_path "${LOG_DIR}" "logs/ (${LOG_DIR})" || CLEAN_FAILED=1
 else
-  printf 'OK: kept run/ and logs/ (use --all to remove them as well)\n'
+  printf 'OK: kept %s and %s (use --all to remove them as well)\n' "${RUN_DIR}" "${LOG_DIR}"
 fi
 
 if [ "${CLEAN_FAILED}" -ne 0 ]; then

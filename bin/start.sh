@@ -7,13 +7,16 @@
 # What it does:
 #   1. reads run/cm-insight.pid; a valid, live, CM Insight PID short-circuits as
 #      "already running" and a stale/foreign PID file is cleaned up
-#   2. refuses to start when loopback /api/health already answers as CM Insight
-#      but no PID file tracks it (an UNTRACKED INSTANCE), and also refuses when
-#      another service already holds the configured port
+#   2. refuses to start when the CONFIGURED BIND ADDRESS already answers the exact
+#      CM Insight health marker but no PID file tracks it (an UNTRACKED INSTANCE),
+#      and also refuses when another service holds the configured port or the
+#      socket that would serve the configured address
 #   3. runs bin/doctor.sh as a pre-flight check
 #   4. launches bin/cm-insight with nohup, appending to logs/cm-insight.out
-#   5. health-checks http://127.0.0.1:<web.port>/api/health until the timeout,
-#      verifying on every iteration that the PID is still our process
+#   5. health-checks the configured bind until the timeout, verifying on every
+#      iteration that the PID is still our process AND that the answer carries the
+#      exact CM Insight marker ({"status":"UP","service":"cm-insight"}), not merely
+#      any HTTP 2xx - a foreign service on the port is never mistaken for CM Insight
 #   6. PUBLISHES run/cm-insight.pid atomically (temp file + rename) ONLY AFTER the
 #      instance is confirmed: health OK, or the process verified in the
 #      process-only modes (--timeout 0, web.port=0). A failed start never writes
@@ -21,6 +24,20 @@
 #      never lose its tracking because of a later failed start
 #   7. on failure names the actual condition and prints the decisive log line(s)
 #      together with the tail of the log
+#
+# Bind awareness (Goal 01A section G):
+#   one shared address model (bin/lib/cm-insight-addr.sh) decides where the health
+#   probe dials and which sockets count as this configuration's listener:
+#     127.0.0.1 and any other 127/8 literal -> probed at that literal itself
+#     localhost                             -> probed at 127.0.0.1, then ::1
+#     ::1                                   -> probed at ::1
+#     wildcard (0.0.0.0, ::)                -> probed at a loopback address, and
+#                                              a wildcard socket IS recognized as
+#                                              this configuration's listener
+#     a specific non-loopback address       -> probed at that address
+#   A non-loopback bind is refused by the application itself unless the operator has
+#   deliberately set web.allowInsecureHttp=true (Goal 01A section F); this script
+#   reports that condition in its failure diagnosis and never weakens the policy.
 #
 # Tracking safety:
 #   * the PID file is only ever created by a start that confirmed its instance;
@@ -30,10 +47,20 @@
 # Untracked instance (recovery):
 #   ./bin/status.sh              -> "Status: UNTRACKED INSTANCE" (exit 1)
 #   ./bin/stop.sh --untracked    -> stops the process that owns the configured port
+#                                   (only with positive CM Insight ownership evidence)
 #
 # Message prefixes: "OK:" / "WARN:" / "ERROR:".
 # Exit codes: 0 started, 1 startup failure or refusal to duplicate an instance,
 # 2 usage error.
+#
+# Environment:
+#   CM_INSIGHT_HOME        application home (default: the repository root). The default
+#                          configuration file, the PID file and the log derive from it,
+#                          using the same rule bin/cm-insight passes as -Dcminsight.home
+#   CM_INSIGHT_CONFIG      configuration file (default <home>/conf/application.properties;
+#                          a relative value resolves against the application home)
+#   CM_INSIGHT_RUN_DIR     PID file directory (default <home>/run)
+#   CM_INSIGHT_LOG_DIR     application log directory (default <home>/logs)
 
 set -euo pipefail
 
@@ -44,7 +71,9 @@ usage() {
   cat <<'USAGE'
 Usage: ./bin/start.sh [--timeout SECONDS] [--help] [-- application arguments...]
 
-Starts CM Insight in the background and waits until it answers a local health check.
+Starts CM Insight in the background and waits until the configured bind address
+answers a health check with the exact CM Insight marker
+({"status":"UP","service":"cm-insight"}).
 
 Options:
   --timeout SECONDS   how long to wait for the health check (default 30, env
@@ -55,10 +84,13 @@ With web.port=0 the application binds a random free port, so the health URL cann
 be derived from the configuration and only the process is verified.
 
 Refuses to start (exit 1) when:
-  * the configured loopback port already answers /api/health as CM Insight but no
+  * the configured bind address already answers /api/health as CM Insight but no
     PID file tracks it -> an UNTRACKED INSTANCE; inspect it with ./bin/status.sh
     and stop it with ./bin/stop.sh --untracked, or
-  * another service already holds the configured port.
+  * another service already holds the configured port (whether it answers HTTP or
+    not), or
+  * the configured bind is non-loopback without the deliberate
+    web.allowInsecureHttp=true override (the application refuses that itself).
 A PID file that tracks a live CM Insight process is the "already running" fast
 path (exit 0, nothing started).
 
@@ -66,8 +98,13 @@ Everything after "--" is passed to the application launcher (bin/cm-insight).
 
 Environment:
   JAVA_HOME              JDK 17+ home (POSIX or Windows form)
-  CM_INSIGHT_CONFIG      configuration file (default conf/application.properties)
+  CM_INSIGHT_HOME        application home (default: the repository root); the default
+                         configuration file, the PID file and the log live under it
+  CM_INSIGHT_CONFIG      configuration file (default conf/application.properties under
+                         the application home; a relative value resolves against it)
   CM_INSIGHT_START_TIMEOUT  default health-check timeout in seconds
+  CM_INSIGHT_RUN_DIR     PID file directory (default <home>/run)
+  CM_INSIGHT_LOG_DIR     application log directory (default <home>/logs)
 
 Files:
   run/cm-insight.pid     PID file, published atomically only after the instance is
@@ -108,12 +145,34 @@ SCRIPT_DIR="$(dirname -- "${SELF}")"
 [ -d "${SCRIPT_DIR}" ] || { printf 'ERROR: cannot locate script directory: %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
 ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)" || { printf 'ERROR: cannot resolve repository root from %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
 
-RUN_DIR="${ROOT}/run"
-LOG_DIR="${ROOT}/logs"
+LIB_DIR="${SCRIPT_DIR}/lib"
+for module in cm-insight-addr.sh cm-insight-lifecycle.sh; do
+  [ -r "${LIB_DIR}/${module}" ] || { printf 'ERROR: required module is missing: %s\n' "${LIB_DIR}/${module}" >&2; exit 2; }
+done
+# shellcheck source=/dev/null
+. "${LIB_DIR}/cm-insight-lifecycle.sh"
+
+# One path rule (Goal 01A section D), shared with bin/cm-insight: the application home
+# is CM_INSIGHT_HOME when set, else the repository root, and the default config file,
+# the PID file and the logs live under it. CM_INSIGHT_CONFIG / CM_INSIGHT_RUN_DIR /
+# CM_INSIGHT_LOG_DIR stay explicit overrides; a relative CM_INSIGHT_CONFIG resolves
+# against the application home.
+APP_HOME="$(ci_effective_home "${ROOT}")"
+
+RUN_DIR="${CM_INSIGHT_RUN_DIR:-${APP_HOME}/run}"
+LOG_DIR="${CM_INSIGHT_LOG_DIR:-${APP_HOME}/logs}"
 PID_FILE="${RUN_DIR}/cm-insight.pid"
 OUT_FILE="${LOG_DIR}/cm-insight.out"
-CONFIG="${CM_INSIGHT_CONFIG:-${ROOT}/conf/application.properties}"
+CONFIG="$(ci_effective_config "${APP_HOME}")"
 PID_TMP=""
+
+BIND="$(ci_effective_bind "${CONFIG}")"
+PORT="$(ci_effective_port "${CONFIG}")"
+BIND_DISPLAY="$(ci_bind_display "${BIND}" "${PORT}")"
+PROBE_HOST="$(ci_addr_probe_host "${BIND}")"
+HEALTH_URL="$(ci_health_url "${PROBE_HOST}" "${PORT}")"
+BIND_LOOPBACK=false
+ci_addr_is_loopback "${BIND}" && BIND_LOOPBACK=true
 
 cleanup_tmp() {
   # Only ever removes the private candidate file: the published PID file is not
@@ -126,110 +185,19 @@ log_ok() { printf 'OK: %s\n' "$*"; }
 log_warn() { printf 'WARN: %s\n' "$*" >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-is_alive() {
-  # $1 = pid; false for a process that has exited (including a zombie)
-  _pid="$1"
-  kill -0 "${_pid}" 2>/dev/null || return 1
-  if [ -r "/proc/${_pid}/stat" ]; then
-    _state="$(sed -n 's/^[^)]*) \([A-Za-z]\).*/\1/p' "/proc/${_pid}/stat" 2>/dev/null)"
-    [ "${_state}" = "Z" ] && return 1
-  fi
-  return 0
-}
-
-proc_cmdline() {
-  # $1 = pid; prints the command line when the platform allows it, else nothing
-  _pid="$1"
-  if [ -r "/proc/${_pid}/cmdline" ]; then
-    # stderr is suppressed on the READ, not only on the test: between the -r test
-    # and the open the process can exit and the file disappear, which used to leak
-    # a bare "/proc/<pid>/cmdline: No such file or directory".
-    _cmd="$(cat "/proc/${_pid}/cmdline" 2>/dev/null | tr '\0' ' ' || true)"
-    printf '%s' "${_cmd}"
-    return 0
-  fi
-  if command -v ps >/dev/null 2>&1; then
-    ps -p "${_pid}" -o args= 2>/dev/null || true
-  fi
-}
-
-proc_is_ours() {
-  # 0 = our application, 1 = a different process, 2 = cannot tell
-  _cmd="$(proc_cmdline "$1")"
-  _cmd="${_cmd%%$'\n'*}"
-  if [ -z "${_cmd}" ]; then return 2; fi
-  case "${_cmd}" in
-    *cm-insight.jar*|*cminsight.app.Main*|*bin/cm-insight*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-config_value() {
-  # $1 = file, $2 = literal key; prints the effective value or nothing.
-  # Like java.util.Properties, a duplicated key uses the LAST occurrence.
-  _file="$1"
-  _key="$2"
-  [ -r "${_file}" ] || return 0
-  _esc="$(printf '%s' "${_key}" | sed 's/[.]/\\./g')"
-  _line="$(sed -n "s/^[[:space:]]*${_esc}[[:space:]]*=[[:space:]]*//p" "${_file}" 2>/dev/null)"
-  _line="${_line##*$'\n'}"
-  _line="${_line%$'\r'}"
-  printf '%s' "${_line}"
-}
-
-PORT=""
-PORT_KNOWN=false
-probe_health() {
-  # Loopback-only probe of the configured port. Sets:
-  #   PORT, PORT_KNOWN, PROBE_KIND = our | foreign | none | unknown, PROBE_CODE
-  # "our" means the health body carries the cm-insight service marker, so a
-  # different HTTP service on the same port is reported as foreign, not as ours.
-  PROBE_KIND="unknown"
-  PROBE_CODE="000"
-  PORT="$(config_value "${CONFIG}" web.port)"
-  case "${PORT}" in ''|*[!0-9]*) PORT="8080" ;; esac
-  if [ "${PORT}" = "0" ]; then return 0; fi
-  PORT_KNOWN=true
-  command -v curl >/dev/null 2>&1 || return 0
-  _tmp="${TMPDIR:-/tmp}/cm-insight-probe.$$"
-  PROBE_CODE="$(curl -sS -o "${_tmp}" -w '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/api/health" 2>/dev/null || true)"
-  _body="$(cat "${_tmp}" 2>/dev/null || true)"
-  rm -f "${_tmp}" 2>/dev/null || true
-  case "${PROBE_CODE}" in
-    ''|000) PROBE_CODE="000"; PROBE_KIND="none" ;;
-    200)
-      case "${_body}" in
-        *'"service":"cm-insight"'*) PROBE_KIND="our" ;;
-        *) PROBE_KIND="foreign" ;;
-      esac
-      ;;
-    *) PROBE_KIND="foreign" ;;
-  esac
-}
-
-port_listener_pid() {
-  # Prints the WINDOWS pid (Git Bash/MSYS) or Linux pid that owns 127.0.0.1:PORT,
-  # or returns 1 when it cannot be resolved. Only genuinely PORT-SCOPED sources are
-  # used: the socket table via netstat -ano (Windows/MSYS, net-tools on Linux) or
-  # ss -ltnp (iproute2 on Linux). There is deliberately NO process-name scan: an
-  # unrelated CM Insight JVM on another port must never be mistaken for this port's
-  # owner, and an unknown owner must stay unknown (callers treat that as "no
-  # conflict", never as "guess").
-  if command -v netstat >/dev/null 2>&1; then
-    _line="$(netstat -ano 2>/dev/null | tr -d '\r' | awk -v p="127.0.0.1:${PORT}" '$2==p {print; exit}' || true)"
-    if [ -n "${_line}" ]; then
-      _pid="$(printf '%s' "${_line}" | awk '{print $NF}')"
-      case "${_pid}" in
-        ''|*[!0-9]*) : ;;
-        *) printf '%s' "${_pid}"; return 0 ;;
-      esac
-    fi
-  fi
-  if command -v ss >/dev/null 2>&1; then
-    _pid="$(ss -ltnp 2>/dev/null | awk -v p="127.0.0.1:${PORT}" '$4==p && match($0, /pid=[0-9]+/) {print substr($0, RSTART+4, RLENGTH-4); exit}' || true)"
-    if [ -n "${_pid}" ]; then printf '%s' "${_pid}"; return 0; fi
-  fi
-  return 1
+listener_owner() {
+  # prints "host|pid|exact|covered" for the first socket that serves the configured
+  # bind (exact before covered) or nothing. Never a process-name guess: only the
+  # port-scoped socket table is consulted.
+  _ci_lo_port="$1"
+  _ci_lo_bind="$2"
+  for _ci_lo_class in exact covered; do
+    ci_bind_listener_rows "${_ci_lo_port}" "${_ci_lo_bind}" | while IFS='|' read -r _ci_lo_host _ci_lo_pid _ci_lo_cls; do
+      [ "${_ci_lo_cls}" = "${_ci_lo_class}" ] || continue
+      printf '%s|%s|%s\n' "${_ci_lo_host}" "${_ci_lo_pid}" "${_ci_lo_cls}"
+      break
+    done
+  done | sed -n '1p'
 }
 
 run_log_slice() {
@@ -254,9 +222,11 @@ startup_reason() {
     return 0
   fi
   if printf '%s\n' "${_slice}" | grep -qiE 'Address already in use|BindException'; then
-    printf 'the configured address 127.0.0.1:%s is already bound by another process (bind failed)' "${PORT:-?}"
+    printf 'the configured address %s is already bound by another process (bind failed)' "${BIND_DISPLAY}"
   elif printf '%s\n' "${_slice}" | grep -qi 'Configuration file not found'; then
     printf 'the configuration file could not be read'
+  elif printf '%s\n' "${_slice}" | grep -qi 'allowInsecureHttp'; then
+    printf 'plain HTTP on the non-loopback bind %s was refused; web.allowInsecureHttp=true is an explicitly accepted insecure exposure' "${BIND}"
   elif printf '%s\n' "${_slice}" | grep -qiE 'Unsupported database vendor|InvalidPathException|ConfigException'; then
     printf 'the configuration was rejected at startup'
   elif printf '%s\n' "${_slice}" | grep -qiE 'OutOfMemoryError|java.lang.OutOfMemory'; then
@@ -268,7 +238,7 @@ startup_reason() {
 
 print_decisive_lines() {
   # surfaces this run's decisive lines so the operator does not have to read a whole tail
-  _lines="$(run_log_slice | grep -iE 'Address already in use|BindException|Configuration file not found|InvalidPathException|Unsupported database vendor|ConfigException|OutOfMemoryError|ERROR' 2>/dev/null | tail -n 3)"
+  _lines="$(run_log_slice | grep -iE 'Address already in use|BindException|Configuration file not found|InvalidPathException|Unsupported database vendor|ConfigException|allowInsecureHttp|OutOfMemoryError|ERROR' 2>/dev/null | tail -n 3)"
   if [ -n "${_lines}" ]; then
     printf -- '--- decisive log line(s) ---\n' >&2
     printf '%s\n' "${_lines}" >&2
@@ -283,6 +253,14 @@ print_log_tail() {
     printf -- '--- end of log ---\n' >&2
   else
     printf -- '(no output captured yet in %s)\n' "${OUT_FILE}" >&2
+  fi
+}
+
+print_bind_hint() {
+  # Section F reminder for the one condition a bind-aware script must name: the
+  # application itself owns the policy, this only explains a refusal.
+  if [ "${BIND_LOOPBACK}" != true ]; then
+    printf '       note: web.bind=%s is not loopback, so plain HTTP is refused unless the operator deliberately sets web.allowInsecureHttp=true (a SECURITY WARNING at startup).\n' "${BIND}" >&2
   fi
 }
 
@@ -309,19 +287,19 @@ if [ -f "${PID_FILE}" ]; then
       rm -f "${PID_FILE}"
       ;;
     *)
-      if is_alive "${OLD_PID}"; then
+      if ci_pid_is_running "${OLD_PID}" "${PORT}" "${BIND}"; then
         set +e
-        proc_is_ours "${OLD_PID}"
+        ci_proc_identity "${OLD_PID}"
         IDENT_RC=$?
         set -e
         case "${IDENT_RC}" in
           0) log_ok "CM Insight is already running (PID ${OLD_PID}); nothing to do"; exit 0 ;;
           1) log_warn "PID file ${PID_FILE} points at PID ${OLD_PID}, which is a different process; removing the stale PID file and continuing" ;;
-          *) log_warn "PID file ${PID_FILE} points at live PID ${OLD_PID} but its command line cannot be inspected; removing the stale PID file and continuing" ;;
+          *) log_warn "PID file ${PID_FILE} points at live PID ${OLD_PID} but its command line cannot be inspected; removing the stale PID file and continuing (the port check below still refuses a second instance)" ;;
         esac
         rm -f "${PID_FILE}"
       else
-        log_warn "removing stale PID file ${PID_FILE} (PID ${OLD_PID} is not running)"
+        log_warn "removing stale PID file ${PID_FILE} (PID ${OLD_PID} is not running: absent from the process table and from the socket table)"
         rm -f "${PID_FILE}"
       fi
       ;;
@@ -329,35 +307,52 @@ if [ -f "${PID_FILE}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. untracked instance / occupied port pre-flight (loopback only)
+# 2. untracked instance / occupied-port pre-flight (bind-aware)
 # ---------------------------------------------------------------------------
-probe_health
-LISTEN_PID="$(port_listener_pid || true)"
-case "${PROBE_KIND}" in
+ci_health_probe "${PORT}" "${BIND}"
+LISTENER="$(listener_owner "${PORT}" "${BIND}" || true)"
+LISTEN_HOST="${LISTENER%%|*}"
+LISTEN_REST="${LISTENER#*|}"
+LISTEN_PID="${LISTEN_REST%%|*}"
+LISTEN_CLASS="${LISTEN_REST##*|}"
+[ -n "${LISTENER}" ] || { LISTEN_HOST=""; LISTEN_PID=""; LISTEN_CLASS=""; }
+
+listener_detail() {
+  ci_describe_socket "${LISTEN_HOST}" "${LISTEN_CLASS}" "${BIND}" "${PORT}"
+}
+
+case "${CI_HEALTH_KIND}" in
   our)
-    printf 'ERROR: an instance is already serving http://127.0.0.1:%s/api/health but is not tracked by %s; refusing to start a second instance.\n' "${PORT}" "${PID_FILE}" >&2
+    printf 'ERROR: an instance is already serving %s but is not tracked by %s; refusing to start a second instance.\n' "${CI_HEALTH_URL}" "${PID_FILE}" >&2
     printf '       Inspect it with ./bin/status.sh (Status: UNTRACKED INSTANCE) and stop it with ./bin/stop.sh --untracked. No PID file was written or removed.\n' >&2
     exit 1
     ;;
   foreign)
-    printf 'ERROR: 127.0.0.1:%s already answers HTTP %s without the cm-insight health marker; refusing to start (another service holds the port, or an instance reports an unexpected health body).\n' "${PORT}" "${PROBE_CODE}" >&2
-    printf '       Stop that service or choose another web.port in %s.\n' "${CONFIG}" >&2
+    printf 'ERROR: %s answered HTTP %s without the cm-insight health marker; refusing to start (another service holds the configured port, or an instance reports an unexpected health body).\n' "${CI_HEALTH_URL}" "${CI_HEALTH_CODE}" >&2
+    printf '       The marker must be the exact {"status":"UP","service":"cm-insight"} body. Stop that service or choose another web.port in %s.\n' "${CONFIG}" >&2
     exit 1
     ;;
   *)
-    if [ -n "${LISTEN_PID}" ]; then
-      printf 'ERROR: 127.0.0.1:%s is already bound (owner PID %s) but /api/health does not answer as CM Insight; refusing to start.\n' "${PORT}" "${LISTEN_PID}" >&2
-      printf '       That is another service, a hung instance, or an instance that was not published in %s (it is still untracked).\n' "${PID_FILE}" >&2
+    if [ -n "${LISTEN_PID}" ] || [ -n "${LISTEN_HOST}" ]; then
+      printf 'ERROR: %s is already bound (%s) but /api/health does not answer as CM Insight; refusing to start.\n' "${BIND_DISPLAY}" "$(listener_detail)" >&2
+      case "${LISTEN_PID}" in
+        ''|-)
+          printf '       The owner could not be resolved on this platform; the port belongs to somebody else.\n' >&2
+          ;;
+        *)
+          printf '       Owner PID %s: another service, a hung instance, or an instance that was not published in %s (it is still untracked).\n' "${LISTEN_PID}" "${PID_FILE}" >&2
+          ;;
+      esac
       printf '       Inspect it with ./bin/status.sh, stop an untracked instance with ./bin/stop.sh --untracked, or choose another web.port.\n' >&2
       exit 1
     fi
     ;;
 esac
-if [ "${PROBE_KIND}" = "unknown" ]; then
-  if [ "${PORT_KNOWN}" = true ]; then
-    log_warn "the port could not be probed (curl unavailable); the untracked-instance and port-conflict checks were skipped"
-  else
+if [ "${CI_HEALTH_KIND}" = "unknown" ]; then
+  if [ "${PORT}" = "0" ]; then
     log_warn "web.port=0 binds a random free port; the untracked-instance and port-conflict checks cannot run"
+  else
+    log_warn "the port could not be probed (curl unavailable); the untracked-instance and port-conflict checks were skipped"
   fi
 fi
 
@@ -411,24 +406,41 @@ if [ "${PORT}" = "0" ]; then
   log_warn "web.port=0 binds a random free port, so the health URL cannot be derived from the configuration; verifying the process only"
 fi
 
-HEALTH_URL="http://127.0.0.1:${PORT}/api/health"
-
 WAITED=0
 HEALTH_OK=false
 PROCESS_ONLY=false
 PROC_GONE=false
 RECYCLED=false
+HEALTH_CONFIRMED_URL=""
 while : ; do
-  if ! is_alive "${PID}"; then PROC_GONE=true; break; fi
+  # "Gone" is only ever concluded from BOTH nets (review finding H-3). The MSYS pid of a
+  # process that exec'd native java.exe can vanish while the Windows process keeps
+  # serving; trusting kill -0 alone made a healthy start report "exited during startup".
+  ALIVE_NOW=true
+  if ! ci_process_exists "${PID}"; then
+    if ci_pid_owns_serving_socket "${PID}" "${PORT}" "${BIND}"; then
+      ALIVE_NOW=true
+    else
+      ALIVE_NOW=false
+    fi
+  fi
+  if [ "${ALIVE_NOW}" != true ]; then PROC_GONE=true; break; fi
 
   set +e
-  proc_is_ours "${PID}"
+  ci_proc_identity "${PID}"
   IDENT_RC=$?
   set -e
   if [ "${IDENT_RC}" -eq 1 ]; then RECYCLED=true; break; fi
 
   if [ "${USE_CURL}" = true ]; then
-    if curl -fsS --max-time 2 "${HEALTH_URL}" >/dev/null 2>&1; then HEALTH_OK=true; break; fi
+    # The exact marker is required, not any 2xx answer, and every probe candidate of
+    # the configured bind is tried (127.0.0.1 and/or ::1 for a wildcard bind).
+    ci_health_probe "${PORT}" "${BIND}"
+    if [ "${CI_HEALTH_KIND}" = "our" ]; then
+      HEALTH_OK=true
+      HEALTH_CONFIRMED_URL="${CI_HEALTH_URL}"
+      break
+    fi
   elif [ "${WAITED}" -ge 3 ]; then
     PROCESS_ONLY=true
     break
@@ -452,7 +464,7 @@ if [ "${HEALTH_OK}" = true ] || [ "${PROCESS_ONLY}" = true ]; then
 fi
 
 if [ "${HEALTH_OK}" = true ]; then
-  log_ok "CM Insight started (PID ${PID}); health OK on ${HEALTH_URL}"
+  log_ok "CM Insight started (PID ${PID}); health OK on ${HEALTH_CONFIRMED_URL:-${HEALTH_URL}} (web.bind=${BIND})"
   log_ok "PID file published: ${PID_FILE}"
   log_ok "log: ${OUT_FILE}"
   exit 0
@@ -478,8 +490,12 @@ if [ "${PROC_GONE}" = true ]; then
   # gone) while `wait` never returns at all. start.sh then blocked forever *after* it already knew
   # the start had failed, so the operator got no message whatsoever. Measured: 3 hangs in 5 cycles.
   # startup_reason plus the log slice below name the cause, which is what an operator needs.
-  fail_start "CM Insight exited during startup (PID ${PID}): ${REASON}." \
-             "Nothing is running and no PID file was written or removed; check the port and the configuration."
+  printf 'ERROR: CM Insight exited during startup (PID %s): %s.\n' "${PID}" "${REASON}" >&2
+  printf '       Nothing is running and no PID file was written or removed; check the port and the configuration.\n' >&2
+  print_bind_hint
+  print_decisive_lines "${OUT_FILE}"
+  print_log_tail
+  exit 1
 fi
 
 if [ "${RECYCLED}" = true ]; then
@@ -489,6 +505,7 @@ fi
 
 printf 'ERROR: CM Insight (PID %s) did not answer %s within %ss: %s.\n' "${PID}" "${HEALTH_URL}" "${TIMEOUT}" "${REASON}" >&2
 printf '       The process is still alive but unconfirmed, so NO PID file was written; stop it with ./bin/stop.sh --untracked, then investigate.\n' >&2
+print_bind_hint
 print_decisive_lines "${OUT_FILE}"
 print_log_tail
 exit 1

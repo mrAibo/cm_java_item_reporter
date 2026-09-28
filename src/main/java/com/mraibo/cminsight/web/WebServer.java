@@ -52,7 +52,9 @@ import java.util.regex.Pattern;
  *   <li>the router is bound to an {@link Authenticator} built from {@link WebAuthSettings} plus the
  *       brute-force guard settings from configuration;</li>
  *   <li>the exposure policy runs before the socket is opened, so a refused configuration never
- *       listens at all;</li>
+ *       listens at all; a non-loopback plain-HTTP bind additionally requires the explicit
+ *       {@code web.allowInsecureHttp=true} opt-in (default false) and is announced as a security
+ *       warning when it is used;</li>
  *   <li>worker threads are daemons and the work queue is bounded, so a request flood applies
  *       backpressure instead of growing memory without limit.</li>
  * </ul>
@@ -98,6 +100,7 @@ public final class WebServer implements AutoCloseable {
     private final int backlog;
     private final String version;
     private final String mode;
+    private final boolean allowInsecureHttp;
     private final List<String> warnings;
 
     private HttpServer server;
@@ -114,18 +117,30 @@ public final class WebServer implements AutoCloseable {
         this.backlog = config.getInt(KEY_BACKLOG, 0, 0, 4096);
         this.version = config.get(KEY_VERSION, DEFAULT_VERSION);
         this.mode = config.get(KEY_MODE, DEFAULT_MODE);
+        // Fail closed: an absent key is false, and anything that is not exactly true/false is a
+        // configuration error rather than a silent yes or no. Parsed by SecurityPolicy so the doctor
+        // entry point applies the identical rule.
+        this.allowInsecureHttp = SecurityPolicy.allowInsecureHttp(config);
 
         LoginThrottle throttle = new LoginThrottle(
                 config.getInt(KEY_MAX_FAILURES, 5, 1, 1000),
                 config.getDuration(KEY_LOCKOUT, Duration.ofMinutes(5), Duration.ofSeconds(1), Duration.ofHours(24)),
                 config.getInt(KEY_MAX_TRACKED_KEYS, 4096, 16, 1_048_576));
         this.authenticator = new Authenticator(auth, throttle);
-        this.warnings = SecurityPolicy.exposureWarnings(auth, bindAddress, configuredPort);
+        this.warnings = SecurityPolicy.exposureWarnings(auth, bindAddress, configuredPort, allowInsecureHttp);
     }
 
     /** Exposure warnings collected at construction: safe to print, never contains a credential. */
     public List<String> warnings() {
         return warnings;
+    }
+
+    /**
+     * The effective value of {@code web.allowInsecureHttp} (default {@code false}). True only when the
+     * operator explicitly accepted a non-loopback plain-HTTP bind.
+     */
+    public boolean allowInsecureHttp() {
+        return allowInsecureHttp;
     }
 
     /**
@@ -140,7 +155,7 @@ public final class WebServer implements AutoCloseable {
                 throw new IllegalStateException("The web server is already started");
             }
             // Fails closed before a socket exists.
-            SecurityPolicy.validateWebExposure(auth, bindAddress, configuredPort);
+            SecurityPolicy.validateWebExposure(auth, bindAddress, configuredPort, allowInsecureHttp);
             printStartupWarnings();
 
             router.bindAuthenticator(authenticator);
@@ -207,7 +222,12 @@ public final class WebServer implements AutoCloseable {
             System.err.println("cm-insight web: warning: " + warning);
         }
         for (String warning : warnings) {
-            System.err.println("cm-insight web: warning: " + warning);
+            // An accepted insecure plain-HTTP exposure is an operator decision, not a routine note:
+            // it gets its own prefix so it cannot be mistaken for noise in a startup log.
+            String prefix = warning.startsWith(SecurityPolicy.INSECURE_HTTP_MARKER)
+                    ? "cm-insight web: SECURITY WARNING: "
+                    : "cm-insight web: warning: ";
+            System.err.println(prefix + warning);
         }
     }
 

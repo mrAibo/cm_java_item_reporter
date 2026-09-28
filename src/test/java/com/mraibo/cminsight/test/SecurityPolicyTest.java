@@ -8,6 +8,7 @@ import com.mraibo.cminsight.security.SecurityPolicy;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 
 /** The exposure guard: literal-only loopback detection and fail-closed credential checks. */
 public class SecurityPolicyTest {
@@ -117,11 +118,63 @@ public class SecurityPolicyTest {
                 "admin/admin is refused on the IPv6 wildcard too");
     }
 
-    public void realCredentialsAreAllowedOnANonLoopbackBind() {
+    /**
+     * Goal 01A (F): a non-loopback plain-HTTP bind is refused even with real credentials, unless the
+     * operator accepts the risk explicitly with {@code web.allowInsecureHttp=true}.
+     *
+     * <p>This test replaces the Goal 01 test {@code realCredentialsAreAllowedOnANonLoopbackBind}, which
+     * asserted the OLD policy: real credentials alone unlocked a non-loopback bind over plain HTTP.
+     * Goal 01A F closes that hole, because HTTP Basic sends reusable credentials in cleartext on every
+     * request, and it requires the opt-in to be explicit rather than implied by a long password.
+     *
+     * <p>Fails against the pre-Goal-01A {@code SecurityPolicy}, where the third rule did not exist and
+     * the two {@code validateWebExposure(..., false)} calls below returned normally.
+     */
+    public void realCredentialsNeedTheInsecureOverrideOnANonLoopbackBind() {
         WebAuthSettings real = TestSupport.credentials("ops", "Correct-Horse-8842");
         Assert.assertFalse(SecurityPolicy.usesDefaultCredentials(real), "explicit credentials are not the default");
-        SecurityPolicy.validateWebExposure(real, "0.0.0.0", 8080);
-        SecurityPolicy.validateWebExposure(real, "cm-insight.example", 8443);
+
+        IllegalStateException wildcard = Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(real, "0.0.0.0", 8080),
+                "a wildcard bind over plain HTTP is refused even with real credentials");
+        Assert.assertTrue(wildcard.getMessage().contains(SecurityPolicy.KEY_ALLOW_INSECURE_HTTP),
+                "the refusal names the explicit opt-in: " + wildcard.getMessage());
+        Assert.assertFalse(wildcard.getMessage().contains("Correct-Horse-8842"),
+                "the refusal never prints a credential: " + wildcard.getMessage());
+
+        IllegalStateException named = Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(real, "cm-insight.example", 8443),
+                "a host name is not loopback either, so it is refused too");
+        Assert.assertTrue(named.getMessage().contains(SecurityPolicy.KEY_ALLOW_INSECURE_HTTP),
+                "the refusal names the explicit opt-in: " + named.getMessage());
+
+        // The explicit opt-in is the only thing that accepts the plaintext transport risk.
+        SecurityPolicy.validateWebExposure(real, "0.0.0.0", 8080, true);
+        SecurityPolicy.validateWebExposure(real, "cm-insight.example", 8443, true);
+
+        // The override never weakens the other two fail-closed rules.
+        WebAuthSettings defaults = developmentDefaults();
+        IllegalStateException adminAdmin = Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(defaults, "0.0.0.0", 8080, true),
+                "the insecure override does not permit admin/admin on a non-loopback bind");
+        Assert.assertTrue(adminAdmin.getMessage().contains("admin/admin development credentials"),
+                "the refusal still explains the credential problem: " + adminAdmin.getMessage());
+        Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(blankCredentials(), "0.0.0.0", 8080, true),
+                "the insecure override does not permit blank credentials");
+        Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(blankCredentials(), "127.0.0.1", 8080, true),
+                "blank credentials stay refused on loopback even with the override");
+
+        Assert.assertTrue(SecurityPolicy.exposureWarnings(real, "0.0.0.0", 8080, true).stream()
+                        .anyMatch(warning -> warning.contains(SecurityPolicy.INSECURE_HTTP_MARKER)),
+                "an accepted insecure exposure is reported with the shared marker");
+        Assert.assertTrue(SecurityPolicy.exposureWarnings(real, "0.0.0.0", 8080).stream()
+                        .anyMatch(warning -> warning.contains(SecurityPolicy.KEY_ALLOW_INSECURE_HTTP)),
+                "without the override the warning names what would be required");
+        Assert.assertTrue(SecurityPolicy.exposureWarnings(real, "127.0.0.1", 8080, true).stream()
+                        .anyMatch(warning -> warning.contains("has no effect on the loopback bind")),
+                "the override is called out as unnecessary on loopback");
     }
 
     public void blankCredentialsAreRefusedEverywhere() {
@@ -157,5 +210,78 @@ public class SecurityPolicyTest {
         Assert.assertTrue(SecurityPolicy.exposureWarnings(blankCredentials(), "127.0.0.1", 8080).stream()
                         .anyMatch(w -> w.contains("blank")),
                 "blank credentials are called out");
+    }
+
+    /**
+     * Regression (t9, finding F-1): the exposure refusal covers <em>any part</em> of the credential
+     * that is the built-in development default, not only the {@code admin}/{@code admin} pair.
+     *
+     * <p>A blank {@code web.auth.password} is treated as unset and silently falls back to the
+     * published development password. The pre-fix policy compared the pair only, so
+     * {@code web.bind=0.0.0.0} + {@code web.auth.user=operator} + a blank password + the insecure
+     * opt-in started, and {@code GET /api/info} answered {@code 200} to {@code operator}/{@code admin}
+     * over plaintext on a routable interface. Fails against that pre-fix policy.
+     */
+    public void anyPartOfTheCredentialThatIsTheDevelopmentDefaultIsRefusedOffLoopback() {
+        SecretResolver resolver = new SecretResolver(Map.of(), null);
+
+        // The hole: a configured user name and a blank, silently defaulted password.
+        Properties hole = new Properties();
+        hole.setProperty("web.auth.user", "operator");
+        hole.setProperty("web.auth.password", "");
+        WebAuthSettings defaultPassword = WebAuthSettings.resolve(AppConfig.fromProperties(hole), resolver);
+        Assert.assertEquals(SecretRef.Source.DEFAULT, defaultPassword.passwordSource().source(),
+                "a blank password is reported as the development default, not as a resolved secret");
+        Assert.assertFalse(SecurityPolicy.usesDefaultCredentials(defaultPassword),
+                "this is not the admin/admin pair");
+        Assert.assertTrue(SecurityPolicy.usesDefaultPassword(defaultPassword),
+                "the effective password is still the published development default");
+        Assert.assertTrue(SecurityPolicy.usesAnyDevelopmentDefault(defaultPassword),
+                "any default part makes the credential a development credential");
+
+        // Loopback keeps the supported development fallback, with a warning that names the field.
+        SecurityPolicy.validateWebExposure(defaultPassword, "127.0.0.1", 8080);
+        Assert.assertTrue(SecurityPolicy.exposureWarnings(defaultPassword, "127.0.0.1", 8080).stream()
+                        .anyMatch(w -> w.contains("built-in development password")),
+                "the warning names the defaulted password: "
+                        + SecurityPolicy.exposureWarnings(defaultPassword, "127.0.0.1", 8080));
+
+        // Off loopback it is refused, the insecure opt-in cannot unlock it, and the message says why.
+        IllegalStateException failure = Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(defaultPassword, "0.0.0.0", 8080, true),
+                "a defaulted password is refused on a non-loopback bind even with the insecure opt-in");
+        Assert.assertTrue(failure.getMessage().contains("web password"),
+                "the refusal names the credential field: " + failure.getMessage());
+        Assert.assertTrue(failure.getMessage().contains("built-in development default"),
+                "the refusal names the development default: " + failure.getMessage());
+        Assert.assertTrue(failure.getMessage().contains(SecurityPolicy.KEY_ALLOW_INSECURE_HTTP),
+                "the refusal explains that the opt-in does not help: " + failure.getMessage());
+        Assert.assertTrue(failure.getMessage().contains("127.0.0.1"),
+                "the refusal offers the loopback alternative: " + failure.getMessage());
+
+        // The mirror image: a blank user name with a real password.
+        Properties mirror = new Properties();
+        mirror.setProperty("web.auth.password.env", "CM_TEST_WEB_PASSWORD");
+        WebAuthSettings defaultUser = WebAuthSettings.resolve(AppConfig.fromProperties(mirror),
+                new SecretResolver(Map.of("CM_TEST_WEB_PASSWORD", "Correct-Horse-8842"), null));
+        Assert.assertEquals(SecretRef.Source.DEFAULT, defaultUser.userSource().source(),
+                "a blank user name is reported as the development default");
+        Assert.assertTrue(SecurityPolicy.usesDefaultUser(defaultUser), "the defaulted user is detected");
+        Assert.assertTrue(SecurityPolicy.usesAnyDevelopmentDefault(defaultUser),
+                "the user half alone is enough to make it a development credential");
+        Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(defaultUser, "0.0.0.0", 8080, true),
+                "a defaulted user name is refused on a non-loopback bind too");
+
+        // A password written out as the published value is the same credential.
+        Properties published = new Properties();
+        published.setProperty("web.auth.user", "operator");
+        published.setProperty("web.auth.password", "admin");
+        WebAuthSettings explicitDefault = WebAuthSettings.resolve(AppConfig.fromProperties(published), resolver);
+        Assert.assertTrue(SecurityPolicy.usesDefaultPassword(explicitDefault),
+                "the published password is recognised whatever its source");
+        Assert.assertThrows(IllegalStateException.class,
+                () -> SecurityPolicy.validateWebExposure(explicitDefault, "0.0.0.0", 8080, true),
+                "the published password is refused on a non-loopback bind");
     }
 }

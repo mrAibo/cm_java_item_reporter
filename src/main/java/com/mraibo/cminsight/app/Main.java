@@ -1,6 +1,7 @@
 package com.mraibo.cminsight.app;
 
 import com.mraibo.cminsight.config.AppConfig;
+import com.mraibo.cminsight.config.AppPaths;
 import com.mraibo.cminsight.config.ClassificationRules;
 import com.mraibo.cminsight.config.ConfigException;
 import com.mraibo.cminsight.config.RepositoryProfile;
@@ -56,6 +57,7 @@ public final class Main {
             "web.auth.user", "web.auth.user.env", "web.auth.user.file",
             "web.auth.password", "web.auth.password.env", "web.auth.password.file",
             "web.auth.maxFailures", "web.auth.lockout", "web.auth.maxTrackedKeys",
+            SecurityPolicy.KEY_ALLOW_INSECURE_HTTP,
             "cm.pool.size", "cm.pool.borrow.timeout.ms",
             "cm.pool.max.age.minutes", "cm.pool.max.operations",
             "jdbc.pool.size", "jdbc.pool.borrow.timeout.ms",
@@ -93,7 +95,10 @@ public final class Main {
     }
 
     private static int execute(String[] args) throws Exception {
-        Path configPath = Path.of("conf", "application.properties");
+        // Goal 01A (D): every operational path is resolved against ONE application home, so the
+        // launcher works from any working directory. See AppPaths for the precedence.
+        AppPaths paths = AppPaths.resolve();
+        Path configPath = paths.configurationFile(null);
         boolean printConfig = false;
 
         for (int i = 0; i < args.length; i++) {
@@ -102,7 +107,10 @@ public final class Main {
                     if (i + 1 >= args.length) {
                         throw new ConfigException("--config requires a file path");
                     }
-                    configPath = Path.of(args[++i]);
+                    configPath = paths.configurationFile(args[++i]);
+                }
+                case "--validate-config" -> {
+                    return ConfigCheck.run(args, System.out, System.err);
                 }
                 case "--version", "-V" -> {
                     System.out.println("CM Insight " + VERSION);
@@ -123,26 +131,33 @@ public final class Main {
         AppConfig config = AppConfig.load(configPath);
         List<String> warnings = new ArrayList<>();
 
-        Path secretsDir = Path.of(config.get("secrets.dir", "conf/secrets"));
+        Path secretsDir = paths.secretsDir(config);
         SecretResolver secrets = SecretResolver.system(secretsDir);
         WebAuthSettings auth = WebAuthSettings.resolve(config, secrets);
         warnings.addAll(auth.warnings());
 
         String bind = config.webBind();
         int port = config.webPort();
+        // Non-loopback plain HTTP sends reusable Basic credentials with no transport encryption, so it
+        // is refused unless the operator explicitly opts in. The flag defaults to false and never
+        // unlocks the admin/admin refusal, which is checked before it.
+        // One strict parse shared with SecurityPolicy/ConfigCheck, so Main, WebServer and doctor can
+        // never disagree about what the flag means. A non-boolean value is a hard failure.
+        boolean allowInsecureHttp = SecurityPolicy.allowInsecureHttp(config);
+
         // Fail closed before anything is opened. This is the operator-facing check: a refusal here
         // becomes a configuration error and process exit code 3. WebServer.start() applies the same
         // policy again immediately before it binds, as defence in depth; reached through Main that
         // second copy is unreachable, and if it ever did fire it would surface as a startup failure
         // with exit code 1.
         try {
-            SecurityPolicy.validateWebExposure(auth, bind, port);
+            SecurityPolicy.validateWebExposure(auth, bind, port, allowInsecureHttp);
         } catch (IllegalStateException e) {
             throw new ConfigException(e.getMessage(), e);
         }
+        warnings.addAll(SecurityPolicy.exposureWarnings(auth, bind, port, allowInsecureHttp));
 
-        RepositoryProfileLoader profileLoader =
-                new RepositoryProfileLoader(Path.of(config.get("profiles.dir", "conf/profiles")));
+        RepositoryProfileLoader profileLoader = new RepositoryProfileLoader(paths.profilesDir(config));
         List<RepositoryProfile> profiles = profileLoader.loadAll();
         warnings.addAll(profileLoader.diagnostics());
 
@@ -155,7 +170,8 @@ public final class Main {
         warnings.addAll(unknownKeyWarnings(config));
 
         if (printConfig) {
-            printEffectiveConfiguration(config, auth, features, profiles, classifications, secretsDir, bind, port);
+            printEffectiveConfiguration(config, auth, features, profiles, classifications, secretsDir, bind, port,
+                    allowInsecureHttp, paths);
             printWarnings(warnings);
             return 0;
         }
@@ -210,24 +226,19 @@ public final class Main {
      * <p>Goal 01 has no IBM CM adapter, so nothing is activated by default: an operator picks a
      * repository once the adapter exists. When activation is requested explicitly, a failure aborts
      * startup rather than leaving a silently unusable console.
+     *
+     * <p>The lookup itself lives in {@link ConfigCheck#autoActivatedProfile} because the doctor and
+     * the runtime must answer "which repository does startup activate?" identically. Keeping one
+     * implementation is what makes that agreement structural rather than a coincidence.
      */
     private static void activateConfiguredRepository(AppConfig config,
                                                      List<RepositoryProfile> profiles,
                                                      RepositoryManager repositories)
             throws Exception {
-        String requested = config.get("repository.auto.activate", null);
-        if (requested == null || requested.isBlank()) {
-            return;
+        RepositoryProfile profile = ConfigCheck.autoActivatedProfile(config, profiles);
+        if (profile != null) {
+            repositories.switchTo(profile);
         }
-        String id = requested.trim();
-        RepositoryProfile profile = profiles.stream()
-                .filter(candidate -> candidate.id().equals(id))
-                .findFirst()
-                .orElseThrow(() -> new ConfigException("repository.auto.activate names unknown repository '"
-                        + id + "'. Configured repositories: "
-                        + (profiles.isEmpty() ? "(none)" : String.join(", ", profiles.stream()
-                                .map(RepositoryProfile::id).toList()))));
-        repositories.switchTo(profile);
     }
 
     private static void printStartupBanner(AppConfig config,
@@ -257,16 +268,29 @@ public final class Main {
                                                      ClassificationRules classifications,
                                                      Path secretsDir,
                                                      String bind,
-                                                     int port) {
+                                                     int port,
+                                                     boolean allowInsecureHttp,
+                                                     AppPaths paths) {
         System.out.println("CM Insight " + VERSION + " effective configuration");
         System.out.println("  config file       : " + describePath(config.sourcePath()));
         System.out.println("  web.bind          : " + bind);
         System.out.println("  web.port          : " + port);
         System.out.println("  web user          : " + auth.user() + " [" + auth.userSource().describe() + "]");
         System.out.println("  web password      : <redacted> [" + auth.passwordSource().describe() + "]");
-        System.out.println("  default creds     : " + auth.defaultCredentials());
+        // Names which parts are the built-in development default ("none", "user only",
+        // "password only", "both") instead of a single boolean: a partially defaulted credential is
+        // not "false", and printing false directly under "[built-in development default]" is exactly
+        // the misreading finding F-1 was about.
+        System.out.println("  default creds     : " + SecurityPolicy.describeDevelopmentDefaults(auth));
         System.out.println("  secrets dir       : " + secretsDir.toAbsolutePath());
-        System.out.println("  profiles dir      : " + config.get("profiles.dir", "conf/profiles"));
+        System.out.println("  application home  : " + paths.describeHome());
+        // The override only has an effect off loopback, so only claim the insecure exposure when it
+        // actually applies - a loopback bind stays safe whatever the flag says.
+        boolean insecureActuallyApplies = allowInsecureHttp && !SecurityPolicy.isLoopbackLiteral(bind);
+        System.out.println("  insecure http     : " + allowInsecureHttp
+                + (insecureActuallyApplies
+                        ? "  (SECURITY: non-loopback plain HTTP is permitted by opt-in)" : ""));
+        System.out.println("  profiles dir      : " + paths.profilesDir(config));
         System.out.println("  classification    : " + classifications.ruleCount() + " rule(s), fallback '"
                 + classifications.fallbackLabel() + "'");
         System.out.println("  features          :");
@@ -274,10 +298,12 @@ public final class Main {
                 System.out.println("      " + id + " = " + enabled));
         System.out.println("  repositories      : " + profiles.size());
         for (RepositoryProfile profile : profiles) {
+            // credentialSourceSummary covers BOTH indirections; credentialEnvNames is env-only and would
+            // print nothing at all for a profile that uses a secret file.
             System.out.println("      " + profile.id() + " (" + profile.displayName() + ", "
                     + profile.databaseVendor() + ", SSID " + profile.ssid() + ")"
-                    + (profile.credentialEnvNames().isEmpty()
-                            ? "" : " credentials: " + String.join(", ", profile.credentialEnvNames())));
+                    + (profile.credentialSourceSummary().isEmpty()
+                            ? "" : " credentials: " + String.join(", ", profile.credentialSourceSummary())));
         }
     }
 
@@ -338,11 +364,19 @@ public final class Main {
         out.println();
         out.println("Usage: cm-insight [options]");
         out.println();
-        out.println("  --config <path>    configuration file (default conf/application.properties)");
+        out.println("  --config <path>    configuration file (default <application home>/conf/application.properties)");
+        out.println("  --validate-config  validate configuration, credentials and exposure policy, then exit");
         out.println("  --print-config     print the effective configuration with secrets redacted, then exit");
         out.println("  --self-test        run the built-in artifact self-check, then exit");
         out.println("  --version, -V      print the version, then exit");
         out.println("  --help, -h         print this help, then exit");
+        out.println();
+        out.println("Application home (the base for every relative operational path, so the launcher works");
+        out.println("from any working directory) is resolved in this order:");
+        out.println("  1. -Dcminsight.home=<dir>  (set by bin/cm-insight)");
+        out.println("  2. CM_INSIGHT_HOME=<dir>   (environment)");
+        out.println("  3. the current working directory (documented fallback)");
+        out.println("Absolute paths in the configuration bypass the application home entirely.");
         out.println();
         out.println("This application reads its configuration only from --config.");
         out.println();

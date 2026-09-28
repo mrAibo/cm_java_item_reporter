@@ -16,12 +16,23 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <h2>Capacity rule</h2>
  *
- * Every capacity slot is accounted for under a single lock as one of four states: idle, leased,
- * being created, or retiring (closed but not yet finished closing). A borrow may only proceed when
- * the sum of those states is below the configured size, so the pool can <em>never</em> overshoot.
- * When the pool is exhausted a borrow waits up to the borrow timeout and then fails with
- * {@link TimeoutException}; exactly the required backpressure. There is no emergency-connection path
- * and no unbounded fallback: CM_Migrator's emergency connection behaviour is deliberately absent.
+ * Every capacity slot is accounted for under a single lock as exactly one of five states: idle,
+ * leased, being created, retiring (closed but not yet finished closing), or quarantined (a close whose
+ * outcome is uncertain). A borrow may only proceed when the sum of those states is below the configured
+ * size, so the pool can <em>never</em> overshoot. When the pool is exhausted a borrow waits up to the
+ * borrow timeout and then fails with {@link TimeoutException}; exactly the required backpressure. There
+ * is no emergency-connection path and no unbounded fallback: CM_Migrator's emergency connection
+ * behaviour is deliberately absent.
+ *
+ * <h2>An uncertain close never frees physical capacity</h2>
+ *
+ * A resource whose {@code close()} throws has an <em>unknown</em> physical outcome: the exception does
+ * not prove that the underlying CM session or JDBC connection is gone. Such a slot is therefore moved to
+ * quarantine and stays consumed, so no replacement can be created while the old resource may still
+ * exist. This deliberately degrades the pool rather than risk exceeding the configured physical hard
+ * bound - safety outranks availability. Only a {@code close()} that returned normally frees a slot.
+ * {@link PoolMetrics#quarantined()} and {@link PoolMetrics#degraded()} make that state visible, and
+ * {@code closeAttempts}/{@code closeSuccesses}/{@code closeFailures} keep the two outcomes distinct.
  *
  * <h2>Refill without threads</h2>
  *
@@ -30,12 +41,22 @@ import java.util.concurrent.locks.ReentrantLock;
  * a reserved slot. Refill races are therefore impossible by construction, and a burst of retiring
  * resources cannot spawn a wave of creating threads.
  *
+ * <p>A creation that is still in flight when {@link #close()} begins is never handed out: it is retired
+ * through the same path as any other retirement, so its slot is freed or quarantined exactly once.
+ *
  * <h2>Strictness versus promptness</h2>
  *
  * A retiring resource keeps its slot until {@code close()} has actually returned. That means a slow
  * close can briefly delay a borrow, but the pool never opens a replacement while the old resource is
  * still alive. Bounded-but-slower was chosen over fast-but-overshooting because the hard bound is a
  * non-negotiable architecture rule.
+ *
+ * <h2>Usage rotation cannot be forgotten</h2>
+ *
+ * Every completed borrow/use/close cycle counts as one usage automatically, so a caller that only uses
+ * try-with-resources still advances the operation budget. {@link Lease#recordOperation()} adds explicit
+ * counts on top, and {@link PoolMetrics#automaticUsages()} and
+ * {@link PoolMetrics#explicitOperations()} keep the two sources separately visible.
  *
  * @param <T> pooled resource type
  */
@@ -78,6 +99,16 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
     private int leasedCount;
     private int creatingCount;
     private int retiringCount;
+    /**
+     * Slots whose resource had an UNCERTAIN close: {@code close()} threw, so the physical session or
+     * connection may still exist. They keep consuming capacity for the lifetime of this pool, which is
+     * deliberate: there is no in-process way to prove the resource is gone, and keeping the slot is
+     * exactly what stops a replacement from pushing the pool past its configured physical bound. The
+     * state is visible through {@link PoolMetrics#quarantined()} and {@link PoolMetrics#degraded()};
+     * recovering the capacity means resolving the underlying resource and replacing the pool - a later
+     * goal's adapter concern - rather than something this class can do for the caller.
+     */
+    private int quarantinedCount;
     private boolean initialized;
     private volatile boolean closed;
 
@@ -88,14 +119,19 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
     private final AtomicLong totalWaitNanos = new AtomicLong();
     private final AtomicLong maxWaitNanos = new AtomicLong();
     private final AtomicLong createAttempts = new AtomicLong();
+    private final AtomicLong initialCreations = new AtomicLong();
+    private final AtomicLong replacementCreations = new AtomicLong();
     private final AtomicLong created = new AtomicLong();
     private final AtomicLong createFailures = new AtomicLong();
-    private final AtomicLong closedResources = new AtomicLong();
+    private final AtomicLong closeAttempts = new AtomicLong();
+    private final AtomicLong closeSuccesses = new AtomicLong();
+    private final AtomicLong closeFailures = new AtomicLong();
     private final AtomicLong validationFailures = new AtomicLong();
     private final AtomicLong ageRotations = new AtomicLong();
     private final AtomicLong operationRotations = new AtomicLong();
     private final AtomicLong unhealthyRotations = new AtomicLong();
-    private final AtomicLong operationCount = new AtomicLong();
+    private final AtomicLong automaticUsages = new AtomicLong();
+    private final AtomicLong explicitOperations = new AtomicLong();
 
     /** A pool with no age or operation based rotation. */
     public BoundedPool(String name, int size, Duration borrowTimeout, ResourceFactory<T> factory) {
@@ -170,31 +206,30 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
         List<Entry<T>> entries = new ArrayList<>(size);
         try {
             for (int i = 0; i < size; i++) {
-                entries.add(newEntry());
+                entries.add(newEntry(true));
             }
         } catch (Throwable failure) {
-            // Roll back completely, whatever went wrong. Every entry created so far is closed even if
-            // one of them throws an Error while closing - aborting here would leave creatingCount
-            // inflated and initialized() true, which makes every later borrow time out forever.
-            // Note that these entries were reserved as `creating`, not as `retiring`, so the slot is
-            // returned by decrementing creatingCount once, not by finishRetirement() per entry.
-            Error closeFailure = null;
-            for (Entry<T> entry : entries) {
-                try {
-                    closeEntry(entry);
-                } catch (Error fatal) {
-                    if (closeFailure == null) {
-                        closeFailure = fatal;
-                    }
-                }
-            }
+            // Roll back completely, whatever went wrong.
+            //
+            // The reservation moves from `creating` to `retiring` BEFORE anything is closed, so every
+            // entry that was actually created finishes through the normal retirement path: its slot is
+            // freed only when close() returned normally, and quarantined when the outcome is uncertain.
+            // Decrementing creatingCount while closing would free capacity for resources that may still
+            // exist.
             lock.lock();
             try {
                 creatingCount -= size;
+                retiringCount += entries.size();
                 initialized = false;
                 capacityChanged.signalAll();
             } finally {
                 lock.unlock();
+            }
+            Error closeFailure = null;
+            try {
+                closeAllAndFinish(entries);
+            } catch (Error fatal) {
+                closeFailure = fatal;
             }
             if (closeFailure != null) {
                 failure.addSuppressed(closeFailure);
@@ -208,20 +243,25 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
         List<Entry<T>> discarded = null;
         lock.lock();
         try {
-            creatingCount -= size;
             if (closed) {
+                // close() began while this pool was still being filled: these resources must never be
+                // published into the idle set. The reservation moves from `creating` to `retiring`, so
+                // each slot is freed only when its close actually succeeded.
+                creatingCount -= size;
+                retiringCount += entries.size();
                 discarded = new ArrayList<>(entries);
             } else {
+                creatingCount -= size;
                 for (Entry<T> entry : entries) {
                     idle.addLast(entry);
                 }
-                capacityChanged.signalAll();
             }
+            capacityChanged.signalAll();
         } finally {
             lock.unlock();
         }
         if (discarded != null) {
-            closeAll(discarded);
+            closeAllAndFinish(discarded);
         }
     }
 
@@ -235,24 +275,40 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
     public Lease<T> borrow() throws InterruptedException, TimeoutException {
         long startNanos = System.nanoTime();
         long deadlineNanos = startNanos + borrowTimeout.toNanos();
+        // Counted at the ATTEMPT, so a borrow refused because the pool is closed or exhausted is still
+        // visible. Counting only the outcomes would show an operator one borrow where two were attempted.
+        borrowCount.incrementAndGet();
         final Entry<T> entry;
+        boolean waitRecorded = false;
         try {
             entry = acquire(deadlineNanos);
         } catch (TimeoutException e) {
             recordWait(startNanos);
-            borrowCount.incrementAndGet();
+            waitRecorded = true;
             borrowTimeoutCount.incrementAndGet();
             throw e;
+        } finally {
+            // The wait is recorded for EVERY attempt, including one refused because the pool closed or a
+            // creation failed: borrowCount counts attempts now, so the latency metrics must describe the
+            // same population or they would report 0 ms for a borrow that actually waited.
+            if (!waitRecorded) {
+                recordWait(startNanos);
+            }
         }
-        recordWait(startNanos);
-        borrowCount.incrementAndGet();
+
+        // A completed borrow/use/close cycle always counts as one usage. Operation-based rotation must
+        // not depend on the caller remembering to invoke recordOperation(): an ordinary
+        // try-with-resources block has to advance the budget, or a resource could sit at zero lifetime
+        // usage forever and never rotate.
+        entry.operations.incrementAndGet();
+        automaticUsages.incrementAndGet();
 
         return new Lease<>(
                 entry.value,
                 lease -> release(entry),
                 count -> {
                     entry.operations.addAndGet(count);
-                    operationCount.addAndGet(count);
+                    explicitOperations.addAndGet(count);
                 },
                 startNanos,
                 name + "#" + entry.sequence);
@@ -268,6 +324,7 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
      */
     public int rotateStale() {
         List<Entry<T>> stale = new ArrayList<>();
+        Throwable probeFailure = null;
         lock.lock();
         try {
             if (closed) {
@@ -276,7 +333,19 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
             Iterator<Entry<T>> iterator = idle.iterator();
             while (iterator.hasNext()) {
                 Entry<T> entry = iterator.next();
-                Rotation rotation = rotationFor(entry);
+                Rotation rotation;
+                try {
+                    rotation = rotationFor(entry);
+                } catch (Throwable failure) {
+                    // A probe failure must not abort the whole sweep with nothing counted: the resource is
+                    // treated as suspect and retired like any other, and the failure is reported after the
+                    // sweep has been applied.
+                    validationFailures.incrementAndGet();
+                    rotation = Rotation.UNHEALTHY;
+                    if (probeFailure == null) {
+                        probeFailure = failure;
+                    }
+                }
                 if (rotation == null || rotation == Rotation.SHUTDOWN) {
                     continue;
                 }
@@ -290,6 +359,12 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
         }
 
         closeAllAndFinish(stale);
+        if (probeFailure != null) {
+            if (probeFailure instanceof Error error) {
+                throw error;
+            }
+            throw (RuntimeException) probeFailure;
+        }
         return stale.size();
     }
 
@@ -329,19 +404,25 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
                     leasedCount,
                     creatingCount,
                     retiringCount,
+                    quarantinedCount,
                     borrows,
                     borrowTimeoutCount.get(),
                     borrows == 0 ? 0.0 : (totalWaitNanos.get() / 1_000_000.0) / borrows,
                     maxWaitNanos.get() / 1_000_000.0,
                     createAttempts.get(),
+                    initialCreations.get(),
+                    replacementCreations.get(),
                     created.get(),
                     createFailures.get(),
-                    closedResources.get(),
+                    closeAttempts.get(),
+                    closeSuccesses.get(),
+                    closeFailures.get(),
                     validationFailures.get(),
                     ageRotations.get(),
                     operationRotations.get(),
                     unhealthyRotations.get(),
-                    operationCount.get());
+                    automaticUsages.get(),
+                    explicitOperations.get());
         } finally {
             lock.unlock();
         }
@@ -398,13 +479,30 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
     private Entry<T> takeIdle() {
         Entry<T> result = null;
         List<Entry<T>> retiring = null;
+        Throwable probeFailure = null;
 
         lock.lock();
         try {
             ensureOpen();
             while (!idle.isEmpty()) {
                 Entry<T> entry = idle.pollFirst();
-                Rotation rotation = rotationFor(entry);
+                Rotation rotation;
+                boolean probeFailed = false;
+                try {
+                    rotation = rotationFor(entry);
+                } catch (Throwable failure) {
+                    // The health probe threw, so this resource's state is unknown. Retire it like any
+                    // other suspect resource instead of letting it fall out of the bookkeeping: an
+                    // unaccounted slot plus a physically alive resource is exactly how the pool would
+                    // exceed its configured hard bound (measured before this fix: physical live 3..6
+                    // with configured size 1, because the next borrow created a replacement).
+                    validationFailures.incrementAndGet();
+                    rotation = Rotation.UNHEALTHY;
+                    probeFailed = true;
+                    if (probeFailure == null) {
+                        probeFailure = failure;
+                    }
+                }
                 if (rotation != null && rotation != Rotation.SHUTDOWN) {
                     retiringCount++;
                     recordRotation(rotation);
@@ -412,6 +510,13 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
                         retiring = new ArrayList<>(2);
                     }
                     retiring.add(entry);
+                    if (probeFailed) {
+                        // Stop scanning. Continuing would allow a later HEALTHY entry to be promoted to
+                        // leased and then abandoned when the remembered probe failure is rethrown below,
+                        // leaving it leased forever and unreachable - even for close() - which is a leaked
+                        // session plus silent capacity loss.
+                        break;
+                    }
                     continue;
                 }
                 leasedCount++;
@@ -424,6 +529,12 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
 
         if (retiring != null) {
             closeAllAndFinish(retiring);
+        }
+        if (probeFailure != null) {
+            if (probeFailure instanceof Error error) {
+                throw error;
+            }
+            throw (RuntimeException) probeFailure;
         }
         return result;
     }
@@ -443,32 +554,73 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
         }
     }
 
+    /**
+     * Fills a capacity slot reserved by {@link #reserveCreationSlot()}.
+     *
+     * <p>Two failure modes are handled here because either would otherwise corrupt accounting:
+     *
+     * <ul>
+     *   <li>the creation fails or throws an {@link Error} - the reserved slot must be given back for
+     *       <em>every</em> outcome, or {@code creating} stays incremented forever and the pool
+     *       permanently loses capacity;</li>
+     *   <li>the pool is closed while the creation is still in flight - the resource must never be
+     *       leased, because the invariant is that no new lease is handed out once close has begun. It is
+     *       retired instead, so its slot is freed or quarantined through the normal path.</li>
+     * </ul>
+     */
     private Entry<T> createReserved() throws InterruptedException, TimeoutException {
-        Entry<T> entry;
+        final Entry<T> entry;
         try {
-            entry = newEntry();
-        } catch (Exception e) {
-            lock.lock();
-            try {
-                creatingCount--;
-                capacityChanged.signalAll();
-            } finally {
-                lock.unlock();
-            }
-            if (e instanceof InterruptedException interrupted) {
+            entry = newEntry(false);
+        } catch (Throwable failure) {
+            releaseCreationSlot();
+            if (failure instanceof InterruptedException interrupted) {
                 throw interrupted;
             }
-            throw new PoolException("Pool '" + name + "' could not create a resource: " + describe(e), e);
+            if (failure instanceof Error error) {
+                throw error;
+            }
+            throw new PoolException("Pool '" + name + "' could not create a resource: "
+                    + describe(failure), failure);
         }
 
+        final boolean poolClosed;
         lock.lock();
         try {
             creatingCount--;
-            leasedCount++;
+            poolClosed = closed;
+            if (poolClosed) {
+                retiringCount++;
+            } else {
+                leasedCount++;
+            }
+            capacityChanged.signalAll();
         } finally {
             lock.unlock();
         }
+
+        if (poolClosed) {
+            boolean closedCleanly = false;
+            try {
+                closedCleanly = attemptClose(entry);
+            } finally {
+                finishRetirement(closedCleanly);
+            }
+            throw new IllegalStateException("Pool '" + name
+                    + "' was closed while a resource was being created; no lease is handed out");
+        }
         return entry;
+    }
+
+    /** Returns one reserved creation slot. Used by every failure path of a reserved creation. */
+    private void releaseCreationSlot() {
+        lock.lock();
+        try {
+            creatingCount--;
+            capacityChanged.signalAll();
+        } finally {
+            lock.unlock();
+        }
     }
 
     private void awaitCapacity(long deadlineNanos) throws InterruptedException, TimeoutException {
@@ -493,7 +645,19 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
     }
 
     private void release(Entry<T> entry) {
-        Rotation rotation = rotationFor(entry);
+        Rotation rotation;
+        Throwable probeFailure = null;
+        try {
+            rotation = rotationFor(entry);
+        } catch (Throwable failure) {
+            // The probe threw, so the resource's state is unknown: retire it. The lease must be handed
+            // back regardless - losing it here would stick the slot as leased forever with
+            // quarantined()==0 and degraded()==false, which is silent permanent degradation that no
+            // metric would explain.
+            validationFailures.incrementAndGet();
+            rotation = Rotation.UNHEALTHY;
+            probeFailure = failure;
+        }
         boolean retire = rotation != null;
 
         lock.lock();
@@ -518,20 +682,39 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
             if (rotation != Rotation.SHUTDOWN) {
                 recordRotation(rotation);
             }
+            boolean closedCleanly = false;
             try {
-                closeEntry(entry);
+                closedCleanly = attemptClose(entry);
             } finally {
-                // Return the slot even if close() throws an Error; otherwise the pool degrades
-                // permanently because of one bad resource.
-                finishRetirement();
+                // The slot is always accounted for: freed when close() returned normally, quarantined
+                // when the outcome is uncertain. One bad resource must never corrupt the accounting.
+                finishRetirement(closedCleanly);
             }
+        }
+
+        if (probeFailure != null) {
+            if (probeFailure instanceof Error error) {
+                throw error;
+            }
+            throw (RuntimeException) probeFailure;
         }
     }
 
-    private void finishRetirement() {
+    /**
+     * Ends one retirement: frees the slot when the close succeeded, or quarantines it when the close
+     * outcome is uncertain.
+     *
+     * <p>This is the single place where a retirement returns capacity, so the two outcomes cannot be
+     * confused. Quarantine deliberately consumes the slot: it may degrade the pool, and that is the safe
+     * direction, because a close exception never proves that the physical connection disappeared.
+     */
+    private void finishRetirement(boolean closedCleanly) {
         lock.lock();
         try {
             retiringCount--;
+            if (!closedCleanly) {
+                quarantinedCount++;
+            }
             capacityChanged.signalAll();
         } finally {
             lock.unlock();
@@ -539,23 +722,31 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
     }
 
     /**
-     * Closes every entry and rethrows the first Error afterwards, without touching the retirement
-     * counter.
+     * Closes every entry, ends each retirement, and rethrows the first Error afterwards.
      *
-     * <p>Used for entries that were reserved as {@code creating} and never entered the idle set, so
-     * their slot is returned by the caller's own accounting rather than by {@code finishRetirement()}.
-     * As with {@link #closeAllAndFinish}, the loop must reach the end of the list before the failure is
-     * reported: stopping at the first Error would leave the remaining resources open forever.
+     * <p>Two properties matter here and both are enforced by construction:
+     *
+     * <ul>
+     *   <li>closing continues to the end of the list - a plain {@code try/finally} around a single close
+     *       would let one failure abandon the remaining resources;</li>
+     *   <li>a resource whose close threw has an UNCERTAIN physical outcome, so its slot is quarantined
+     *       instead of freed. Freeing it would authorise a replacement while the old session or
+     *       connection may still exist, which is exactly how a pool exceeds its configured physical
+     *       hard bound.</li>
+     * </ul>
      */
-    private void closeAll(List<Entry<T>> entries) {
+    private void closeAllAndFinish(List<Entry<T>> entries) {
         Error fatal = null;
         for (Entry<T> entry : entries) {
+            boolean closedCleanly = false;
             try {
-                closeEntry(entry);
+                closedCleanly = attemptClose(entry);
             } catch (Error e) {
                 if (fatal == null) {
                     fatal = e;
                 }
+            } finally {
+                finishRetirement(closedCleanly);
             }
         }
         if (fatal != null) {
@@ -564,28 +755,27 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
     }
 
     /**
-     * Closes every entry, returns each reserved slot, and rethrows the first Error afterwards.
+     * Attempts to close one resource.
      *
-     * <p>A plain {@code try/finally} around a single close is not enough here: it would return the
-     * throwing entry's slot but let the Error abort the loop, leaving the remaining resources open and
-     * their slots reserved forever. Closing must continue to the end of the list, and
-     * {@code finishRetirement()} must run for every entry, before the failure is reported.
+     * @return true only when {@code close()} returned normally, which is the only evidence that the
+     *         physical resource is gone. A thrown exception - or an Error, which propagates - means the
+     *         outcome is uncertain, and the caller must quarantine the slot rather than free it.
      */
-    private void closeAllAndFinish(List<Entry<T>> entries) {
-        Error fatal = null;
-        for (Entry<T> entry : entries) {
-            try {
-                closeEntry(entry);
-            } catch (Error e) {
-                if (fatal == null) {
-                    fatal = e;
-                }
-            } finally {
-                finishRetirement();
-            }
-        }
-        if (fatal != null) {
-            throw fatal;
+    private boolean attemptClose(Entry<T> entry) {
+        closeAttempts.incrementAndGet();
+        try {
+            entry.value.close();
+            closeSuccesses.incrementAndGet();
+            return true;
+        } catch (Exception e) {
+            closeFailures.incrementAndGet();
+            return false;
+        } catch (Error e) {
+            // An Error is still an unsuccessful close, so it is counted as a failure as well as
+            // propagated. Without this, closeAttempts would not equal successes + failures and an
+            // operator could not explain where capacity went.
+            closeFailures.incrementAndGet();
+            throw e;
         }
     }
 
@@ -626,14 +816,19 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
         }
     }
 
-    private Entry<T> newEntry() throws Exception {
+    private Entry<T> newEntry(boolean initial) throws Exception {
         createAttempts.incrementAndGet();
         final T resource;
         try {
             resource = factory.create();
-        } catch (Exception e) {
+        } catch (Throwable failure) {
+            // Every failed creation is counted, including an Error, so that
+            // createAttempts == created + createFailures always holds and capacity loss stays explainable.
             createFailures.incrementAndGet();
-            throw e;
+            if (failure instanceof Error error) {
+                throw error;
+            }
+            throw (Exception) failure;
         }
         if (resource == null) {
             createFailures.incrementAndGet();
@@ -641,21 +836,21 @@ public final class BoundedPool<T extends AutoCloseable> implements AutoCloseable
                     + "' returned null for pool '" + name + "'");
         }
         created.incrementAndGet();
+        // Initial population and replacement creation are different events, so they are counted
+        // separately. Only the CM/JDBC adapter can say whether a creation was a reconnect, so this pool
+        // deliberately publishes no "reconnect" counter.
+        if (initial) {
+            initialCreations.incrementAndGet();
+        } else {
+            replacementCreations.incrementAndGet();
+        }
         return new Entry<>(resource, sequence.incrementAndGet(), System.nanoTime());
     }
 
-    private void closeEntry(Entry<T> entry) {
-        try {
-            entry.value.close();
-        } catch (Exception ignored) {
-            // A resource that refuses to close must not stop retirement of the others.
-        } finally {
-            closedResources.incrementAndGet();
-        }
-    }
-
     private int capacityInUse() {
-        return idle.size() + leasedCount + creatingCount + retiringCount;
+        // Quarantined slots are consumed on purpose: an uncertain close may still hold a physical
+        // session or connection, so its slot must not become available to a replacement.
+        return idle.size() + leasedCount + creatingCount + retiringCount + quarantinedCount;
     }
 
     private void recordWait(long startNanos) {

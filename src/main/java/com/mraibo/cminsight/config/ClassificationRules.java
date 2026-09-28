@@ -58,7 +58,7 @@ public final class ClassificationRules {
         Properties merged = new Properties();
         String origin = "inline configuration";
 
-        Path file = config.find("classifications.file").map(Path::of).orElse(null);
+        Path file = AppPaths.resolve().classificationsFile(config);
         if (file != null) {
             if (Files.isRegularFile(file)) {
                 try (InputStream in = Files.newInputStream(file)) {
