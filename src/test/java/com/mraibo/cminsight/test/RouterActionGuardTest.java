@@ -158,7 +158,7 @@ public class RouterActionGuardTest {
      * itself the assertion for the CM half - and the full set must still expose exactly one public path. A
      * route added later without authentication fails here rather than at review time.
      */
-    public void everyCmRouteIsAuthenticatedAndOnlyHealthIsPublic() {
+    public void everyCmRouteIsAuthenticatedAndOnlyHealthIsPublic() throws Exception {
         Harness harness = new Harness();
 
         for (Route route : harness.router.routes()) {
@@ -171,19 +171,28 @@ public class RouterActionGuardTest {
                 "the CM routes must contribute NO public route: the health endpoint comes from the mandatory"
                         + " set, and nothing else may be reachable without credentials");
 
-        // The composed server: mandatory routes plus the CM ones, as Main installs them.
+        // The composed server, built the way Main builds it. The mandatory routes are installed by start(), so
+        // this binds a loopback ephemeral port and closes it again - the only composition in which "the only
+        // public route is /api/health" is a real statement.
         Router composed = new Router();
-        new WebServer(serverConfig(), authSettings(), composed);
-        new CmApiRoutes(new RepositoryManager(harness.factory),
-                List.of(TestSupport.profile("alpha")), IbmCmAdapterRegistry.discover()).install(composed);
-
-        List<String> publicPaths = composed.routes().stream()
-                .filter(route -> !route.authRequired())
-                .map(Route::path)
-                .toList();
-        Assert.assertEquals(List.of(Router.PUBLIC_PATH), publicPaths,
-                "the only public route in the composed server must be the health endpoint, but the public"
-                        + " set is " + publicPaths);
+        WebServer server = new WebServer(serverConfig(), authSettings(), composed);
+        server.installCmApiRoutes(new RepositoryManager(harness.factory),
+                List.of(TestSupport.profile("alpha")), IbmCmAdapterRegistry.discover());
+        server.start();
+        try {
+            List<String> publicPaths = composed.routes().stream()
+                    .filter(route -> !route.authRequired())
+                    .map(Route::path)
+                    .toList();
+            Assert.assertEquals(List.of(Router.PUBLIC_PATH), publicPaths,
+                    "the only public route in the composed server must be the health endpoint, but the public"
+                            + " set is " + publicPaths);
+            Assert.assertTrue(composed.routes().stream().anyMatch(
+                            route -> CmApiRoutes.REPOSITORIES_PATH.equals(route.path())),
+                    "and the CM routes must be installed alongside the mandatory ones");
+        } finally {
+            server.close();
+        }
     }
 
     /** An unauthenticated guarded POST is refused by authentication, before the guard is even consulted. */
@@ -243,7 +252,7 @@ public class RouterActionGuardTest {
      * <p>No socket is opened: the constructor installs the route table, and that table is what this test
      * reads. The bind is loopback and the port is 0 so nothing can collide with a real listener.
      */
-    private static com.mraibo.cminsight.config.AppConfig serverConfig() {
+    private static AppConfig serverConfig() {
         Properties properties = new Properties();
         properties.setProperty("web.bind", "127.0.0.1");
         properties.setProperty("web.port", "0");
@@ -252,12 +261,12 @@ public class RouterActionGuardTest {
         properties.setProperty("web.auth.maxFailures", "3");
         properties.setProperty("web.auth.lockout", "60s");
         properties.setProperty("web.threads", "4");
-        return com.mraibo.cminsight.config.AppConfig.fromProperties(properties);
+        return AppConfig.fromProperties(properties);
     }
 
-    private static com.mraibo.cminsight.config.WebAuthSettings authSettings() {
-        return com.mraibo.cminsight.config.WebAuthSettings.resolve(serverConfig(),
-                new com.mraibo.cminsight.config.SecretResolver(Map.of(), null));
+    private static WebAuthSettings authSettings() {
+        return WebAuthSettings.resolve(serverConfig(),
+                new SecretResolver(Map.of(), null));
     }
 
     /** A POST with the given query parameters: {@code FakeTransport} takes them at construction. */

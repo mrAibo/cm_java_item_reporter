@@ -256,6 +256,12 @@ OUT_DIR="${ROOT}/target"
 IBM_CLASSES_DIR="${OUT_DIR}/ibm-classes"
 IBM_TEST_CLASSES_DIR="${OUT_DIR}/ibm-test-classes"
 IBM_STUB_CLASSES_DIR="${OUT_DIR}/ibm-stub-classes"
+# Created HERE, immediately, and not as a side effect of a later compile step. target/ is gitignored, so
+# a clean checkout - which is exactly what CI has - does not contain it, and the per-run stub directory
+# is created with `mktemp -d "${OUT_DIR}/..."` BEFORE any of the compile steps below would have created
+# their own output directory. On a developer machine target/ already existed from an earlier run, so the
+# omission was invisible there and failed only in CI, where the directory is absent by definition.
+mkdir -p "${OUT_DIR}"
 MAIN_SRC_DIR="${ROOT}/src/main/java"
 TEST_SRC_DIR="${ROOT}/src/test/java"
 RESOURCES_DIR="${ROOT}/src/main/resources"
