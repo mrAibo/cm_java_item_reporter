@@ -12,6 +12,8 @@
 - **Goal 01C implementation/work commits (the commits this file describes):**
   - `4b844bd18b48a3b09edbeab2b713fa03f9e007f9` - quiescent repository shutdown before switching
   - `dd6a34cb7ba0dacb6f0e1c36bf453c40349e880a` - review-finding fixes (latch, lock scope, states)
+  - `98a97e3dc6aaf97e18b0463760579112f12bbe59` - revert of the F1 lock-scope mitigation and the
+    test-flake fix that hides the regression it caused
 - Stage: **Goal 01C executed, adversarially reviewed and pushed; awaiting architecture review before Goal 02**
 - Runtime target: Java 17 LTS / OpenJDK-compatible
 - Build/deployment: javac + jar + bash; single JVM
@@ -155,7 +157,7 @@ Exact-SHA GitHub Actions (`bootstrap-test`, both events) - all green:
 | `4b844bd` (initial Goal 01C) | `36477237772` success | `36477243761` success |
 | `dd6a34c` (review fixes) | `36479626191` success | `36479635585` success |
 | `26894a4` (STATUS.md only) | `36480132293` **failure** | `36480141960` **failure** |
-| `c1c11b3` (regression fix) | see the final handoff report | see the final handoff report |
+| `98a97e3` (regression fix) | see the final handoff report | see the final handoff report |
 
 The `26894a4` failure is recorded deliberately rather than hidden. A documentation-only commit cannot
 change test behaviour, so its two red runs were the first visible symptom of a REAL regression
