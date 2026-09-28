@@ -122,6 +122,12 @@ Goal 01A runs, observed via the GitHub API:
 | 36441516322 | `093b088` | pull_request | failure — step `Safety guards` |
 | **36441834046** | **`08d4f82`** | **push** | **success — every step green** |
 | 36441839844 | `08d4f82` | pull_request | failure — step `Start` |
+| 36442607233 | `fb25b0b` | push | failure — step `Start` |
+| 36442615936 | `fb25b0b` | pull_request | failure — step `Start` |
+| 36442792506 | `0e1f9d9` | push | failure — step `Start` (first annotations) |
+| 36442798831 | `0e1f9d9` | pull_request | success |
+| 36443162071 | `44bc7c1` | pull_request | success |
+| 36443162071-era | `44bc7c1` | push | failure — step `Start` (decisive annotations) |
 
 Two distinct facts, both recorded honestly:
 
@@ -129,9 +135,29 @@ Two distinct facts, both recorded honestly:
 
 2. **The pre-existing `Start` flake is NOT yet eliminated on Linux, and I could not fully diagnose it.** For the same SHA `08d4f82`, the push run succeeded while the pull_request run failed at `Start` — the runs differ only in runner and timing. Job logs require a token I do not have, so the failing output itself was never read. What I did do: (a) the whole step sequence was replayed locally on a clean `git archive HEAD` checkout with **no `build/` directory**, in the workflow's own order, and every step passed; (b) `bin/start.sh` now requires **three consecutive negative liveness observations** before concluding the process is gone, so a transiently negative answer on the first iteration of a loaded runner can no longer produce a false "exited during startup"; 8/8 local start/stop cycles pass with it. That is a targeted robustness fix, not a diagnosis, and it is not proven to be the CI cause.
 
-Also fixed and pushed in a separate commit: my own new `Safety guards` step was initially red because it (i) ran **before** `./build.sh` while invoking `./bin/cm-insight`, which exits 2 ("build first") when the jar is absent, and (ii) asserted exit 3 for a configuration passed to `--validate-config`, whose contract is 1 (the runtime's is 3). Both are corrected, the guard config now sets a real user so the test isolates the plain-HTTP rule rather than the development-default rule, and the workflow step order is documented in the file.
+Also fixed and pushed: my own new `Safety guards` step was initially red because it (i) ran **before** `./build.sh` while invoking `./bin/cm-insight`, which exits 2 ("build first") when the jar is absent, and (ii) asserted exit 3 for a configuration passed to `--validate-config`, whose contract is 1 (the runtime's is 3). Both are corrected, the guard config now sets a real user so the test isolates the plain-HTTP rule rather than the development-default rule, and the workflow step order is documented in the file.
 
-CI is claimed green only for run `36441834046` above. The pull_request run for the same commit is red, and that is stated rather than averaged away.
+### The unresolved `Start` flake, with the diagnostic evidence I could obtain
+
+Step logs need a token I do not have, so the workflow now emits its failure data as `::error::` **check-run annotations**, which are readable through the API. From the failed `push` run of `44bc7c1`, the annotations report:
+
+    start-diagnostic: log exists, bytes -> 0
+    start-diagnostic: jar -> build/cm-insight.jar (151607 bytes)
+    start-diagnostic: java -> openjdk version "17.0.20.1" 2026-08-18
+    start-diagnostic: our procs -> 3445  0  .../java -Dcminsight.home=/home/runner/work/... \
+        -cp /home/runner/work/.../build/cm-insight.jar com.mraibo.cminsight.app.Main \
+        --config /home/runner/work/.../conf/application.properties
+    start-diagnostic: run dir -> (empty: only . and ..)
+    start-diagnostic: listeners -> (nothing on the configured port)
+
+What that establishes, and what it does not:
+
+- The launcher, the jar, the JDK and the command line are all correct, and the application **is** running with the expected arguments.
+- The application log is **0 bytes** and the process has been alive for **0 seconds** when the diagnostic runs, while `run/` holds no published PID file and nothing is listening yet.
+- Therefore `start.sh` returns 1 **almost immediately after launching**, leaving behind a JVM that has not yet written its first line or bound its socket. The failing message on the earlier pre-01A commit was the `RECYCLED` branch ("PID ... was reused by a different process ... the application exited before writing anything to the log"), which is the same shape: the wait loop concludes failure while the process is still starting.
+- I could NOT determine which of the loop's exit paths fires, because I cannot read the step's stdout. The three-strike grace period added in `fb25b0b` did not eliminate it, so the "single transient negative observation" hypothesis is **disproven**.
+
+Honest status: CI is **not reliably green** on this branch, on either event, and it was already unreliable before Goal 01A (`b6efa75` and `eb49b56` push runs both red at `Start`). Goal 01A measurably reduces the local failure rate (2/10 → 0/10 on Windows) and produced one fully green push run, but the Linux `Start` step still fails intermittently. The next session should read the `Start` step log directly (with a token) using the annotations above as the starting point, and treat this as an open CI-reliability defect rather than a closed one.
 
 ## Unresolved risks and accepted limitations
 
