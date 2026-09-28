@@ -35,6 +35,14 @@ import java.nio.file.Path;
  * presents a chosen service descriptor over the application classpath, which is exactly how the real lookup
  * sees the world: the verdict is decided by what
  * {@code META-INF/services/com.mraibo.cminsight.ibm.CmAdapterProvider} contains.
+ *
+ * <h2>Why this suite needs no adapter on its class path</h2>
+ *
+ * <p>It asserts the registry's DECISION, which is a pure function of the descriptors it finds, so every case
+ * supplies its own descriptor. The complementary property - that this build's own registration is present and
+ * resolves to the IBM provider - needs the adapter's classes and therefore lives in {@code src/ibm-test},
+ * where the class path carries them: {@code IbmProviderRegistrationTest}. Keeping the two apart is what lets
+ * this suite run inside the core suite, which is deliberately adapter-free.
  */
 public class ProviderDiscoveryTest {
 
@@ -43,34 +51,8 @@ public class ProviderDiscoveryTest {
             "META-INF/services/" + CmAdapterProvider.class.getName();
 
     /**
-     * The shipped build has exactly one provider, and it is the IBM adapter.
-     *
-     * <p>Asserted against the real classpath rather than a fake, because "one provider is installed" is the
-     * production configuration the rest of the runtime is written for: the build packages the adapter's
-     * classes AND its service descriptor into the same jar, and a descriptor missing from the jar would make
-     * every repository silently unactivatable.
+     * No provider registered is ABSENT, and nothing may be activated through it.
      */
-    public void thePackagedBuildDiscoversExactlyOneUsableProvider() {
-        IbmCmAdapterRegistry registry = IbmCmAdapterRegistry.discover();
-
-        Assert.assertEquals(IbmCmAdapterRegistry.Availability.AVAILABLE, registry.status().availability(),
-                "this build packages one CM adapter provider, so discovery must report AVAILABLE; anything"
-                        + " else means the service descriptor is missing from the jar and every repository is"
-                        + " unactivatable. Status: " + registry.status().describe());
-        Assert.assertTrue(registry.provider().isPresent(),
-                "an AVAILABLE verdict must carry the provider, since every activation goes through it");
-        Assert.assertTrue(registry.status().available(), "and the status agrees");
-        Assert.assertFalse(registry.status().refused(),
-                "a discovered provider must not be reported as refused");
-        Assert.assertFalse(registry.status().providerId().isBlank(),
-                "the provider id is published so diagnostics can name the adapter");
-        Assert.assertFalse(registry.status().adapterVersion().isBlank(),
-                "and its build version");
-        Assert.assertFalse(registry.status().describe().isBlank(),
-                "and a value-free description exists for the operator");
-    }
-
-    /** No provider registered is ABSENT, and nothing may be activated through it. */
     public void noProviderRegisteredIsAbsentAndActivatesNothing() throws IOException {
         IbmCmAdapterRegistry registry = IbmCmAdapterRegistry.discover(isolatedLoaderWith(""));
 

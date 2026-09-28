@@ -3,6 +3,7 @@ package com.mraibo.cminsight.ibmtest;
 import com.mraibo.cminsight.ibm.internal.IbmCmSessionFactoryVerdictTest;
 import com.mraibo.cminsight.ibm.internal.IbmCleanupVerdictTest;
 import com.mraibo.cminsight.ibm.internal.IbmMappingRulesTest;
+import com.mraibo.cminsight.ibm.internal.IbmProviderRegistrationTest;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -57,6 +58,7 @@ public final class IbmAdapterTest {
 
     /** Every IBM adapter suite. Order is explicit so successive runs print identical output. */
     private static final List<Class<?>> TEST_CLASSES = List.of(
+            IbmProviderRegistrationTest.class,
             IbmCmSessionFactoryVerdictTest.class,
             IbmCleanupVerdictTest.class,
             IbmMappingRulesTest.class);
