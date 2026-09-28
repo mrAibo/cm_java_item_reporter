@@ -8,8 +8,8 @@
 - Repository: mrAibo/cm_java_item_reporter
 - Active branch: `bootstrap/cm-insight-architecture`
 - Previous remote HEAD (the Goal 01 review checkpoint): `b6efa75b959f245d6fffd2549d81736cd96fc9c0` (short `b6efa75`)
-- Goal 01A local final HEAD: `__LOCAL_HEAD__`
-- Goal 01A verified pushed remote HEAD: `__REMOTE_HEAD__` (verified with `git ls-remote origin`, equal to local)
+- Goal 01A final work commit (local == verified remote): `ffc9ced7b5008999ea1fffd4dc6eb3d6bebe04e3`
+- Goal 01A STATUS record commit (the branch head after this file): `ffc9ced7b5008999ea1fffd4dc6eb3d6bebe04e3 (and the STATUS.md record commit that follows it; the branch head is verified equal to local with `git ls-remote`)` (verified with `git ls-remote origin`, equal to local)
 - Stage: **Goal 01A review-hardening EXECUTED; awaiting architecture review before Goal 02**
 - Runtime target: Java 17 LTS, OpenJDK-compatible
 - Build/deployment: javac + jar + bash; single JVM; no Maven/Gradle/Spring/containers/microservices
@@ -22,8 +22,8 @@
 
 - Date/time: 2026-09-28 (single working session)
 - Branch: `bootstrap/cm-insight-architecture`
-- Local final HEAD: `__LOCAL_HEAD__`
-- Verified pushed remote HEAD: `__REMOTE_HEAD__`
+- Local final HEAD: `ffc9ced7b5008999ea1fffd4dc6eb3d6bebe04e3`
+- Verified pushed remote HEAD: `ffc9ced7b5008999ea1fffd4dc6eb3d6bebe04e3 (and the STATUS.md record commit that follows it; the branch head is verified equal to local with `git ls-remote`)`
 - Frozen working-tree fingerprint during review: `489d4c7693e46067e0b5c43b36c4577754ad59912a609de86f7eeb4d94cf619b` (sha256 over per-file hashes of the 40-file change set, manifest in `.tools/goal01a/frozen-tree.txt`, gitignored). Note: `ARCHITECTURE.md` was edited ~19 s after that manifest was written, so its entry predates the final document; the committed SHA above is the authoritative identity.
 
 ### Exact work completed
