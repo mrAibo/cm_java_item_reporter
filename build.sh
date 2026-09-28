@@ -280,6 +280,19 @@ else
   IBM_CP_KIND="none"
 fi
 
+# The stubs are Java SOURCES, so they are useless on a class path until they are
+# compiled. Compiling them into their own directory does three things at once:
+# it makes the stub set a real class path entry, it fails on a stub that does not
+# itself compile (which would otherwise look like the adapter being broken), and
+# it keeps the stubs out of build/classes and out of the packaged jar by
+# construction rather than by a copy step somebody has to remember.
+IBM_STUB_CLASSES_DIR="${BUILD_DIR}/ibm-stub-classes"
+STUB_SOURCES=()
+if [ -d "${IBM_STUB_DIR}" ]; then
+  while IFS= read -r -d '' file; do STUB_SOURCES+=("${file}"); done \
+    < <(find "${IBM_STUB_DIR}" -type f -name '*.java' -print0 2>/dev/null)
+fi
+
 if [ "${REQUIRE_IBM}" = true ] && [ "${IBM_CP_KIND}" != "real" ]; then
   fail "IBM support was required (--require-ibm) but no IBM SDK jar was found in ${ROOT}/lib/ibm. Vendor JARs are never downloaded or committed, so place the IBM CM 8.7 SDK jars there (see lib/README.md) or drop --require-ibm to build the core runtime only."
 fi
@@ -349,6 +362,30 @@ if [ "${#IBM_MAIN_SOURCES[@]}" -gt 0 ]; then
   if [ "${IBM_CP_KIND}" = "none" ]; then
     fail "src/ibm/java exists but there is no IBM SDK to compile it against: lib/ibm has no jar and ${IBM_STUB_DIR} is missing. Place the IBM CM 8.7 SDK jars in lib/ibm (see lib/README.md), or remove src/ibm/java for a core-only build."
   fi
+
+  if [ "${IBM_CP_KIND}" = "stubs" ]; then
+    if [ "${#STUB_SOURCES[@]}" -eq 0 ]; then
+      fail "${IBM_STUB_DIR} contains no .java file, so src/ibm/java has nothing to compile against. Restore the test-only stubs (see tests/ibm-stubs/README.md) or place the real SDK jars in lib/ibm."
+    fi
+    rm -rf "${IBM_STUB_CLASSES_DIR}"
+    mkdir -p "${IBM_STUB_CLASSES_DIR}"
+    log_ok "compiling ${#STUB_SOURCES[@]} IBM stub source file(s) into ${IBM_STUB_CLASSES_DIR} (test-only; never packaged)"
+    "${JAVAC}" --release 17 -encoding UTF-8 -Xlint:all -d "${IBM_STUB_CLASSES_DIR}" "${STUB_SOURCES[@]}"
+
+    # Pin the stubs to their committed expectation. This is what stops a stub being
+    # quietly widened or renamed into an API that does not exist: the failure would
+    # otherwise surface only on a machine that owns the proprietary JAR.
+    if [ -x "${IBM_STUB_DIR}/check-signatures.sh" ]; then
+      log_ok "checking the stub signatures against tests/ibm-stubs/EXPECTED_SIGNATURES.txt"
+      if ! bash "${IBM_STUB_DIR}/check-signatures.sh" --classes "${IBM_STUB_CLASSES_DIR}"; then
+        fail "the IBM compile stubs no longer match tests/ibm-stubs/EXPECTED_SIGNATURES.txt. The stubs must mirror the real IBM CM 8.7 SDK; if the change was deliberate, re-run tests/ibm-stubs/check-signatures.sh --write and commit the result."
+      fi
+    else
+      fail "${IBM_STUB_DIR}/check-signatures.sh is missing or not executable; the stubs cannot be pinned to the committed expectation and a drifted stub would go unnoticed."
+    fi
+    IBM_CP="${IBM_STUB_CLASSES_DIR}"
+  fi
+
   mkdir -p "${IBM_CLASSES_DIR}"
   IBM_JAVAC_ARGS=(--release 17 -encoding UTF-8 -Xlint:all -d "${IBM_CLASSES_DIR}")
   IBM_JAVAC_ARGS+=(-cp "${CLASSES_DIR}${CP_SEP}${IBM_CP}")

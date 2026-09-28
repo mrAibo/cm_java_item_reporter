@@ -1,5 +1,6 @@
 package com.mraibo.cminsight.test;
 
+import com.mraibo.cminsight.connection.CreationFailure;
 import com.mraibo.cminsight.connection.ResourceFactory;
 
 import java.io.IOException;
@@ -27,6 +28,9 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
     private final AtomicInteger creations = new AtomicInteger();
     private final AtomicInteger failures = new AtomicInteger();
     private final AtomicInteger failNextCreates = new AtomicInteger();
+    private final AtomicInteger failNextAfterAllocation = new AtomicInteger();
+    private final AtomicInteger leakedFailures = new AtomicInteger();
+    private volatile boolean failAfterAllocationCleanupProven;
     private final List<FakeResource> created = Collections.synchronizedList(new ArrayList<>());
     private final List<FakeResource> closed = Collections.synchronizedList(new ArrayList<>());
     private volatile CountDownLatch closeGate;
@@ -36,6 +40,11 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
     private volatile CountDownLatch createEntered;
     private volatile Error healthError;
 
+    /** Live resources a fail-after-allocation attempt leaked, for the test to assert on. */
+    int leakedFailures() {
+        return leakedFailures.get();
+    }
+
     @Override
     public FakeResource create() throws Exception {
         creations.incrementAndGet();
@@ -44,10 +53,34 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
             failures.incrementAndGet();
             throw new IOException("simulated resource creation failure");
         }
+
+        // Allocate FIRST, then decide whether to fail. A resource created on this path is recorded by
+        // live/peak/created exactly like a successful one, so a test can prove that the pool kept the
+        // slot consumed while the resource was still alive.
         FakeResource resource = new FakeResource(sequence.incrementAndGet(), this);
         created.add(resource);
         int now = live.incrementAndGet();
         peak.accumulateAndGet(now, Math::max);
+
+        int failingAfterAllocation =
+                failNextAfterAllocation.getAndUpdate(remaining -> Math.max(0, remaining - 1));
+        if (failingAfterAllocation > 0) {
+            failures.incrementAndGet();
+            leakedFailures.incrementAndGet();
+            boolean proven = failAfterAllocationCleanupProven;
+            if (proven) {
+                // The factory really did release what it allocated: the live count drops, so releasing
+                // the reserved slot is honest.
+                resource.close();
+            }
+            // Deliberately NOT counted by onClose() when unproven: the resource stays live, which is
+            // what "the physical outcome is unknown" means for this fake.
+            throw new CreationFailure(
+                    proven ? CreationFailure.Cleanup.PROVEN_CLEAN : CreationFailure.Cleanup.UNPROVEN,
+                    "simulated failure after allocation (cleanup "
+                            + (proven ? "proven clean" : "unproven") + ")");
+        }
+
         awaitCreateGate();
         return resource;
     }
@@ -82,6 +115,26 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
     /** Makes the next {@code count} creation attempts fail. */
     void failNextCreates(int count) {
         failNextCreates.set(count);
+    }
+
+    /**
+     * Makes the next {@code count} creation attempts fail AFTER allocating a resource, reporting the
+     * cleanup as unproven.
+     *
+     * <p>This is the shape Goal 02 section C exists for, and the shape {@link #failNextCreates(int)}
+     * cannot express: that one throws before {@code new FakeResource(...)}, so nothing was ever
+     * allocated and releasing the reserved slot is genuinely correct. Here the resource IS allocated -
+     * {@code live}, {@code peak} and {@code created} all record it - and the failure then reports
+     * {@link CreationFailure.Cleanup#UNPROVEN}, which obliges the pool to QUARANTINE the slot rather than
+     * free it. {@code liveCount()} therefore stays raised, and that is the point: a pool that released
+     * the slot would hand out capacity for a resource that is demonstrably still alive.
+     *
+     * @param count          how many attempts fail this way
+     * @param cleanupProven  true to report a proven-clean cleanup instead, which must release the slot
+     */
+    void failNextCreatesAfterAllocation(int count, boolean cleanupProven) {
+        failNextAfterAllocation.set(count);
+        failAfterAllocationCleanupProven = cleanupProven;
     }
 
     /**

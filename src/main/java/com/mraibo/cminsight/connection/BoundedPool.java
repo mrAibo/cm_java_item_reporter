@@ -228,8 +228,7 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
 
         List<Entry<T>> entries = new ArrayList<>(size);
         // A creation attempt that rolled the pool back with an UNPROVEN cleanup keeps its reserved slot
-        // quarantined instead of being released, and the reservation it used must therefore not be part
-        // of the blanket rollback below.
+        // quarantined instead of being released.
         boolean unprovenCreation = false;
         try {
             for (int i = 0; i < size; i++) {
@@ -238,22 +237,30 @@ public final class BoundedPool<T extends AutoCloseable> implements CloseOutcomeA
         } catch (Throwable failure) {
             // Roll back completely, whatever went wrong.
             //
+            // Reservations: initialize() reserved `size` slots in one step, and newEntry() consumes
+            // exactly one of them per attempt. So when the loop aborts, the outstanding reservations are
+            // the FAILING attempt plus every attempt that never started - `size - entries.size()` in
+            // total. Both have to be resolved here, because nothing else ever will: the failed attempt is
+            // not in `entries` (the pool never received its resource) and the never-started ones have no
+            // object at all. Releasing only the failing attempt leaves a phantom in-flight creation per
+            // never-started slot, which permanently loses capacity AND makes an untouched pool report
+            // itself as still creating.
+            //
             // The reservation moves from `creating` to `retiring` BEFORE anything is closed, so every
             // entry that was actually created finishes through the normal retirement path: its slot is
             // freed only when close() returned normally, and quarantined when the outcome is uncertain.
             // Decrementing creatingCount while closing would free capacity for resources that may still
             // exist.
             //
-            // The attempt that FAILED is not in `entries` - the pool never received its resource - so its
-            // own reservation is resolved here. It is released only when the failure proved that nothing
-            // was left behind; an unproven cleanup is quarantined so no replacement can be created while
-            // the physical resource may still exist.
+            // The failing attempt's own slot is released only when the failure proved that nothing was
+            // left behind; an unproven cleanup is quarantined, so no replacement can be created while the
+            // physical resource may still exist.
             unprovenCreation = quarantineUnprovenCreation(failure);
             lock.lock();
             try {
-                if (!unprovenCreation) {
-                    creatingCount--;
-                }
+                int outstandingReservations = size - entries.size();
+                int released = unprovenCreation ? outstandingReservations - 1 : outstandingReservations;
+                creatingCount -= released;
                 creatingCount -= entries.size();
                 retiringCount += entries.size();
                 initialized = false;

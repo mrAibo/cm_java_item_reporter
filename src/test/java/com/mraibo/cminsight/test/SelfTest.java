@@ -49,6 +49,7 @@ public final class SelfTest {
             BoundedPoolTest.class,
             BoundedPoolLifecycleTest.class,
             BoundedPoolHardeningTest.class,
+            UncertainCreationTest.class,
             RepositoryManagerTest.class,
             RepositoryClosePropagationTest.class,
             RepositorySwitchQuiescenceTest.class,

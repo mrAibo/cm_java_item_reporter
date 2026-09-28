@@ -74,6 +74,39 @@ STUB_DIR="${ROOT}/tests/ibm-stubs"
 # of these - commitCount, addItemTypeView, deleteExpiredItemsMaximumRows - is
 # not a false positive. Every entry is a real member of DKPolicyMgmtICM,
 # DKItemTypeDefICM, DKDatastoreICM or DKDatastoreDefICM according to javap.
+#
+# WHY THE COLLECTION-SHAPED NAMES ARE NOT HERE AT ALL - not `add`, `remove`,
+# `update`, `delete`, `del` (which DKPolicyMgmtICM really does expose) and not
+# `set*` (which DKItemTypeDefICM really does expose):
+#
+# every one of them is also an ordinary java.util or primitive-wrapper method, so
+# matching by name alone refuses the adapter's own bookkeeping. Measured, on a
+# file whose entire content was local collections:
+#
+#   List.add / List.remove / Map.remove / Map.put / List.clear   -> 5 refusals
+#   AtomicBoolean.set / List.set                                 -> 2 refusals
+#
+# A guard that cannot pass is a guard that gets disabled, so the receiver
+# cannot be left out of it. And the receiver cannot be guessed either: the
+# adapter legitimately holds `List<String>`, `Map<...>`, `AtomicBoolean`,
+# `AtomicLong` and `Optional` locals, so any receiver allow-list would be both
+# long and wrong the first time somebody adds a field.
+#
+# Those members are excluded STRUCTURALLY instead, one layer earlier, and it is a
+# stronger guarantee than a text scan: tests/ibm-stubs deliberately declares ONLY
+# the read-only getters on DKItemTypeDefICM, DKRetentionPolicyDefICM and
+# DKPolicyMgmtICM. A call to `policy.add(...)`, `itemType.update()` or
+# `itemType.setName(...)` therefore does not compile against the stubs at all.
+# build.sh compiles the stubs and pins them against
+# tests/ibm-stubs/EXPECTED_SIGNATURES.txt, so the omission is audited rather than
+# assumed, and it cannot be defeated by a receiver name this file failed to
+# predict.
+#
+# What remains here is the set of names that are IBM-specific and unambiguous:
+# nothing in the JDK or in the adapter's own code is called `checkIn`, `reorg` or
+# `changePassword`. Each is anchored on the call parenthesis, so a getter that
+# merely resembles one of them - commitCount, deleteExpiredItemsMaximumRows,
+# addItemTypeView - is not a refusal.
 # ---------------------------------------------------------------------------
 FORBIDDEN_CALL_PATTERNS=(
   'commit[[:space:]]*\('
@@ -91,11 +124,6 @@ FORBIDDEN_CALL_PATTERNS=(
   'clearCache[[:space:]]*\('
   'assign[[:space:]]*\('
   'unassign[[:space:]]*\('
-  '\.[[:space:]]*update[[:space:]]*\('
-  '\.[[:space:]]*delete[[:space:]]*\('
-  '\.[[:space:]]*del[[:space:]]*\('
-  '\.[[:space:]]*remove[[:space:]]*\('
-  '\.[[:space:]]*add[[:space:]]*\('
 )
 
 # The one file allowed to mention a com.ibm type in a comment under src/main/java.
