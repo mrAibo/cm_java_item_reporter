@@ -1,59 +1,144 @@
 # Project Status
 
-> This file is the canonical cross-session checkpoint. Update it at the end of every substantial implementation goal and before handing work to another chat/model.
+> Canonical cross-session checkpoint. Read this first when continuing in another chat/model. Update it at the end of every substantial goal.
 
-## Project
+## Project state
 
-- Name: CM Insight
+- Project: CM Insight
 - Repository: mrAibo/cm_java_item_reporter
-- Stage: Bootstrap / architecture
 - Active branch: bootstrap/cm-insight-architecture
-- Last known commit: to be filled after bootstrap commit
-- Runtime target: Java 17 LTS OpenJDK-compatible
-- Build model: javac + jar + bash
-- Product mode: read-only V1/V2
+- Stage: Bootstrap complete; ready for Harness Goal 01
+- Runtime target: Java 17 LTS, OpenJDK-compatible
+- Build/deployment: javac + jar + bash; single JVM
+- Product safety mode: read-only V1/V2
+- Last completed bootstrap implementation commit: da297e1eb46cace2983e06272a43a3b528a11fe9
+- This STATUS.md update is the checkpoint commit immediately after that implementation commit; on resume confirm actual HEAD with git log -1.
 
-## Completed
+## Completed architecture work
 
-- Requirements discussion completed.
-- Existing CM_Item_Reporter reviewed for UI/statistics ideas.
-- Existing CM_Migrator reviewed for connection pooling, concurrency and operational lifecycle ideas.
-- Existing CM_retention reviewed for retention API and DB2/Oracle root mapping ideas.
-- Architecture decisions captured in repository documentation.
-- Decision: hard-bounded pools; no emergency connections.
-- Decision: IBM CM API for metadata/retention, JDBC fast path for aggregate statistics.
-- Decision: retention viewer in V1; retention administration later and disabled by default.
-- Decision: Versions and Parts are explicit research gates; no guessed SQL.
+- Reviewed CM_Item_Reporter for ItemType statistics and UI ideas.
+- Reviewed CM_Migrator for DKDatastoreICM connection reuse, pooling, concurrency, lifecycle and diagnostics.
+- Reviewed CM_retention for working ItemType/retention API usage and DB2/Oracle physical-root mapping.
+- Chosen product direction: CM Insight, a modular CM administration/analytics console rather than a narrow reporter rewrite.
+- Chosen Java 17/OpenJDK-compatible runtime.
+- Fixed no-Maven/no-Gradle/no-Spring/no-container/no-microservice constraint.
+- Fixed DB2 + Oracle requirement.
+- Fixed hard-bounded connection policy; no emergency connections.
+- Fixed IBM Java API for metadata/retention plus JDBC fast path for heavy aggregates.
+- Fixed one selected active repository context at a time.
+- Fixed retention viewer for V1 and retention administration as a later disabled-by-default module.
+- Fixed configurable classification rules instead of hard-coded SAP/NON-SAP.
+- Fixed Versions and Parts as research gates: no guessed SQL.
 
-## Current implementation state
+## Bootstrap files created
 
-Bootstrap files are being created. No production IBM CM adapter or JDBC statistics implementation exists yet.
+Architecture/documentation:
 
-## Next goal
+- README.md
+- VISION.md
+- REQUIREMENTS.md
+- ARCHITECTURE.md
+- DATA_MODEL.md
+- SECURITY.md
+- IMPLEMENTATION_PLAN.md
+- DEEPSEEK_HARNESS_PLAN.md
+- STATUS.md
 
-Implement and validate the dependency-free core runtime skeleton, then execute Harness Goal 01.
+Configuration examples:
 
-## Open technical questions
+- conf/application.properties.example
+- conf/profiles/example-db2.properties.example
+- conf/profiles/example-oracle.properties.example
+- conf/classifications.properties.example
+- lib/README.md
 
-1. Verify exact logical-item aggregate SQL on DB2 and Oracle.
-2. Define and verify Versions semantics.
-3. Define and verify Parts semantics.
-4. Decide exact persistent history implementation once approved local libraries are available.
-5. Benchmark safe production parallelism on a representative Library Server.
+Operational lifecycle:
 
-## Handoff protocol
+- build.sh
+- bin/compile.sh
+- bin/cm-insight
+- bin/start.sh
+- bin/stop.sh
+- bin/restart.sh
+- bin/status.sh
+- bin/doctor.sh
+- bin/clean.sh
+- tests/selftest.sh
 
-When resuming in another session:
+Java bootstrap:
 
-1. Read this file.
-2. Read ARCHITECTURE.md and IMPLEMENTATION_PLAN.md.
-3. Inspect git status/log and confirm Last known commit.
-4. Do not repeat completed architecture work.
-5. Continue from Next goal.
-6. Before stopping, update this file with:
-   - branch and commit
-   - completed work
-   - tests/build results
-   - unresolved failures
-   - next exact goal
-   - any architecture decision changed with user approval
+- AppConfig and repository/domain DTOs
+- generic hard-bounded BoundedPool + Lease + metrics
+- IBM-independent CmSession boundary
+- DB2/Oracle dialect skeletons
+- ItemType/Statistics/Retention DTOs
+- RepositoryContext skeleton
+- fail-closed web exposure policy
+- Basic Auth wrapper
+- embedded JDK HttpServer
+- offline bootstrap page
+- dependency-free SelfTest
+
+Harness:
+
+- harness/MASTER_GOAL.md
+- GOAL_01_CORE_RUNTIME.md
+- GOAL_02_IBM_CM_RETENTION.md
+- GOAL_03_FAST_ANALYTICS.md
+- GOAL_04_CACHE_REPORTS_UI.md
+- GOAL_05_VERSIONS_PARTS_RESEARCH.md
+
+CI:
+
+- .github/workflows/bootstrap-test.yml
+- Intended gate: Java 17 build -> self-test -> doctor -> start -> status/health -> stop.
+
+## Validation status
+
+- GitHub commits and branch creation succeeded.
+- A local git clone/build could not be executed from the current assistant container because that environment could not resolve github.com.
+- The bootstrap CI workflow was committed, but no workflow run was visible immediately after the push. Do not claim CI passed until a run is actually observed.
+- No IBM CM live test has been performed for this new project yet.
+- No DB2/Oracle live statistics query has been performed yet.
+- Proprietary IBM/Oracle JARs were intentionally not committed.
+
+## Current limitations
+
+- RepositoryProfileLoader and RepositoryManager are not implemented yet.
+- Generic BoundedPool is a bootstrap implementation and still needs the Goal 01 concurrency hardening/review.
+- IBM DKDatastoreICM adapter is not implemented yet.
+- Retention viewer business implementation is not implemented yet.
+- JDBC pools/root resolver/statistics are not implemented yet.
+- Cache/history/reports are not implemented yet.
+- Current Web UI is only a bootstrap landing page.
+- Versions/Parts remain deliberately unavailable until verified.
+
+## Exact next goal
+
+Execute:
+
+1. harness/MASTER_GOAL.md
+2. harness/GOAL_01_CORE_RUNTIME.md
+
+Goal 01 should use subagents for concurrency/pool review, security/config review, and independent tests/reliability review, with the lead agent integrating all changes.
+
+## Resume instruction for a new session
+
+Use this prompt:
+
+"Continue the CM Insight project in mrAibo/cm_java_item_reporter. Read STATUS.md first, then README.md, ARCHITECTURE.md, REQUIREMENTS.md, DATA_MODEL.md, SECURITY.md, IMPLEMENTATION_PLAN.md, DEEPSEEK_HARNESS_PLAN.md and harness/MASTER_GOAL.md. Confirm the current branch/HEAD and do not redo completed bootstrap work. Continue from the Exact next goal in STATUS.md. Keep the architecture fixed unless I explicitly approve a change. At the end, build/test what is actually available, commit coherent changes, and update STATUS.md with the exact checkpoint."
+
+## Mandatory checkpoint rule
+
+At the end of every substantial goal update this file with:
+
+- date/time
+- branch and verified HEAD/commit reference
+- exact work completed
+- major files changed
+- commands/tests actually run and their results
+- live IBM/DB tests actually run or explicitly not run
+- unresolved failures and risks
+- architecture changes only when user-approved
+- exact next goal
+- a copy/paste resume instruction
