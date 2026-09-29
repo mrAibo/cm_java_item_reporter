@@ -23,20 +23,26 @@
 
 ## ItemTypeStatistics
 
+One ItemType's result inside one snapshot (implemented record; every metric is a `MetricValue`).
+
 - repositoryId
+- itemTypeId (integer, for cross-referencing the metadata list)
 - itemTypeName
-- capturedAt
-- totalLogicalItems
-- createdToday
-- createdLast7Days
-- createdLast30Days
-- createdCurrentYear
-- versions: unavailable until verified
-- parts: unavailable until verified
+- businessClassification (the label already present in metadata; totals are grouped by it)
+- scanStartedAt, capturedAt
+- logicalItems: distinct `ItemID` total
+- createdToday, createdLast7Days, createdLast30Days, createdCurrentYear
+- versions: always `UNAVAILABLE` in this goal
+- parts: always `UNAVAILABLE` in this goal
 - durationMs
-- source
-- status
-- errorMessage
+- source (for example `jdbc`)
+- status: `OK`, `PARTIAL` or `ERROR` - DERIVED from the metrics, never asserted by a producer
+- errorMessage: sanitised failure text, or an empty string
+
+`MetricValue` has exactly three states and only one of them carries a number: `AVAILABLE(value)`,
+`UNAVAILABLE` and `ERROR`. An unavailable or failed metric can never carry a value, so a count nobody
+measured cannot be rendered as `0`. A PARTIAL ItemType is one whose total was measured but whose window
+boundaries were not representable.
 
 ## RetentionPolicyInfo
 
@@ -51,13 +57,36 @@
 
 ## StatisticsSnapshot
 
+One completed scan's result: immutable, self-consistent, published atomically or not at all. While a scan
+runs the previous completed snapshot stays visible; a cancelled, timed-out or catastrophic scan publishes
+nothing and never replaces it with a half-built object.
+
 - repositoryId
-- capturedAt
-- scanStartedAt
-- scanDurationMs
-- perItemType
-- totals
-- partialFailureCount
+- scanId (monotonic per repository context)
+- capturedAt, scanStartedAt, scanDurationMs
+- anchorDate: the single database current date every window of this snapshot was anchored on
+- perItemType: one `ItemTypeStatistics` per frozen ItemType, in the frozen order
+- totals: `StatisticsTotals`, grouped by the metadata business classification
+- coverage: `StatisticsCoverage` - how much of the frozen list is accounted for, and how completely
+- partialFailureCount: ItemTypes that were not measured completely
+
+`StatisticsTotals` carries `logicalItemsTotal` (the sum over the ItemTypes that were measured), the four
+coverage counts (`countedItemTypes`, `availableItemTypes`, `partialItemTypes`, `errorItemTypes`),
+`complete`, and `byBusinessClassification` (`ClassificationTotals` per label). A total therefore always
+travels with the coverage that qualifies it: a subtotal over the ItemTypes that happened to succeed is
+never presented as the complete total for the frozen list, and a failed ItemType contributes nothing rather
+than zero.
+
+### The API's published shape
+
+`GET /api/statistics` publishes this read model through a value-free port (`web.AnalyticsApi`) rather than
+the records above directly, so a field that is not declared in the port cannot appear in a response. The
+JSON carries the analytics state and its reason, the active repository id, the scan block (running, phase,
+started/finished, duration, total/completed/failed, rate, current ItemType, failure reason), the snapshot
+with `capturedAt`/`ageMillis`, the coverage block, the totals with their classification groups, and one
+object per ItemType whose metrics are `{"available":true,"state":"AVAILABLE","value":N}` or
+`{"available":false,"state":"UNAVAILABLE","value":null,...}`. There is no staleness threshold: the age is
+reported, not judged.
 
 ## Fixed counting semantics
 

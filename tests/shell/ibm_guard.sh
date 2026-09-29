@@ -129,10 +129,34 @@ FORBIDDEN_CALL_PATTERNS=(
 # The one file allowed to mention a com.ibm type in a comment under src/main/java.
 ISOLATION_ALLOWED_RELATIVE="src/main/java/com/mraibo/cminsight/connection/CmSession.java"
 
+# ---------------------------------------------------------------------------
+# The DB2 driver class NAME is a deliberate exception, and it is narrower than an
+# allow-listed file.
+#
+# Goal 03 needs local, offline JDBC driver discovery, and the DB2 universal JDBC
+# driver's class name is literally `com.ibm.db2.jcc.DB2Driver`. That is not the
+# IBM CM SDK: this repository compiles against no DB2 jar, the name is only ever a
+# String passed to Class.forName, and the driver ships separately in lib/db2 or is
+# absent entirely. The CM-SDK isolation rule exists to stop core code from
+# DEPENDING on com.ibm types; a reflective driver name is not such a dependency,
+# and a rule that forbids it forbids the correct implementation.
+#
+# So the exemption is scoped to THIS NAME rather than to a file. Stating it here
+# means the `--list` output and this comment are the one place the exception is
+# visible, and it cannot quietly widen: any other com.ibm reference anywhere under
+# src/main/java, in the same file or another, is still a violation.
+#
+# The alternative - allowing the whole file - is rejected on purpose. An
+# allow-listed file is an escape hatch: the next person to edit it could add a real
+# SDK reference and the guard would stay silent, which is exactly the failure mode
+# this guard exists to prevent.
+ISOLATION_ALLOWED_REFERENCE='com\.ibm\.db2\.jcc\.DB2Driver'
+
 if [ "${LIST_ONLY}" = true ]; then
   printf 'forbidden call patterns (src/ibm/java):\n'
   for pattern in "${FORBIDDEN_CALL_PATTERNS[@]}"; do printf '  %s\n' "${pattern}"; done
   printf 'isolation allow-list (src/main/java):\n  %s\n' "${ISOLATION_ALLOWED_RELATIVE}"
+  printf 'isolation allowed reference (driver class name only):\n  %s\n' "${ISOLATION_ALLOWED_REFERENCE}"
   exit 0
 fi
 
@@ -201,6 +225,19 @@ while IFS= read -r line; do
     # second allowance cannot appear without this line being edited too.
     printf 'OK: allow-listed comment reference in %s\n' "${relative}"
     continue
+  fi
+  # Report only the com.ibm references that are NOT the allowed driver class name.
+  # Matching is done against the reference itself, so the exemption cannot be
+  # satisfied by a file name and cannot cover a different com.ibm type.
+  # `grep -n` output is <path>:<line>:<content>, so drop the first two fields.
+  content="${line#*:}"
+  content="${content#*:}"
+  if printf '%s\n' "${content}" | grep -Eq "${ISOLATION_ALLOWED_REFERENCE}"; then
+    remaining="$(printf '%s\n' "${content}" | sed -E "s/${ISOLATION_ALLOWED_REFERENCE}//g")"
+    if ! printf '%s\n' "${remaining}" | grep -Eq 'com\.ibm\.'; then
+      printf 'OK: allowed JDBC driver class name in %s\n' "${relative}"
+      continue
+    fi
   fi
   printf 'ERROR: com.ibm reference in the IBM-independent core: %s\n' "${line}" >&2
   violations=$((violations + 1))

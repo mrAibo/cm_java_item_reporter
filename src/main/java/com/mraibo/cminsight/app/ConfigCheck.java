@@ -9,6 +9,9 @@ import com.mraibo.cminsight.config.RepositoryProfileLoader;
 import com.mraibo.cminsight.config.SecretRef;
 import com.mraibo.cminsight.config.SecretResolver;
 import com.mraibo.cminsight.config.WebAuthSettings;
+import com.mraibo.cminsight.core.JdbcPoolSettings;
+import com.mraibo.cminsight.core.StatisticsSettings;
+import com.mraibo.cminsight.db.JdbcDrivers;
 import com.mraibo.cminsight.ibm.CmAdapterSettings;
 import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
 import com.mraibo.cminsight.security.SecurityPolicy;
@@ -40,10 +43,11 @@ import java.util.Objects;
  *
  * <p>Deliberately narrow: credential resolution ({@link WebAuthSettings#resolve}), the exposure policy
  * ({@link SecurityPolicy#validateWebExposure}), the repository-profile credential verdicts
- * ({@link #inspectProfiles}) and the CM adapter verdicts ({@link #adapterFindings}) - exactly the
- * decisions doctor and runtime must agree on - plus the resolved operational path set from
- * {@link AppPaths}. It never opens a socket, never touches the network and never prints a credential
- * value.
+ * ({@link #inspectProfiles}), the CM adapter verdicts ({@link #adapterFindings}) and the local analytics
+ * readiness verdicts ({@link #statisticsFindings}) - exactly the decisions doctor and runtime must agree on
+ * - plus the resolved operational path set from
+ * {@link AppPaths}. It never opens a socket, never touches the network, never opens a database connection
+ * and never prints a credential value.
  *
  * <p>Every verdict is produced by the runtime's own code: {@code WebAuthSettings}, {@code SecurityPolicy},
  * {@code RepositoryProfileLoader} and {@code SecretResolver}. Nothing here re-implements a rule, which is
@@ -233,9 +237,13 @@ public final class ConfigCheck {
         // The doctor's report is where the two independent questions are composed: what is true of the
         // profile files, and whether an adapter is installed to read them. inspectProfiles keeps answering
         // only the first, so a healthy profile stays healthy in core-only mode.
-        List<Finding> doctorFindings = new ArrayList<>(profileFindings.size() + 3);
+        List<Finding> doctorFindings = new ArrayList<>(profileFindings.size() + 8);
         doctorFindings.addAll(profileFindings);
         doctorFindings.addAll(adapterFindings(config, secrets));
+        // Goal 03 section 14: the analytics half's own local readiness. A third independent question -
+        // "could this runtime run a statistics scan, and if not, why" - kept apart from the two above for
+        // the same reason they are apart from each other.
+        doctorFindings.addAll(statisticsFindings(paths, config, secrets));
 
         out.println(OK_PREFIX + "home = " + paths.describeHome());
         out.println(OK_PREFIX + "config file = " + configPath);
@@ -523,6 +531,130 @@ public final class ConfigCheck {
         return findings;
     }
 
+    /**
+     * The analytics section of the report: the validated bounds, and each profile's LOCAL JDBC readiness.
+     *
+     * <p>Goal 03 section 14 asks for six facts an operator has to be able to tell apart, and they are
+     * reported as six facts rather than as one verdict:
+     *
+     * <ul>
+     *   <li>the analytics feature is switched off ({@code feature.statistics=false}) - a WARN, because the
+     *       runtime starts and the repository works; nothing is wrong with the configuration;</li>
+     *   <li>the JDBC driver is <em>absent</em> - a WARN naming the measured directory to place the jar in;</li>
+     *   <li>the driver is <em>present</em> - reported as ready, with the class name that was found;</li>
+     *   <li>the JDBC URL belongs to another vendor's family - a WARN naming the expected prefix. A mismatch
+     *       is never "try it anyway", and it is not an ERROR here either, because the IBM CM half of the
+     *       repository is unaffected;</li>
+     *   <li>the schema is configured, or has to be derived from a live session at scan time;</li>
+     *   <li>the pool and worker bounds are accepted - and when they are not, an ERROR, because the runtime
+     *       refuses to start on the same {@code ConfigException} this line prints.</li>
+     * </ul>
+     *
+     * <p><strong>Local readiness only.</strong> Nothing here opens a database connection: the driver
+     * verdict is {@code JdbcDrivers}' class-loading and {@code DriverManager} inspection, and a loadable
+     * driver is <em>not</em> evidence of a reachable database. That sentence is printed as part of the
+     * report on purpose - "the driver is installed" and "the database answers" are different claims, and a
+     * doctor line that let them blur would be worse than no line.
+     *
+     * <p>Deliberately never the JDBC URL, the database user name, the schema name or a credential value:
+     * the verdict text comes from {@code JdbcDrivers}, whose contract is that it contains none of them, and
+     * the schema is reported as configured-versus-derived rather than by name.
+     *
+     * <p>Kept out of {@link Report#errors()}, which stays the runtime's own refusal text, exactly like
+     * {@link #adapterFindings}: an absent driver must not make the doctor refuse a configuration the
+     * runtime accepts.
+     */
+    public static List<Finding> statisticsFindings(AppPaths paths, AppConfig config, SecretResolver secrets) {
+        Objects.requireNonNull(paths, "paths");
+        Objects.requireNonNull(config, "config");
+        Objects.requireNonNull(secrets, "secrets");
+
+        List<Finding> findings = new ArrayList<>(8);
+        JdbcPoolSettings pool = null;
+        try {
+            // The runtime's own reader, range check included, so the doctor cannot accept a jdbc.pool.*
+            // value that would make Main exit 3 - or refuse one it accepts.
+            pool = JdbcPoolSettings.from(config);
+            findings.add(new Finding(Level.OK, "JDBC pool bounds accepted: " + pool.describe()));
+        } catch (ConfigException e) {
+            // Main reads this before it serves anything and exits 3 on the same exception.
+            findings.add(new Finding(Level.ERROR, e.getMessage()));
+        }
+
+        StatisticsSettings statistics = null;
+        if (pool == null) {
+            // The pool bounds are already refused above; the worker check needs a pool size, and reporting
+            // a second failure derived from the first would double-count one misconfiguration.
+            findings.add(new Finding(Level.WARN, "analytics worker bounds were not checked because the JDBC"
+                    + " pool bounds are refused above"));
+        } else {
+            try {
+                statistics = StatisticsSettings.from(config, pool);
+                if (statistics.enabled()) {
+                    findings.add(new Finding(Level.OK, "analytics settings accepted: " + statistics.describe()));
+                } else {
+                    findings.add(new Finding(Level.WARN, StatisticsSettings.ENABLED_KEY + "=false: the"
+                            + " analytics half is disabled. No JDBC pool is created and no database connection"
+                            + " is ever attempted; repository activation, the ItemType reads and the retention"
+                            + " viewer are unaffected, and /api/statistics reports the disabled state."));
+                }
+            } catch (ConfigException e) {
+                findings.add(new Finding(Level.ERROR, e.getMessage()));
+            } catch (IllegalArgumentException e) {
+                // StatisticsSettings refuses an impossible pool size programmatically rather than by
+                // configuration; surfacing it here keeps the doctor from reporting a clean run over a
+                // contradiction it could not evaluate.
+                findings.add(new Finding(Level.ERROR, e.getMessage()));
+            }
+        }
+
+        final List<RepositoryProfile> profiles;
+        try {
+            profiles = new RepositoryProfileLoader(paths.profilesDir(config)).loadAll();
+        } catch (ConfigException e) {
+            // Deliberately not reported as a second ERROR: inspectProfiles() already reports the loader's
+            // refusal, and the doctor must not count one broken profile file twice. The missing readiness
+            // lines are explained instead of silently absent.
+            findings.add(new Finding(Level.WARN, "repository JDBC readiness was not evaluated because the"
+                    + " repository profiles could not be loaded (see the profile findings)"));
+            return List.copyOf(findings);
+        }
+
+        for (RepositoryProfile profile : profiles) {
+            findings.add(readinessFinding(profile));
+        }
+        findings.add(new Finding(Level.OK, "analytics readiness is LOCAL only: driver discovery loads classes"
+                + " and inspects DriverManager, no database connection was attempted, and a loadable driver is"
+                + " not evidence of a reachable database"));
+        return List.copyOf(findings);
+    }
+
+    /**
+     * One repository's local JDBC readiness, as a single classified line.
+     *
+     * <p>A repository whose driver is missing or whose URL names another vendor stays a WARN: Goal 03
+     * section 3 requires the metadata and retention halves to keep working in exactly that state, so making
+     * the doctor refuse would contradict the runtime. The line says what the operator will see - the
+     * statistics API reporting {@code UNAVAILABLE} - so "not ready" cannot be read as "the application is
+     * broken".
+     */
+    private static Finding readinessFinding(RepositoryProfile profile) {
+        JdbcDrivers.Readiness readiness = JdbcDrivers.readiness(profile.databaseVendor(), profile.jdbcUrl());
+        String schema = profile.jdbcSchema() == null
+                ? "schema not configured (derived from the live session at scan time, then validated by the"
+                        + " same identifier rule; never a guessed ICMADMIN)"
+                : "schema configured (repository.jdbc.schema)";
+        String facts = "url family " + JdbcDrivers.urlPrefix(profile.databaseVendor()) + ", " + schema;
+        if (readiness.ready()) {
+            return new Finding(Level.OK, "repository " + profile.id() + " [" + profile.databaseVendor()
+                    + "] JDBC driver ready (" + readiness.driverIdentity() + "); " + facts);
+        }
+        return new Finding(Level.WARN, "repository " + profile.id() + " [" + profile.databaseVendor()
+                + "] JDBC driver NOT ready: " + readiness.reason() + "; " + facts
+                + ". Analytics will report UNAVAILABLE and the repository stays usable: the ItemType and"
+                + " retention routes are unaffected.");
+    }
+
     private static Finding credentialFinding(SecretResolver secrets, String key, SecretRef declared) {
         if (declared.source() == SecretRef.Source.MISSING) {
             return new Finding(Level.WARN, "credential " + key + " is not configured; declare '" + key
@@ -601,6 +733,13 @@ public final class ConfigCheck {
         out.println("whether the cm.pool.*/cache.metadata.* values the runtime reads are acceptable. A missing");
         out.println("adapter is a WARN while nothing activates a repository, and an ERROR when");
         out.println("repository.auto.activate names one, because the runtime then refuses to start.");
+        out.println();
+        out.println("The analytics section reports the jdbc.pool.*/statistics.* bounds, whether statistics are");
+        out.println("switched off, and each repository's LOCAL JDBC readiness: driver absent, driver present, a");
+        out.println("JDBC URL that belongs to another vendor's family, and whether the schema is configured or");
+        out.println("derived from a live session at scan time. It opens NO database connection - a loadable");
+        out.println("driver is not evidence of a reachable database - and an out-of-range bound is an ERROR,");
+        out.println("because the runtime refuses to start on the same message.");
         out.println();
         out.println("  --config <file>   configuration file (default <home>/conf/application.properties)");
         out.println("  --validate-config accepted and ignored (the flag that dispatches here from Main)");

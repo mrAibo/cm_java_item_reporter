@@ -105,6 +105,65 @@ public class CoreIbmIsolationTest {
                         + ": a second one would be a second exception nobody reviewed");
     }
 
+    /**
+     * The two isolation guards agree about the DB2 driver class name.
+     *
+     * <p>This exists because they disagreed for real: the shell guard gained the scoped driver-name exemption
+     * and the Java twin did not, so the same rule was enforced two different ways and only one of the two
+     * builds failed. A guard pair that disagrees is worse than one guard, because whichever a developer runs
+     * first decides whether the tree looks clean.
+     *
+     * <p>The assertion is on the VALUE rather than on the text, so it keeps holding if either side is
+     * reformatted.
+     */
+    public void theTwoIsolationGuardsShareTheSameDriverNameExemption() {
+        String script = readString(SourceGuard.shellGuard());
+        Assert.assertTrue(script.contains("ISOLATION_ALLOWED_REFERENCE="),
+                "the shell guard must declare its scoped reference exemption, or the Java twin is enforcing a"
+                        + " rule the shell guard does not know about");
+        Assert.assertTrue(script.contains(SourceGuard.ISOLATION_ALLOWED_REFERENCE),
+                "the shell guard must exempt the same reference '" + SourceGuard.ISOLATION_ALLOWED_REFERENCE
+                        + "' that the Java guard exempts; a different value means one of them is enforcing a"
+                        + " rule the other cannot see");
+        int declarations = script.split(java.util.regex.Pattern.quote(
+                "ISOLATION_ALLOWED_REFERENCE="), -1).length - 1;
+        Assert.assertEquals(1, declarations,
+                "the shell guard must carry exactly ONE reference exemption, but carries " + declarations
+                        + ": a second one would be a second exception nobody reviewed");
+    }
+
+    /**
+     * The driver-name exemption cannot hide a real SDK reference on the same line.
+     *
+     * <p>This is the property that makes the exemption safe rather than a hole. A line carrying the allowed
+     * driver class name AND a genuine CM SDK reference must still be reported, so the allowance is scoped to
+     * the reference and not to the line, the file or the developer's intent.
+     */
+    public void aLineCarryingBothTheDriverNameAndAnSdkReferenceIsStillReported() throws IOException {
+        Path copy = copyCoreTree();
+        try {
+            Path planted = copy.resolve(CORE_SOURCE + "/com/mraibo/cminsight/db/PlantedBoth.java");
+            Files.createDirectories(planted.getParent());
+            Files.writeString(planted,
+                    "package com.mraibo.cminsight.db;\n"
+                            + "final class PlantedBoth {\n"
+                            + "    String driver() { return \"" + SourceGuard.ISOLATION_ALLOWED_REFERENCE + "\"; }\n"
+                            + "    Object sdk() throws Exception {\n"
+                            + "        return Class.forName(\"com.ibm.mm.sdk.server.DKDatastoreICM\");\n"
+                            + "    }\n"
+                            + "}\n");
+
+            List<String> violations = SourceGuard.findIbmReferencesInCore(copy);
+            Assert.assertTrue(violations.stream().anyMatch(v -> v.contains("PlantedBoth")
+                            && v.contains("DKDatastoreICM")),
+                    "a core line naming BOTH the allowed DB2 driver class and a real CM SDK type must still be"
+                            + " reported, or the exemption has widened from one reference into a hole. Found: "
+                            + violations);
+        } finally {
+            deleteRecursively(copy);
+        }
+    }
+
     /** A planted com.ibm reference in a core file is reported. */
     public void aPlantedIbmReferenceInTheCoreIsReported() throws IOException {
         Path copy = copyCoreTree();

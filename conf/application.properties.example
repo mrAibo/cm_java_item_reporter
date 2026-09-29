@@ -115,16 +115,45 @@ cache.metadata.ttl.seconds=600
 # in lib/ibm/ (see lib/README.md) before enabling this key.
 # repository.auto.activate=
 
-# --- Reserved for later goals -------------------------------------------------
-# Goal 01 carries these keys so the configuration shape stays stable, but no code reads
-# them as values yet: the statistics settings belong to the analytics goal. Setting them
-# has no effect today, and changing them cannot break the current build.
-jdbc.pool.size=6
+# --- Fast analytics: the bounded JDBC pool and the scan (Goal 03) -------------
+# Read by JdbcPoolSettings.from(...) and StatisticsSettings.from(...), the single
+# readers of these keys. Every value is range-checked and an out-of-range one is a
+# CONFIGURATION ERROR naming the key and the range (process exit 3) - never a
+# silently clamped number. --print-config, --validate-config (bin/doctor.sh) and the
+# serving path all use these same readers, so they cannot disagree.
+#
+# jdbc.pool.size                     default 4,    1..64        hard bound on live JDBC connections
+# jdbc.pool.borrow.timeout.ms        default 5000, 1..600000    how long a borrow waits before it fails
+# jdbc.pool.max.age.minutes          default 30,   1..1440      rotate a connection older than this
+# jdbc.pool.max.operations           default 1000, 1..1000000   rotate a connection after this many uses
+# statistics.workers                 default min(4, jdbc.pool.size), 1..64
+# statistics.query.timeout.seconds   default 60,   1..3600      per-statement query timeout
+# statistics.scan.timeout.seconds    default 1800, 1..86400     overall deadline for one scan
+# cache.statistics.ttl.seconds       default 300,  0..86400     reserved: Goal 03 keeps ONE live snapshot
+#                                                               per repository, so nothing reads it yet
+#
+# statistics.workers is REFUSED, never clamped, when it exceeds jdbc.pool.size: every
+# concurrent query holds one JDBC connection for its whole duration, so a larger
+# worker count could not be delivered and the requested parallelism must not be
+# reported as if it existed. Leave it out to get min(4, jdbc.pool.size).
+#
+# The JDBC pool is lazily created: nothing here causes a connection at startup, and
+# feature.statistics=false, a missing driver, a missing JDBC credential, an unusable
+# schema or an unreachable database never deactivates a repository - the metadata and
+# retention halves keep working and the analytics routes report why. A loadable driver
+# is NOT evidence of a reachable database (see lib/README.md).
+jdbc.pool.size=4
 jdbc.pool.borrow.timeout.ms=5000
-statistics.threads=6
-statistics.itemtype.timeout.seconds=120
-statistics.scan.timeout.seconds=600
+jdbc.pool.max.age.minutes=30
+jdbc.pool.max.operations=1000
+statistics.workers=4
+statistics.query.timeout.seconds=60
+statistics.scan.timeout.seconds=1800
 cache.statistics.ttl.seconds=300
+
+# --- Reserved for later goals -------------------------------------------------
+# No key here is read yet. (Goal 04's report/UI settings and Goal 05's Versions/Parts
+# research land later; the analytics keys above are read and enforced today.)
 
 # Paths: use forward slashes (conf/profiles) or doubled backslashes (conf\\profiles).
 # A single backslash is an escape character in .properties files, so conf\profiles

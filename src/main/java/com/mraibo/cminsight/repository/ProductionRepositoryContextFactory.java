@@ -10,12 +10,19 @@ import com.mraibo.cminsight.core.CmPoolDiagnostics;
 import com.mraibo.cminsight.core.CmPoolSettings;
 import com.mraibo.cminsight.core.CmSessionFactory;
 import com.mraibo.cminsight.core.CloseState;
+import com.mraibo.cminsight.core.JdbcPoolSettings;
 import com.mraibo.cminsight.core.MetadataCache;
 import com.mraibo.cminsight.core.RepositoryServices;
+import com.mraibo.cminsight.core.StatisticsSettings;
+import com.mraibo.cminsight.db.Db2Dialect;
+import com.mraibo.cminsight.db.JdbcDialect;
+import com.mraibo.cminsight.db.OracleDialect;
 import com.mraibo.cminsight.ibm.CmAdapterProvider;
 import com.mraibo.cminsight.ibm.CmAdapterSettings;
 import com.mraibo.cminsight.metadata.MetadataRepository;
 import com.mraibo.cminsight.retention.RetentionRepository;
+import com.mraibo.cminsight.statistics.StatisticsCapability;
+import com.mraibo.cminsight.statistics.StatisticsService;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -81,6 +88,8 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
     private final CmAdapterProvider provider;
     private final CmAdapterSettings settings;
     private final SecretResolver secrets;
+    private final JdbcPoolSettings jdbcPoolSettings;
+    private final StatisticsSettings statisticsSettings;
 
     /**
      * @param provider the discovered adapter; the caller refuses to activate when there is none
@@ -90,9 +99,26 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
     public ProductionRepositoryContextFactory(CmAdapterProvider provider,
                                              CmAdapterSettings settings,
                                              SecretResolver secrets) {
+        this(provider, settings, secrets, JdbcPoolSettings.defaults(), StatisticsSettings.disabled());
+    }
+
+    /**
+     * @param provider           the discovered adapter; the caller refuses to activate when there is none
+     * @param settings           the validated CM pool bounds, cache TTL and credential resolver
+     * @param secrets            the resolver used to prove credentials are usable before anything is allocated
+     * @param jdbcPoolSettings   the validated analytics pool bounds; reached only when analytics is enabled
+     * @param statisticsSettings the validated analytics scan settings, including the enabled switch
+     */
+    public ProductionRepositoryContextFactory(CmAdapterProvider provider,
+                                             CmAdapterSettings settings,
+                                             SecretResolver secrets,
+                                             JdbcPoolSettings jdbcPoolSettings,
+                                             StatisticsSettings statisticsSettings) {
         this.provider = Objects.requireNonNull(provider, "provider");
         this.settings = Objects.requireNonNull(settings, "settings");
         this.secrets = Objects.requireNonNull(secrets, "secrets");
+        this.jdbcPoolSettings = Objects.requireNonNull(jdbcPoolSettings, "jdbcPoolSettings");
+        this.statisticsSettings = Objects.requireNonNull(statisticsSettings, "statisticsSettings");
     }
 
     @Override
@@ -156,14 +182,52 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
             cache = new MetadataCache(settings.metadataCacheTtl(), adapterMetadata, adapterRetention);
             resources.add(cache);
         }
+
+        // 7. The analytics half, if this repository has one. Section 3 of the goal is the rule that shapes
+        //    this call: JDBC is OPTIONAL to activation, so nothing here may connect, and an unusable
+        //    analytics side must leave a perfectly working CM repository behind. activate() therefore
+        //    returns an unavailable service - registering ZERO resources and opening ZERO connections - for
+        //    a disabled feature, an absent driver, a driver not registered for this vendor, a vendor/URL
+        //    mismatch and an unresolvable JDBC credential. The pool it does build is lazy: initialize() is
+        //    never called, so the first connection happens when a scan asks for one.
+        //
+        //    The metadata supplier is the CACHE's view, not the adapter's, so a scan reuses the same
+        //    per-context ItemType snapshot the read API serves rather than issuing its own CM sessions.
+        MetadataRepository statisticsMetadata = cache == null ? adapterMetadata : cache.metadataView();
+        StatisticsService statistics = StatisticsCapability.activate(
+                profile,
+                secrets,
+                dialectFor(profile),
+                jdbcPoolSettings,
+                statisticsSettings,
+                statisticsMetadata == null ? List::of : statisticsMetadata::listItemTypes,
+                resources::add);
+
         RepositoryServices published = new RepositoryServices(
                 cache == null ? null : cache.metadataView(),
                 cache == null ? null : cache.retentionView(),
-                adapterServices.diagnosticsService().orElseGet(() -> new PoolCmDiagnostics(pool, errors)));
+                adapterServices.diagnosticsService().orElseGet(() -> new PoolCmDiagnostics(pool, errors)),
+                statistics);
 
-        // 7. Publish, only now. A repository whose adapter offers no read service is still a valid
+        // 8. Publish, only now. A repository whose adapter offers no read service is still a valid
         //    activated repository - its services are reported as unavailable rather than faked.
         return new RepositoryContext(profile, List.copyOf(resources), published);
+    }
+
+    /**
+     * The dialect for a repository's configured vendor.
+     *
+     * <p>Selection is by the profile's own {@code databaseVendor}, never by inspecting the JDBC URL: the
+     * vendor is validated configuration, whereas the URL is free text, and a dialect chosen from free text
+     * would be a second, weaker answer to a question the configuration already answered. A URL that
+     * disagrees with the vendor is refused later by the driver-readiness check, which reports it as
+     * statistics-unavailable rather than silently switching dialect.
+     */
+    private static JdbcDialect dialectFor(RepositoryProfile profile) {
+        return switch (profile.databaseVendor()) {
+            case DB2 -> new Db2Dialect();
+            case ORACLE -> new OracleDialect();
+        };
     }
 
     /**

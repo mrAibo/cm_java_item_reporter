@@ -21,7 +21,6 @@ import com.mraibo.cminsight.web.http.RequestContext;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Pattern;
@@ -42,6 +41,20 @@ import java.util.regex.Pattern;
  *   GET  /api/retention/policies/{name} one policy, with its assigned ItemTypes
  *   GET  /api/diagnostics/cm            adapter, pool, cache and the last sanitised error
  * </pre>
+ *
+ * <p>Goal 03 adds the analytics half of the same authenticated surface, installed by the same
+ * {@link #install(Router)} call so the two can never drift apart:
+ *
+ * <pre>
+ *   GET  /api/statistics                availability, active repository, scan progress, latest snapshot
+ *   POST /api/statistics/refresh        starts at most one scan; requires {@code statistics-refresh}
+ *   GET  /api/diagnostics/jdbc          driver, pool and scan facts, plus a sanitised last JDBC error
+ * </pre>
+ *
+ * <p>The analytics routes are delegated to {@link StatisticsApiRoutes} because their payloads and their
+ * refusals are a different shape; they are registered HERE because "installed with the CM routes, before
+ * the socket opens" is the property that must not be re-litigated later. See
+ * {@link StatisticsApiRoutes} for the refresh guard and the unavailable-state contract.
  *
  * <p>Every route is registered through the authenticated {@link Router} methods only. {@code /api/health}
  * stays the one public path; nothing here can be reached without a principal, and an unauthenticated
@@ -101,12 +114,16 @@ public final class CmApiRoutes {
      * The request header that authorises a local runtime action.
      *
      * <p>Deliberately a custom header: a browser will not send one on a cross-site form submission, and
-     * the value is fixed here so the endpoint, the test and the console cannot drift apart.
+     * the value is fixed in {@link ActionGuard} so the endpoint, the test and the console cannot drift
+     * apart. Kept as a constant here as well because it is part of this class's published route contract.
      */
-    public static final String ACTION_HEADER = "X-CM-Insight-Action";
+    public static final String ACTION_HEADER = ActionGuard.ACTION_HEADER;
 
     /** The only value of {@link #ACTION_HEADER} that authorises a repository selection. */
-    public static final String SELECT_ACTION = "repository-select";
+    public static final String SELECT_ACTION = ActionGuard.SELECT_ACTION;
+
+    /** The only value of {@link #ACTION_HEADER} that authorises a statistics refresh. */
+    public static final String STATISTICS_REFRESH_ACTION = ActionGuard.STATISTICS_REFRESH_ACTION;
 
     /** Path of the repository list. */
     public static final String REPOSITORIES_PATH = "/api/repositories";
@@ -120,6 +137,12 @@ public final class CmApiRoutes {
     public static final String RETENTION_POLICIES_PATH = "/api/retention/policies";
     /** Path of the CM diagnostics endpoint. */
     public static final String CM_DIAGNOSTICS_PATH = "/api/diagnostics/cm";
+    /** Path of the statistics status read (Goal 03). */
+    public static final String STATISTICS_PATH = StatisticsApiRoutes.STATISTICS_PATH;
+    /** Path of the statistics scan action (Goal 03). */
+    public static final String STATISTICS_REFRESH_PATH = StatisticsApiRoutes.REFRESH_PATH;
+    /** Path of the JDBC diagnostics read (Goal 03). */
+    public static final String JDBC_DIAGNOSTICS_PATH = StatisticsApiRoutes.JDBC_DIAGNOSTICS_PATH;
 
     /** Query parameter carrying the repository id of a selection. */
     public static final String REPOSITORY_PARAMETER = "repository";
@@ -148,15 +171,18 @@ public final class CmApiRoutes {
      */
     private static final Pattern SAFE_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}");
 
-    private static final String FORM_URLENCODED = "application/x-www-form-urlencoded";
-    private static final String FORM_MULTIPART = "multipart/form-data";
-    private static final String FORM_PLAIN = "text/plain";
-
     private final RepositoryManager repositories;
     private final List<RepositoryProfile> profiles;
     private final IbmCmAdapterRegistry adapters;
+    private final StatisticsApiRoutes statisticsRoutes;
 
     /**
+     * Every route of the frozen table, with analytics wired to the seam that reports it as unavailable.
+     *
+     * <p>Used by the wiring that has no analytics capability - and by the tests that exercise the CM
+     * routes alone. The three analytics routes are STILL INSTALLED, because "no analytics is wired" must
+     * answer with the documented unavailable state rather than with a {@code 404} that reads like a typo.
+     *
      * @param repositories the manager that owns the single active repository
      * @param profiles     the configured repository profiles, listed without an adapter and selectable
      *                     only through the action guard
@@ -165,17 +191,38 @@ public final class CmApiRoutes {
     public CmApiRoutes(RepositoryManager repositories,
                        List<RepositoryProfile> profiles,
                        IbmCmAdapterRegistry adapters) {
+        this(repositories, profiles, adapters, AnalyticsApi.unavailable(
+                "No analytics capability is wired into this runtime"));
+    }
+
+    /**
+     * @param repositories the manager that owns the single active repository
+     * @param profiles     the configured repository profiles, listed without an adapter and selectable
+     *                     only through the action guard
+     * @param adapters     the discovered adapter verdict, reported as availability/version/release only
+     * @param analytics    the analytics port the Goal 03 routes publish; {@code null} becomes
+     *                     {@link AnalyticsApi#unavailable(String)} rather than a broken route
+     */
+    public CmApiRoutes(RepositoryManager repositories,
+                       List<RepositoryProfile> profiles,
+                       IbmCmAdapterRegistry adapters,
+                       AnalyticsApi analytics) {
         this.repositories = Objects.requireNonNull(repositories, "repositories");
         this.profiles = List.copyOf(Objects.requireNonNull(profiles, "profiles"));
         this.adapters = Objects.requireNonNull(adapters, "adapters");
+        this.statisticsRoutes = new StatisticsApiRoutes(repositories, analytics);
     }
 
     /**
      * Registers every route of the frozen table on a {@link Router}.
      *
-     * <p>All six registrations are authenticated ones; none of them can be reached without a principal.
+     * <p>All nine registrations are authenticated ones; none of them can be reached without a principal.
      * The collection and the {@code {name}} form of ItemTypes and retention policies share one prefix
      * registration each, because a path parameter is not expressible here.
+     *
+     * <p>The three Goal 03 analytics routes are installed by this same call, from one place, so the
+     * "implemented but never installed" defect cannot be reintroduced for one family while the other
+     * still works.
      */
     public void install(Router router) {
         Objects.requireNonNull(router, "router");
@@ -185,6 +232,7 @@ public final class CmApiRoutes {
         router.add(HttpMethod.GET, ITEM_TYPES_PATH, true, true, this::itemTypeRoute);
         router.add(HttpMethod.GET, RETENTION_POLICIES_PATH, true, true, this::retentionRoute);
         router.get(CM_DIAGNOSTICS_PATH, this::cmDiagnostics);
+        statisticsRoutes.install(router);
     }
 
     // ---------------------------------------------------------------- repository routes
@@ -626,26 +674,12 @@ public final class CmApiRoutes {
      * True only when the request carries the action header with the exact value <em>and</em> does not
      * declare a body type an HTML form can send.
      *
-     * <p>The header is the real guard, because a cross-site form cannot set one. The content-type check is
-     * defence in depth: the three types a form can be told to use are refused outright, so a submission
-     * that cannot set the header is refused even if some future client smuggles the token into a body.
+     * <p>Delegated to {@link ActionGuard}, which owns the rule now that two route families share it: the
+     * header is the real guard because a cross-site form cannot set one, and the content-type check is
+     * defence in depth. A second private copy would be how the two come to disagree.
      */
     private static boolean actionAuthorised(RequestContext ctx) {
-        String action = ctx.header(ACTION_HEADER);
-        if (action == null || !SELECT_ACTION.equals(action.trim())) {
-            return false;
-        }
-        String contentType = ctx.header("Content-Type");
-        if (contentType == null) {
-            return true;
-        }
-        String type = contentType.toLowerCase(Locale.ROOT);
-        int parameters = type.indexOf(';');
-        if (parameters >= 0) {
-            type = type.substring(0, parameters);
-        }
-        type = type.trim();
-        return !FORM_URLENCODED.equals(type) && !FORM_MULTIPART.equals(type) && !FORM_PLAIN.equals(type);
+        return ActionGuard.authorises(ctx, ActionGuard.SELECT_ACTION);
     }
 
     /**

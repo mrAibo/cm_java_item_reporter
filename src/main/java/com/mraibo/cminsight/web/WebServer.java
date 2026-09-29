@@ -54,11 +54,13 @@ import java.util.regex.Pattern;
  *       second time is a startup error, not a silent override;</li>
  *   <li>the router is bound to an {@link Authenticator} built from {@link WebAuthSettings} plus the
  *       brute-force guard settings from configuration;</li>
- *   <li>the authenticated CM read API is installed by one explicit
- *       {@link #installCmApiRoutes(RepositoryManager, List, IbmCmAdapterRegistry)} call, which also binds
- *       the repository manager the handlers read through. It is optional: a core-only runtime that never
- *       calls it serves the mandatory routes alone, and every CM API route is registered as an
- *       authenticated one;</li>
+ *   <li>the authenticated CM read API and the Goal 03 analytics API are installed by one explicit
+ *       {@link #installCmApiRoutes(RepositoryManager, List, IbmCmAdapterRegistry)} call (or its
+ *       analytics-aware overload), which also binds the repository manager the handlers read through. It
+ *       is optional: a core-only runtime that never calls it serves the mandatory routes alone, and every
+ *       route it does register is registered as an authenticated one. Analytics is the case that makes
+ *       "installed unconditionally" load-bearing - a missing JDBC driver must answer with the documented
+ *       unavailable state, never with a {@code 404};</li>
  *   <li>the exposure policy runs before the socket is opened, so a refused configuration never
  *       listens at all; a non-loopback plain-HTTP bind additionally requires the explicit
  *       {@code web.allowInsecureHttp=true} opt-in (default false) and is announced as a security
@@ -193,16 +195,39 @@ public final class WebServer implements AutoCloseable {
     /**
      * Installs the authenticated CM read API and binds the repository manager it reads through.
      *
+     * <p>The three Goal 03 analytics routes are installed by the same call, with analytics reporting the
+     * documented unavailable state: a runtime that never wires an analytics capability still SERVES
+     * {@code /api/statistics}, {@code /api/statistics/refresh} and {@code /api/diagnostics/jdbc}, because
+     * "no JDBC driver is installed" is a normal state of this application and a {@code 404} for it is
+     * indistinguishable from a typo in the client's URL.
+     *
+     * @throws IllegalStateException when the API routes have already been installed
+     */
+    public void installCmApiRoutes(RepositoryManager repositories,
+                                   List<RepositoryProfile> profiles,
+                                   IbmCmAdapterRegistry adapters) {
+        installCmApiRoutes(repositories, profiles, adapters, AnalyticsApi.unavailable(
+                "No analytics capability is wired into this runtime"));
+    }
+
+    /**
+     * Installs the authenticated API - the CM read routes and the Goal 03 analytics routes - and binds
+     * the repository manager the handlers read through.
+     *
      * <p>Deliberately one additive call: the mandatory routes above are installed exactly as they were,
      * and this registers the Goal 02 routes from {@link CmApiRoutes} on the same router while retaining
      * the manager so the binding is explicit rather than implied by one handler. Calling it twice is a
      * wiring bug and is refused instead of silently re-registering a route.
      *
-     * @throws IllegalStateException when the CM API routes have already been installed
+     * @param analytics the analytics port the statistics/diagnostics routes publish; never {@code null}
+     *                  in production, and a {@code null} value degrades to the documented unavailable
+     *                  state rather than to an unusable route
+     * @throws IllegalStateException when the API routes have already been installed
      */
     public void installCmApiRoutes(RepositoryManager repositories,
                                    List<RepositoryProfile> profiles,
-                                   IbmCmAdapterRegistry adapters) {
+                                   IbmCmAdapterRegistry adapters,
+                                   AnalyticsApi analytics) {
         Objects.requireNonNull(repositories, "repositories");
         Objects.requireNonNull(profiles, "profiles");
         Objects.requireNonNull(adapters, "adapters");
@@ -210,7 +235,7 @@ public final class WebServer implements AutoCloseable {
             if (cmApiRoutes != null) {
                 throw new IllegalStateException("The CM API routes are already installed");
             }
-            CmApiRoutes installed = new CmApiRoutes(repositories, profiles, adapters);
+            CmApiRoutes installed = new CmApiRoutes(repositories, profiles, adapters, analytics);
             installed.install(router);
             this.cmApiRoutes = installed;
         }

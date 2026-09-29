@@ -180,8 +180,45 @@ current date:
 - current year: January 1 through January 1 of the next year, exclusive.
 
 The aggregate query deduplicates ItemID across versions and all physical root segments first, then computes
-total + the four window counts. DB2/Oracle syntax belongs behind `DatabaseDialect`. Versions and Parts
-remain `UNAVAILABLE`.
+the total plus the four window counts. Versions and Parts remain `UNAVAILABLE`.
+
+### The implemented analytics contract
+
+- `DatabaseDialect` (the three-method bootstrap interface with the context-sensitive `oneRowSuffix()`) has
+  been REPLACED by `JdbcDialect`, implemented by `Db2Dialect` and `OracleDialect`. Each implementation
+  returns whole statements: a database current-date query, a complete zero-row/existence probe, identifier
+  qualification rules and the ItemID aggregate. There is no method whose result is valid only when the
+  caller happened to include a `WHERE` clause.
+- `PhysicalSchemaResolver` maps one ItemType to EVERY expected root segment 1..N (`ICMUTnnnnn001` ..
+  `ICMUTnnnnnNNN`) and fails that ItemType's mapping when a middle segment is absent or inaccessible. The
+  CM_retention single-segment limitation is deliberately not inherited.
+- The query builder accepts only validated schema names and generated `ICMUT` table names: no request
+  parameter, ItemType name or arbitrary string becomes a SQL identifier. An unquoted-identifier rule is
+  what this implementation proves; anything else marks statistics unavailable with an actionable reason.
+- One scan reads the database current date once (`JdbcDialect`), and `ScanWindows` anchors every ItemType of
+  that snapshot on it. Creation-date windows are encoded from the immutable ItemID date portion through
+  `ItemIdDateKey`; a boundary the documented encoder cannot represent makes the affected time metrics
+  `UNAVAILABLE` rather than moving them.
+- A logical item is one distinct `ItemID`. `COUNT(*)` over a versioned root table is never a logical-item
+  count, and counts are `long` end to end.
+- `StatisticsSnapshot` is immutable and published atomically or not at all, and every total travels with its
+  `StatisticsCoverage`, so a subtotal over the ItemTypes that happened to succeed is never presented as the
+  complete total for the frozen list. Versions and Parts stay `UNAVAILABLE` in every result and every total.
+- `StatisticsDiagnostics` is the safe pool view the web layer publishes: counters, a close state and one
+  sanitised error sentence. No `java.sql` type crosses it.
+
+### JDBC is optional to repository activation
+
+`feature.statistics=false`, a missing driver, a missing or unreadable JDBC credential, an unusable schema
+and an unreachable database all leave the repository activated and its metadata/retention routes usable.
+The JDBC pool is created lazily - nothing connects during activation - and the analytics routes answer an
+explicit `DISABLED`/`UNAVAILABLE` state with a fixed reason. An analytics problem never deactivates a
+repository.
+
+A MALFORMED bounded setting is different: an out-of-range `jdbc.pool.*`/`statistics.*` value, or a
+`statistics.workers` greater than `jdbc.pool.size`, is refused at startup (exit 3) and reported as an ERROR
+by `--validate-config`, exactly like `cm.pool.*`. "You typed a number this build refuses" and "the database
+side is not usable right now" are deliberately different outcomes with different operator actions.
 
 Authoritative IBM CM 8.7 evidence used to freeze these rules:
 
@@ -225,5 +262,60 @@ Web UI displays cached data immediately while a refresh runs.
 Start with JDK embedded HttpServer. Routing stays separate from application services.
 
 Only /api/health may be unauthenticated and it must expose minimal data. Repository metadata, statistics, diagnostics and report actions require authentication.
+
+The authenticated surface is installed by one call before the socket is opened, and every route below is
+authenticated:
+
+```text
+GET  /api/repositories              profiles plus adapter availability
+POST /api/repositories/select       activation; requires X-CM-Insight-Action: repository-select
+GET  /api/repositories/status       lifecycle, close state, refusal, retained context
+GET  /api/itemtypes                 ItemType list      (requires an active repository)
+GET  /api/itemtypes/{name}          one ItemType
+GET  /api/retention/policies        retention policies (requires an active repository)
+GET  /api/retention/policies/{name} one policy, with its assigned ItemTypes
+GET  /api/diagnostics/cm            adapter, pool, cache and the last sanitised error
+GET  /api/statistics                analytics availability, scan progress, latest snapshot, coverage
+POST /api/statistics/refresh        starts at most one scan; requires the action header below
+GET  /api/diagnostics/jdbc          database vendor, driver readiness, pool and scan facts
+```
+
+`POST /api/statistics/refresh` changes local process state, so it uses the same CSRF-resistant custom
+header as repository selection:
+
+```text
+X-CM-Insight-Action: statistics-refresh
+```
+
+The header is the control because a cross-site HTML form cannot set one; the three form-sendable content
+types are refused as well. The check runs BEFORE any state is read or changed, so a missing or wrong header
+has zero side effects and can never start a scan. A second refresh while a scan is in flight is a
+deterministic `409 scan_in_progress`, not a duplicate scan.
+
+Installed unconditionally: "no JDBC driver is installed" is a normal state, so `GET /api/statistics` and
+`GET /api/diagnostics/jdbc` must answer the documented `UNAVAILABLE` state instead of a `404` that reads
+like a typo in a client's URL. The same reasoning already applied to "no CM adapter installed". A route
+that is implemented but not installed is the defect this rule exists for.
+
+The analytics payload is value-free by construction: no response field carries the JDBC URL, the database
+user name, a schema taken from an exception, raw SQL or a raw `SQLException` message. `GET
+/api/diagnostics/jdbc` reports a driver CLASS NAME, a URL family PREFIX (`jdbc:db2:`), pool and scan
+counters, and a last-error record whose operation label, SQLState and vendor code are each validated
+against the exact shape that slot may have. Free text from the statistics layer is published only through
+`DiagnosticText`, which strips control characters, redacts any `jdbc:` URL, any `user=`/`password=` value
+and any `//user:secret@` userinfo, removes a SQL-statement-shaped span, and caps the length.
+
+### Readiness and doctor are local only
+
+`bin/doctor.sh` (through `Main --validate-config`) distinguishes, in its own lines: the statistics feature
+disabled; the JDBC driver absent; the driver present; a JDBC URL that belongs to another vendor's family;
+the schema configured versus derived from a live session at scan time; and the pool/worker bounds accepted.
+Every verdict comes from the runtime's own reader (`JdbcPoolSettings`, `StatisticsSettings`, `JdbcDrivers`),
+so the doctor cannot accept a value the runtime refuses or refuse one it accepts.
+
+Driver readiness is class loading plus `DriverManager` inspection: `--print-config` and `--validate-config`
+open no database connection, resolve no credential and perform no network operation merely to describe
+configuration, and no health endpoint calls a live database. A loadable driver is NOT evidence of a
+reachable database.
 
 All static assets are local.

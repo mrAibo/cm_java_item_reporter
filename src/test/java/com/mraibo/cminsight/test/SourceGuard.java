@@ -52,6 +52,19 @@ final class SourceGuard {
     static final String ISOLATION_ALLOWED_RELATIVE =
             "src/main/java/com/mraibo/cminsight/connection/CmSession.java";
 
+    /**
+     * The one {@code com.ibm} reference allowed anywhere under {@code src/main/java}: the DB2 universal
+     * JDBC driver's class name, which Goal 03 needs for local offline driver discovery.
+     *
+     * <p>This is not the IBM CM SDK. The core compiles against no DB2 jar, the name is only ever a String
+     * handed to {@code Class.forName}, and the driver ships separately in {@code lib/db2} or is absent
+     * entirely - so it is not a dependency on an IBM type, which is what the isolation rule exists to
+     * prevent. The exemption is scoped to this REFERENCE, never to a file: an allow-listed file would let a
+     * later edit hide a real SDK reference. It must match {@code ISOLATION_ALLOWED_REFERENCE} in
+     * {@code tests/shell/ibm_guard.sh}, and that agreement is asserted by the isolation test.
+     */
+    static final String ISOLATION_ALLOWED_REFERENCE = "com.ibm.db2.jcc.DB2Driver";
+
     /** A package reference that would make the optional adapter mandatory for the core. */
     static final String ADAPTER_PACKAGE_REFERENCE = "com.mraibo.cminsight.ibm.internal";
 
@@ -204,9 +217,17 @@ final class SourceGuard {
             }
             for (int index = 0; index < lines.size(); index++) {
                 String text = lines.get(index);
-                if (text.contains("com.ibm.")) {
-                    violations.add(relative + ":" + (index + 1) + ": " + text.trim());
+                if (!text.contains("com.ibm.")) {
+                    continue;
                 }
+                // The DB2 driver class name is exempt, but only where it IS that name. Removing it and
+                // re-testing means a line carrying both the allowed name and a real SDK reference is still a
+                // violation, which is what stops the exemption widening into a hole.
+                String remainder = text.replace(ISOLATION_ALLOWED_REFERENCE, "");
+                if (!remainder.contains("com.ibm.")) {
+                    continue;
+                }
+                violations.add(relative + ":" + (index + 1) + ": " + text.trim());
             }
         }
         return violations;

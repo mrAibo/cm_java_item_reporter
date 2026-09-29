@@ -13,6 +13,9 @@ import com.mraibo.cminsight.core.CmPoolDiagnostics;
 import com.mraibo.cminsight.core.FeatureIds;
 import com.mraibo.cminsight.core.FeatureModule;
 import com.mraibo.cminsight.core.FeatureRegistry;
+import com.mraibo.cminsight.core.JdbcPoolSettings;
+import com.mraibo.cminsight.core.StatisticsSettings;
+import com.mraibo.cminsight.db.JdbcDrivers;
 import com.mraibo.cminsight.ibm.CmAdapterProvider;
 import com.mraibo.cminsight.ibm.CmAdapterSettings;
 import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
@@ -23,6 +26,7 @@ import com.mraibo.cminsight.repository.RepositoryContextFactory;
 import com.mraibo.cminsight.repository.RepositoryException;
 import com.mraibo.cminsight.repository.RepositoryManager;
 import com.mraibo.cminsight.security.SecurityPolicy;
+import com.mraibo.cminsight.web.AnalyticsApi;
 import com.mraibo.cminsight.web.Router;
 import com.mraibo.cminsight.web.WebServer;
 
@@ -32,6 +36,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -71,6 +76,12 @@ public final class Main {
      * <p>This is an exact set rather than a list of prefixes on purpose: with a prefix rule, a typo
      * such as {@code web.prt=8080} is silently swallowed because it still starts with {@code web.},
      * which is exactly the misconfiguration an operator most needs to be told about.
+     *
+     * <p>Goal 03 replaced the bootstrap analytics keys with the goal's documented set
+     * ({@code statistics.workers}, {@code statistics.query.timeout.seconds},
+     * {@code jdbc.pool.max.age.minutes}, {@code jdbc.pool.max.operations}). The retired names are not
+     * listed here: they are named in {@link #RETIRED_CONFIG_KEYS} so a stale file gets a warning that
+     * names its replacement instead of a generic "unknown key" - see that constant for why.
      */
     private static final Set<String> KNOWN_CONFIG_KEYS = Set.of(
             "app.name", "app.version", "app.mode",
@@ -82,12 +93,31 @@ public final class Main {
             "cm.pool.size", "cm.pool.borrow.timeout.ms",
             "cm.pool.max.age.minutes", "cm.pool.max.operations",
             "jdbc.pool.size", "jdbc.pool.borrow.timeout.ms",
-            "statistics.threads", "statistics.itemtype.timeout.seconds",
-            "statistics.scan.timeout.seconds",
+            "jdbc.pool.max.age.minutes", "jdbc.pool.max.operations",
+            StatisticsSettings.ENABLED_KEY, StatisticsSettings.WORKERS_KEY,
+            StatisticsSettings.QUERY_TIMEOUT_KEY, StatisticsSettings.SCAN_TIMEOUT_KEY,
             "cache.metadata.ttl.seconds", "cache.statistics.ttl.seconds",
             "profiles.dir", "classifications.file", "secrets.dir",
             "data.dir", "reports.dir", "logs.dir",
             "repository.auto.activate");
+
+    /**
+     * Analytics keys this build no longer reads, and the key that replaced each one.
+     *
+     * <p>The old bootstrap surface declared {@code statistics.threads} and
+     * {@code statistics.itemtype.timeout.seconds}; Goal 03 section 4 names
+     * {@code statistics.workers} and {@code statistics.query.timeout.seconds} instead, and
+     * {@code jdbc.pool.size}/{@code jdbc.pool.borrow.timeout.ms} are the only survivors of that block.
+     *
+     * <p>Why a dedicated map rather than letting them fall through as unknown keys: an operator who
+     * still has the old name in a file gets one warning that says which key to write. Leaving it to the
+     * generic "Unknown configuration key" message would be technically correct and practically
+     * useless - the old value is IGNORED, so the runtime silently uses the default parallelism, which is
+     * the one failure mode a settings rename must not produce.
+     */
+    private static final Map<String, String> RETIRED_CONFIG_KEYS = Map.of(
+            "statistics.threads", StatisticsSettings.WORKERS_KEY,
+            "statistics.itemtype.timeout.seconds", StatisticsSettings.QUERY_TIMEOUT_KEY);
 
     /** Genuinely open families whose keys are discovered from their own naming scheme. */
     private static final List<String> OPEN_CONFIG_PREFIXES = List.of(
@@ -212,16 +242,29 @@ public final class Main {
         IbmCmAdapterRegistry adapters = IbmCmAdapterRegistry.discover();
         CmAdapterSettings adapterSettings = CmAdapterSettings.from(config, secrets, classifications);
 
+        // Goal 03 (section 4): the analytics bounds are read from the SAME configuration, before anything
+        // is opened, so --print-config, --validate-config and the serving path cannot disagree about them.
+        // An out-of-range value - and a statistics.workers above jdbc.pool.size, which cannot be delivered
+        // - is a configuration error here (exit 3), exactly as it is for cm.pool.*: one reader per key.
+        //
+        // This is a MALFORMED-CONFIGURATION refusal, not the runtime unavailability section 3 is about: a
+        // missing driver, a missing JDBC credential, an unusable schema or an unreachable database still
+        // leaves the repository activated and its metadata/retention routes working (they are reported as
+        // the analytics availability state instead). Deliberately the difference between "you typed a
+        // number this build refuses" and "the database side is not usable right now".
+        JdbcPoolSettings jdbcPoolSettings = JdbcPoolSettings.from(config);
+        StatisticsSettings statisticsSettings = StatisticsSettings.from(config, jdbcPoolSettings);
+
         if (printConfig) {
             printEffectiveConfiguration(config, auth, features, profiles, classifications, secretsDir, bind, port,
-                    allowInsecureHttp, paths, adapters);
+                    allowInsecureHttp, paths, adapters, jdbcPoolSettings, statisticsSettings);
             printWarnings(warnings);
             return 0;
         }
 
         if (checkRepositoryId != null) {
-            return runRepositoryCheck(profiles, secrets, adapters, adapterSettings, checkRepositoryId,
-                    System.out, System.err);
+            return runRepositoryCheck(profiles, secrets, adapters, adapterSettings, jdbcPoolSettings,
+                    statisticsSettings, checkRepositoryId, System.out, System.err);
         }
 
         // Repository profiles are listed without an adapter; only ACTIVATION needs one. The manager is
@@ -242,14 +285,15 @@ public final class Main {
         }
 
         RepositoryManager repositories =
-                new RepositoryManager(productionFactory(adapters, adapterSettings, secrets));
+                new RepositoryManager(productionFactory(adapters, adapterSettings, secrets, jdbcPoolSettings,
+                        statisticsSettings));
         if (autoActivated != null) {
             // An activation failure propagates out of execute(), so startup fails (exit 1) instead of
             // serving a console whose repository could not be opened.
             repositories.switchTo(autoActivated);
         }
 
-        return serve(config, auth, repositories, profiles, adapters, warnings);
+        return serve(config, auth, repositories, profiles, adapters, statisticsSettings, warnings);
     }
 
     /**
@@ -261,10 +305,13 @@ public final class Main {
      */
     private static RepositoryContextFactory productionFactory(IbmCmAdapterRegistry adapters,
                                                               CmAdapterSettings adapterSettings,
-                                                              SecretResolver secrets) {
+                                                              SecretResolver secrets,
+                                                              JdbcPoolSettings jdbcPoolSettings,
+                                                              StatisticsSettings statisticsSettings) {
         Optional<CmAdapterProvider> provider = adapters.provider();
         if (provider.isPresent()) {
-            return new ProductionRepositoryContextFactory(provider.get(), adapterSettings, secrets);
+            return new ProductionRepositoryContextFactory(provider.get(), adapterSettings, secrets,
+                    jdbcPoolSettings, statisticsSettings);
         }
         // The two cases need different operator actions, so the refusal names which one it is: an adapter
         // that is not installed at all, or one that IS installed but reports its IBM runtime not ready
@@ -297,6 +344,8 @@ public final class Main {
                                           SecretResolver secrets,
                                           IbmCmAdapterRegistry adapters,
                                           CmAdapterSettings adapterSettings,
+                                          JdbcPoolSettings jdbcPoolSettings,
+                                          StatisticsSettings statisticsSettings,
                                           String repositoryId,
                                           PrintStream out,
                                           PrintStream err) {
@@ -337,7 +386,8 @@ public final class Main {
                 + adapterSettings.classifications().fallbackLabel() + "' (the rules the adapter receives)");
 
         RepositoryManager repositories =
-                new RepositoryManager(new ProductionRepositoryContextFactory(provider, adapterSettings, secrets));
+                new RepositoryManager(new ProductionRepositoryContextFactory(provider, adapterSettings, secrets,
+                        jdbcPoolSettings, statisticsSettings));
         try {
             repositories.switchTo(profile);
         } catch (RepositoryException e) {
@@ -513,6 +563,7 @@ public final class Main {
                              RepositoryManager repositories,
                              List<RepositoryProfile> profiles,
                              IbmCmAdapterRegistry adapters,
+                             StatisticsSettings statisticsSettings,
                              List<String> warnings) throws Exception {
         Router router = new Router();
         WebServer server = new WebServer(config, auth, router);
@@ -523,7 +574,15 @@ public final class Main {
         // questions with the documented adapter_unavailable status instead of a 404 that reads like a
         // path typo. Registering here also keeps every route authenticated: the registration goes through
         // Router, which refuses any unauthenticated path except /api/health.
-        server.installCmApiRoutes(repositories, profiles, adapters);
+        //
+        // Goal 03 section 13: the analytics routes are installed by the SAME call, and equally
+        // unconditionally. "No JDBC driver is installed" is a normal state of this application, so
+        // /api/statistics and /api/diagnostics/jdbc must answer with the documented unavailable state;
+        // a 404 there would be indistinguishable from a typo in the client's URL. The adapter below is
+        // lazy: constructing it opens no connection and loads no driver, and the routes read the active
+        // repository's own statistics service when a request arrives.
+        AnalyticsApi analytics = new RepositoryAnalyticsApi(repositories, statisticsSettings.enabled());
+        server.installCmApiRoutes(repositories, profiles, adapters, analytics);
 
         CountDownLatch shutdown = new CountDownLatch(1);
         AtomicBoolean closed = new AtomicBoolean();
@@ -596,7 +655,9 @@ public final class Main {
                                                      int port,
                                                      boolean allowInsecureHttp,
                                                      AppPaths paths,
-                                                     IbmCmAdapterRegistry adapters) {
+                                                     IbmCmAdapterRegistry adapters,
+                                                     JdbcPoolSettings jdbcPoolSettings,
+                                                     StatisticsSettings statisticsSettings) {
         System.out.println("CM Insight " + VERSION + " effective configuration");
         System.out.println("  config file       : " + describePath(config.sourcePath()));
         System.out.println("  web.bind          : " + bind);
@@ -630,6 +691,22 @@ public final class Main {
         System.out.println("  CM adapter        : " + adapters.status().describe());
         System.out.println("  CM adapter state  : installed=" + adapters.status().providerInstalled()
                 + ", activationReady=" + adapters.status().available());
+        // Goal 03 section 14: a LOCAL readiness report. Reading these values loads no driver, opens no
+        // connection and reads no credential, which is exactly why it is safe on the configuration path of
+        // a repository whose database is unreachable.
+        System.out.println("  JDBC pool bounds  : " + jdbcPoolSettings.describe());
+        System.out.println("  analytics         : " + statisticsSettings.describe()
+                + (statisticsSettings.enabled() ? "" : "  (feature.statistics=false: the analytics half is off"
+                        + " and no JDBC pool is created; the repository is unaffected)"));
+        for (RepositoryProfile profile : profiles) {
+            printJdbcReadiness(profile);
+        }
+        if (!profiles.isEmpty()) {
+            // Stated once, because it is the one thing an operator must not read into the lines above.
+            System.out.println("  JDBC readiness    : local only - driver discovery loads classes and inspects"
+                    + " DriverManager; no connection was attempted, and a loadable driver is NOT evidence of"
+                    + " a reachable database");
+        }
         for (RepositoryProfile profile : profiles) {
             // credentialSourceSummary covers BOTH indirections; credentialEnvNames is env-only and would
             // print nothing at all for a profile that uses a secret file.
@@ -638,6 +715,32 @@ public final class Main {
                     + (profile.credentialSourceSummary().isEmpty()
                             ? "" : " credentials: " + String.join(", ", profile.credentialSourceSummary())));
         }
+    }
+
+    /**
+     * One repository's local JDBC readiness verdict, for {@code --print-config}.
+     *
+     * <p>Four facts an operator has to be able to tell apart, printed as four facts: the vendor, whether a
+     * driver for it is installed AND registered, whether the configured URL belongs to that vendor's
+     * family, and whether the schema is configured or has to be derived from a live session at scan time.
+     *
+     * <p>Deliberately never the JDBC URL. The URL family prefix is what the mismatch is about, and it is
+     * the only part of the value this line reports - the same rule the authenticated
+     * {@code GET /api/diagnostics/jdbc} route applies, so a configuration print and a diagnostics response
+     * cannot disagree about how much of a connection string is publishable. The verdict text comes from
+     * {@code JdbcDrivers}, whose contract is that it never contains the URL, a user name, a credential or a
+     * driver message.
+     */
+    private static void printJdbcReadiness(RepositoryProfile profile) {
+        JdbcDrivers.Readiness readiness = JdbcDrivers.readiness(profile.databaseVendor(), profile.jdbcUrl());
+        System.out.println("  JDBC readiness    : " + profile.id()
+                + " [" + profile.databaseVendor() + "] "
+                + (readiness.ready()
+                        ? "ready (driver " + readiness.driverIdentity() + ")"
+                        : "NOT ready: " + readiness.reason())
+                + ", url family " + JdbcDrivers.urlPrefix(profile.databaseVendor())
+                + ", schema " + (profile.jdbcSchema() == null
+                        ? "to be derived from a live session at scan time" : "configured"));
     }
 
     /**
@@ -659,6 +762,15 @@ public final class Main {
                 continue;
             }
             if (known.contains(key) || OPEN_CONFIG_PREFIXES.stream().anyMatch(key::startsWith)) {
+                continue;
+            }
+            String replacement = RETIRED_CONFIG_KEYS.get(key);
+            if (replacement != null) {
+                // Named before the generic case, and with the replacement, because this key is not a typo:
+                // it worked in a previous build and its value is now IGNORED. An operator who keeps it
+                // silently gets the default parallelism instead of the one they configured.
+                warnings.add("Configuration key '" + key + "' was retired by Goal 03 and is IGNORED;"
+                        + " write '" + replacement + "' instead (its value is not carried over).");
                 continue;
             }
             warnings.add("Unknown configuration key '" + key + "' is ignored.");

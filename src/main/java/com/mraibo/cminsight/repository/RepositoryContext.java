@@ -8,6 +8,8 @@ import com.mraibo.cminsight.core.CmPoolDiagnostics;
 import com.mraibo.cminsight.core.RepositoryServices;
 import com.mraibo.cminsight.metadata.MetadataRepository;
 import com.mraibo.cminsight.retention.RetentionRepository;
+import com.mraibo.cminsight.statistics.StatisticsDiagnostics;
+import com.mraibo.cminsight.statistics.StatisticsRepository;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -204,6 +206,37 @@ public final class RepositoryContext implements CloseOutcomeAware, CloseStateAwa
      */
     public Optional<CmPoolDiagnostics> cmPool() {
         return services.cmDiagnosticsService();
+    }
+
+    /**
+     * The analytics read/refresh service, or empty when this repository has no analytics capability.
+     *
+     * <p>Goal 03's typed accessor, in the same shape as {@link #metadata()} and {@link #retention()} - the
+     * project forbids a {@code Map<String,Object>} service locator, so a new capability gets a declared,
+     * compile-checked accessor rather than a string key.
+     *
+     * <p>Empty is a normal state, not a broken activation: {@code feature.statistics=false}, an absent
+     * DB2/Oracle driver, a missing JDBC credential and an unreachable database all leave the IBM CM
+     * metadata and retention halves fully usable, and JDBC is never contacted while a repository is being
+     * activated. Safe after {@link #close()} as well, so a diagnostics page can describe a repository that
+     * is shutting down.
+     */
+    public Optional<StatisticsRepository> statistics() {
+        return services.statisticsRepository();
+    }
+
+    /**
+     * The analytics JDBC pool and scan facts as value-only numbers, or empty when this context has no
+     * analytics capability to describe.
+     *
+     * <p>The mirror of {@link #cmPool()} for the JDBC half, with one deliberate difference: it returns a
+     * plain record rather than an object holding a pool, because the goal forbids the web layer from
+     * receiving a {@code Connection}, {@code Statement}, {@code ResultSet} or driver object - and a
+     * diagnostics view that cannot hold a pool cannot leak one. No JDBC URL, user name, schema or raw
+     * driver message exists in the returned type.
+     */
+    public Optional<StatisticsDiagnostics> jdbcPool() {
+        return statistics().map(StatisticsRepository::diagnostics);
     }
 
     /** Descriptions of resources that failed to close, if any. */

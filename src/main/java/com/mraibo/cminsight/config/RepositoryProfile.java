@@ -233,6 +233,33 @@ public record RepositoryProfile(
     }
 
     /**
+     * Resolves <strong>only</strong> the two JDBC credentials of this repository.
+     *
+     * <p>The exact mirror of {@link #resolveCmCredentials(SecretResolver)} for the other half of the
+     * architecture, and for the same reason: the IBM CM adapter must never be made to depend on a
+     * database credential it does not use, so the analytics layer resolves the pair it needs, when it
+     * needs it, and nothing else. Goal 03 requires a re-resolution for <em>every</em> new or replacement
+     * JDBC connection, so the caller must invoke this method per connection attempt rather than caching
+     * the result - a credential rotated, revoked or removed between two scans then takes effect at the
+     * next connection instead of pinning the value that existed at activation time.
+     *
+     * <p>Fails closed in exactly the same way as the CM form: an unconfigured source, an unset
+     * environment variable or an unreadable secret file raises {@link ConfigException} naming the field
+     * and the source, and no partial or empty value is ever returned. Because that failure happens
+     * <em>before</em> any JDBC connection is requested, the analytics layer reports it as a proven-clean
+     * pre-allocation failure, so the reserved pool slot is released and a later attempt can succeed once
+     * the credential is back.
+     *
+     * @throws ConfigException when either JDBC credential is unconfigured or cannot be resolved
+     */
+    public JdbcCredentials resolveJdbcCredentials(SecretResolver secrets) {
+        Objects.requireNonNull(secrets, "secrets");
+        return new JdbcCredentials(
+                resolve(secrets, jdbcUserRef, JDBC_USER_KEY),
+                resolve(secrets, jdbcPasswordRef, JDBC_PASSWORD_KEY));
+    }
+
+    /**
      * True when the JDBC URL embeds a credential instead of referencing one by name.
      *
      * <p>{@link RepositoryProfileLoader} rejects such a profile outright; this method exists so the
@@ -358,6 +385,34 @@ public record RepositoryProfile(
         public String toString() {
             return "CmCredentials[cmUser=" + cmUser.describe()
                     + ", cmPassword=<redacted from " + cmPassword.describe() + ">]";
+        }
+    }
+
+    /**
+     * The two resolved JDBC credentials of one scan, and only those.
+     *
+     * <p>The mirror of {@link CmCredentials} for the analytics half, with the same guarantees: resolved
+     * {@link SecretRef} instances, never printable values, {@link #toString()} showing the sources.
+     * Read a value with {@link SecretResolver#resolve(SecretRef)}; never log, serialise or print this
+     * object. Goal 03 re-resolves this pair for every new or replacement connection, so it is
+     * deliberately a short-lived value rather than something the analytics layer caches.
+     */
+    public record JdbcCredentials(SecretRef jdbcUser, SecretRef jdbcPassword) {
+
+        public JdbcCredentials {
+            jdbcUser = requireResolved(jdbcUser, JDBC_USER_KEY);
+            jdbcPassword = requireResolved(jdbcPassword, JDBC_PASSWORD_KEY);
+        }
+
+        /** True when both JDBC credentials carry a value. Always true for a constructed instance. */
+        public boolean usable() {
+            return jdbcUser.resolved() && jdbcPassword.resolved();
+        }
+
+        @Override
+        public String toString() {
+            return "JdbcCredentials[jdbcUser=" + jdbcUser.describe()
+                    + ", jdbcPassword=<redacted from " + jdbcPassword.describe() + ">]";
         }
     }
 

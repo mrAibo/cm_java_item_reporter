@@ -61,9 +61,34 @@ public final class SelfCheck {
         }
     }
 
+    /**
+     * The dialects still identify themselves by the configuration vendor name, and every SQL operation they
+     * expose is now a <strong>complete statement</strong>.
+     *
+     * <p>The replaced dialect exposed {@code oneRowSuffix()}, and the two implementations disagreed about
+     * what that fragment was: DB2 returned a trailing clause, Oracle a {@code WHERE}-clause fragment that was
+     * wrong unless the caller happened to have a {@code WHERE} clause. Pinning the complete statements here
+     * means the packaged artifact cannot silently reintroduce a context-sensitive fragment.
+     */
     private static void dialectsAreStable() {
-        check("DB2 dialect id", "DB2".equals(new Db2Dialect().id()));
-        check("Oracle dialect id", "ORACLE".equals(new OracleDialect().id()));
+        Db2Dialect db2 = new Db2Dialect();
+        OracleDialect oracle = new OracleDialect();
+        check("DB2 dialect id", "DB2".equals(db2.id()));
+        check("Oracle dialect id", "ORACLE".equals(oracle.id()));
+        check("DB2 accepts only db2 URLs",
+                db2.supports("jdbc:db2://host:50000/db") && !db2.supports("jdbc:oracle:thin:@host:1521/db"));
+        check("Oracle accepts only oracle URLs",
+                oracle.supports("jdbc:oracle:thin:@host:1521/db") && !oracle.supports("jdbc:db2://host:50000/db"));
+        check("DB2 current-date query is a complete SELECT using DB2's dummy table",
+                "SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1".equals(db2.currentDateSql().trim()));
+        check("Oracle current-date query is a complete statement using DUAL",
+                oracle.currentDateSql().toUpperCase(java.util.Locale.ROOT).contains("FROM DUAL"));
+        check("DB2 zero-row probe carries DB2's own row-limit clause",
+                "SELECT 1 AS PRESENT FROM ICMADMIN.ICMUT00001001 WHERE 1 = 0 FETCH FIRST 1 ROW ONLY"
+                        .equals(db2.zeroRowProbeSql("ICMADMIN", "ICMUT00001001")));
+        check("Oracle zero-row probe carries its own row-limit predicate",
+                "SELECT 1 AS PRESENT FROM ICMADMIN.ICMUT00001001 WHERE 1 = 0 AND ROWNUM <= 1"
+                        .equals(oracle.zeroRowProbeSql("ICMADMIN", "ICMUT00001001")));
     }
 
     private static void durationParsingIsStrict() {

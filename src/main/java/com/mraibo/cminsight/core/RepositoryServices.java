@@ -4,6 +4,7 @@ import com.mraibo.cminsight.metadata.ItemTypeSummary;
 import com.mraibo.cminsight.metadata.MetadataRepository;
 import com.mraibo.cminsight.retention.RetentionRepository;
 import com.mraibo.cminsight.retention.RetentionPolicyInfo;
+import com.mraibo.cminsight.statistics.StatisticsRepository;
 
 import java.util.List;
 import java.util.Optional;
@@ -31,21 +32,45 @@ import java.util.Optional;
  * appear in this file or in any signature it declares; the build enforces that over all of
  * {@code src/main/java}.
  *
+ * <h2>Analytics is a service like any other, and still optional</h2>
+ *
+ * <p>{@code statistics} is the typed analytics service (Goal 03). It is nullable exactly like the others:
+ * when {@code feature.statistics=false}, when the JDBC driver is absent, when the JDBC credential is
+ * missing or when the database is unreachable, the IBM CM halves must stay fully usable, so a context with
+ * no analytics capability is a normal context rather than a broken one. The three-argument constructor is
+ * kept so every pre-Goal-03 construction site and test compiles unchanged.
+ *
  * @param metadata      the read-only ItemType metadata service, or {@code null} when unavailable
  * @param retention     the read-only retention viewer service, or {@code null} when unavailable
  * @param cmDiagnostics the CM pool and adapter diagnostics, or {@code null} when there is no CM pool
+ * @param statistics    the analytics read/refresh service, or {@code null} when analytics is disabled or
+ *                      unavailable; its presence never affects the CM halves
  */
 public record RepositoryServices(
         MetadataRepository metadata,
         RetentionRepository retention,
-        CmPoolDiagnostics cmDiagnostics) {
+        CmPoolDiagnostics cmDiagnostics,
+        StatisticsRepository statistics) {
 
     /** No services at all: core-only mode, or a context built before an adapter exists. */
     public static final RepositoryServices NONE = new RepositoryServices(null, null, null);
 
-    /** True when neither read service is available, so a repository cannot answer metadata questions. */
+    /** The pre-Goal-03 shape, kept so existing construction sites and tests are unchanged. */
+    public RepositoryServices(MetadataRepository metadata,
+                              RetentionRepository retention,
+                              CmPoolDiagnostics cmDiagnostics) {
+        this(metadata, retention, cmDiagnostics, null);
+    }
+
+    /**
+     * True when no read service at all is available, so a repository cannot answer any read question.
+     *
+     * <p>Analytics counts: a context that can only report statistics is still a context a caller can read
+     * something from, and reporting it as "no read services" would send a reader looking for a broken
+     * activation instead of a disabled metadata half.
+     */
     public boolean hasReadServices() {
-        return metadata != null || retention != null;
+        return metadata != null || retention != null || statistics != null;
     }
 
     public Optional<MetadataRepository> metadataService() {
@@ -58,6 +83,18 @@ public record RepositoryServices(
 
     public Optional<CmPoolDiagnostics> cmDiagnosticsService() {
         return Optional.ofNullable(cmDiagnostics);
+    }
+
+    /**
+     * The analytics read/refresh service, or empty when this repository has no analytics capability.
+     *
+     * <p>Empty is the honest answer in four different situations that must all leave the CM halves working:
+     * the feature is switched off, the JDBC driver is absent, the JDBC credential is missing or unreadable,
+     * and the database is unreachable. A caller that needs to distinguish them asks the service's own
+     * availability verdict - which is why an empty optional here is not an error state.
+     */
+    public Optional<StatisticsRepository> statisticsRepository() {
+        return Optional.ofNullable(statistics);
     }
 
     /**
