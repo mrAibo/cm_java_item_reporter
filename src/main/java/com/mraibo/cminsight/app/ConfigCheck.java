@@ -2,6 +2,7 @@ package com.mraibo.cminsight.app;
 
 import com.mraibo.cminsight.config.AppConfig;
 import com.mraibo.cminsight.config.AppPaths;
+import com.mraibo.cminsight.config.ClassificationRules;
 import com.mraibo.cminsight.config.ConfigException;
 import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.config.RepositoryProfileLoader;
@@ -462,11 +463,13 @@ public final class ConfigCheck {
      * <p>Three verdicts, each the one the runtime would produce:
      *
      * <ul>
-     *   <li>exactly one provider - informational;</li>
-     *   <li>no provider, more than one, or an unloadable one - a WARNING while nothing is configured to
-     *       activate, because the runtime still starts and lists its repositories, and an ERROR as soon as
-     *       {@code repository.auto.activate} names one, because then startup genuinely fails. A missing
-     *       optional adapter is never a configuration error by itself;</li>
+     *   <li>exactly one provider AND its vendor runtime ready - informational, and it reports the two facts
+     *       separately, because "an adapter is installed" is not "activation is ready" (section C);</li>
+     *   <li>no provider, more than one, an unloadable one, or one whose runtime is not ready - a WARNING
+     *       while nothing is configured to activate, because the runtime still starts and lists its
+     *       repositories, and an ERROR as soon as {@code repository.auto.activate} names one, because then
+     *       startup genuinely fails. A missing optional adapter is never a configuration error by
+     *       itself;</li>
      *   <li>an adapter setting outside its documented range - an ERROR, since the runtime reads those keys
      *       before it serves anything.</li>
      * </ul>
@@ -478,16 +481,24 @@ public final class ConfigCheck {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(secrets, "secrets");
 
-        List<Finding> findings = new ArrayList<>(3);
+        List<Finding> findings = new ArrayList<>(4);
         IbmCmAdapterRegistry.Status status = IbmCmAdapterRegistry.discover().status();
         // Read exactly as Main does, so the doctor's verdict and the runtime's refusal cannot diverge
         // about whether auto-activation is configured at all.
         String requested = config.get(AUTO_ACTIVATE_KEY, "");
         boolean autoActivationConfigured = requested != null && !requested.isBlank();
 
+        // Section C, first fact: is the adapter's CODE installed? Reported for every outcome, because the
+        // two concepts have to be visible independently or the verdict cannot be told apart from a
+        // core-only build that legitimately has no adapter.
+        findings.add(new Finding(Level.OK, "CM adapter installed = " + status.providerInstalled()
+                + (status.providerId().isEmpty() ? "" : " (provider " + status.providerId()
+                        + ", adapter " + status.adapterVersion() + ")")));
+
         if (status.available()) {
             findings.add(new Finding(Level.OK, "CM adapter " + status.providerId() + " (adapter "
-                    + status.adapterVersion() + ", CM API " + status.sdkReleaseOrUnknown() + ") is available"));
+                    + status.adapterVersion() + ", CM API " + status.sdkReleaseOrUnknown()
+                    + ") is available and its runtime is ready to activate a repository"));
         } else if (autoActivationConfigured) {
             findings.add(new Finding(Level.ERROR, status.describe() + "; " + AUTO_ACTIVATE_KEY + "='"
                     + requested.trim() + "' is configured, so the runtime refuses to start"));
@@ -495,10 +506,17 @@ public final class ConfigCheck {
             findings.add(new Finding(Level.WARN, status.describe()
                     + "; repository profiles are listed but none can be activated"));
         }
+        // Section D: the settings are built from the SAME configuration this check just read, including the
+        // rules it loaded from that configuration, so the doctor reports exactly the rule set the adapter
+        // will consume. The adapter has no configuration reader of its own to disagree with.
         try {
-            CmAdapterSettings settings = CmAdapterSettings.from(config, secrets);
+            ClassificationRules classifications = ClassificationRules.load(config);
+            CmAdapterSettings settings = CmAdapterSettings.from(config, secrets, classifications);
             findings.add(new Finding(Level.OK, "adapter settings " + settings.pool() + ", "
                     + CmAdapterSettings.METADATA_TTL_KEY + "=" + settings.metadataCacheTtlSeconds() + "s"));
+            findings.add(new Finding(Level.OK, "adapter classification rules "
+                    + settings.classifications().ruleCount() + " rule(s), fallback '"
+                    + settings.classifications().fallbackLabel() + "' (from this configuration)"));
         } catch (ConfigException e) {
             findings.add(new Finding(Level.ERROR, e.getMessage()));
         }

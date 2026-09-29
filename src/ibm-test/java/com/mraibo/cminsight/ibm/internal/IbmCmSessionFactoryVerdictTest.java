@@ -135,9 +135,11 @@ public final class IbmCmSessionFactoryVerdictTest {
 
         Exception failure = assertThrows(Exception.class, factory::create, "the failure must still surface");
         assertFalse(failure instanceof CreationFailure,
-                "C: a failure that carries no cleanup evidence must not be relabelled as a verdict; the pool's"
-                        + " documented default for a non-CreationFailure is to release the slot, and inventing"
-                        + " a verdict here would change that silently. Got: " + failure);
+                "C: a failure that carries no cleanup evidence must not be relabelled as a verdict. The pool's"
+                        + " Goal 02A default for anything that is not a CreationFailure is to QUARANTINE the"
+                        + " reserved slot, so inventing a PROVEN_CLEAN here would release capacity the adapter"
+                        + " never proved it released, and inventing UNPROVEN would lose capacity for a failure"
+                        + " that says nothing at all. Got: " + failure);
     }
 
     /** One unproven creation must quarantine the pool's only slot, and no replacement may be created. */

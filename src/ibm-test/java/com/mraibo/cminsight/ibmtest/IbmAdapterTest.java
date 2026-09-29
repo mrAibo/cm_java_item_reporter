@@ -1,9 +1,12 @@
 package com.mraibo.cminsight.ibmtest;
 
 import com.mraibo.cminsight.ibm.internal.IbmCmSessionFactoryVerdictTest;
+import com.mraibo.cminsight.ibm.internal.IbmClassificationProvenanceTest;
 import com.mraibo.cminsight.ibm.internal.IbmCleanupVerdictTest;
+import com.mraibo.cminsight.ibm.internal.IbmConnectCleanupRuleTest;
 import com.mraibo.cminsight.ibm.internal.IbmMappingRulesTest;
 import com.mraibo.cminsight.ibm.internal.IbmProviderRegistrationTest;
+import com.mraibo.cminsight.ibm.internal.IbmSessionPoisoningTest;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -61,6 +64,9 @@ public final class IbmAdapterTest {
             IbmProviderRegistrationTest.class,
             IbmCmSessionFactoryVerdictTest.class,
             IbmCleanupVerdictTest.class,
+            IbmConnectCleanupRuleTest.class,
+            IbmSessionPoisoningTest.class,
+            IbmClassificationProvenanceTest.class,
             IbmMappingRulesTest.class);
 
     private IbmAdapterTest() {

@@ -182,4 +182,63 @@ public class ClassificationRulesTest {
         Assert.assertEquals("default", ClassificationRules.DEFAULT_KEY, "the reserved rule name");
         Assert.assertEquals("Unclassified", ClassificationRules.FALLBACK_LABEL, "the built-in label");
     }
+
+    /**
+     * Goal 02A section D: the adapter settings carry EXACTLY the rule set the core loaded from the
+     * configuration it selected.
+     *
+     * <h2>Why the identity assertion is the point</h2>
+     *
+     * <p>The defect was not a wrong rule engine - it was a second, independent load from the DEFAULT
+     * configuration path inside the adapter. So the property to pin is provenance, not behaviour: the rule
+     * set that reaches {@code CmAdapterSettings.classifications()} must be the very instance the caller
+     * loaded, which is what makes "the launcher printed and validated these rules" and "the adapter labels
+     * ItemTypes with these rules" the same statement.
+     *
+     * <h2>And the divergence is measured, not assumed</h2>
+     *
+     * <p>A custom configuration and a default one are built side by side and asserted to disagree about the
+     * same ItemType name. That is the shape an operator would see if the adapter ever went back to reading a
+     * configuration of its own, and asserting the difference means a test cannot pass by having both paths
+     * collapse onto the built-in fallback.
+     */
+    public void theAdapterSettingsCarryTheRulesLoadedFromTheSelectedConfiguration() {
+        Properties custom = new Properties();
+        custom.setProperty("classification.custom.label", "CustomBiz");
+        custom.setProperty("classification.custom.regex", "SAP_.*");
+        custom.setProperty("classification.default.label", "AnythingElse");
+        custom.setProperty("cm.pool.size", "2");
+        com.mraibo.cminsight.config.AppConfig customConfig =
+                com.mraibo.cminsight.config.AppConfig.fromProperties(custom);
+
+        ClassificationRules loaded = ClassificationRules.load(customConfig);
+        com.mraibo.cminsight.ibm.CmAdapterSettings settings =
+                com.mraibo.cminsight.ibm.CmAdapterSettings.from(customConfig,
+                        new com.mraibo.cminsight.config.SecretResolver(java.util.Map.of(), null), loaded);
+
+        Assert.assertTrue(settings.classifications() == loaded,
+                "D: the settings must carry the SAME rule set instance the core loaded - a copy, a re-parse"
+                        + " or any second load is the divergence this section removes");
+        Assert.assertEquals(1, settings.classifications().ruleCount(),
+                "D: and it is the rule set from THIS configuration, not an empty default");
+        Assert.assertEquals("CustomBiz", settings.classifications().classify("SAP_MATERIAL"),
+                "D: whose rule really labels an ItemType");
+        Assert.assertEquals("AnythingElse", settings.classifications().classify("ZZZ"),
+                "D: and whose declared fallback applies to everything else");
+
+        com.mraibo.cminsight.config.AppConfig defaultConfig =
+                com.mraibo.cminsight.config.AppConfig.fromProperties(new Properties());
+        ClassificationRules defaultRules = ClassificationRules.load(defaultConfig);
+        com.mraibo.cminsight.ibm.CmAdapterSettings defaultSettings =
+                com.mraibo.cminsight.ibm.CmAdapterSettings.from(defaultConfig,
+                        new com.mraibo.cminsight.config.SecretResolver(java.util.Map.of(), null), defaultRules);
+
+        Assert.assertEquals(0, defaultSettings.classifications().ruleCount(),
+                "D: a default configuration has no rules, so the two settings differ by construction");
+        Assert.assertFalse("CustomBiz".equals(defaultSettings.classifications().classify("SAP_MATERIAL")),
+                "D: and the default configuration can NEVER produce the custom label - if it could, the two"
+                        + " configurations could silently diverge without anyone noticing");
+        Assert.assertFalse(defaultSettings.classifications() == loaded,
+                "D: the two settings really carry different rule sets, so the comparison above says something");
+    }
 }

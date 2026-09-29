@@ -15,29 +15,43 @@ import java.util.List;
  * None of those is representable here: retention administration is a later goal with its own security
  * review, and this record cannot carry a mutation even if a future caller wanted one.
  *
- * <h2>Unknown values stay visible</h2>
+ * <h2>Unknown values stay visible, and unmapped numeric codes are never presented as numbers</h2>
  *
  * <p>The retention type, the period unit and the expiration action are IBM enumerations whose numeric
- * codes are not recoverable from the SDK's class files. Where this build cannot map a value with
- * certainty the readable field carries {@code UNKNOWN(<value>)} and the numeric field carries exactly
- * what the server returned. A guessed unit would silently mis-state how long customer data is kept,
- * which is the one mistake a retention viewer must never make.
+ * codes are not recoverable from the SDK's class files: the SDK exposes the constants
+ * ({@code DK_ICM_RETENTION_TYPE}, {@code DK_ICM_POLICY_TIME_UNIT}, {@code DK_ICM_EXPIRATION_ACTION_TYPE})
+ * but carries no numeric code field on them, so no CM number for a constant can be read out of the SDK at
+ * all. Where this build cannot map a value with certainty the readable field carries
+ * {@code UNKNOWN(<constant>)} - IBM's own constant identity, which is certain - and the numeric field
+ * carries {@code null}, meaning <em>no numeric CM code has been established</em>. A guessed unit or code
+ * would silently mis-state how long customer data is kept, which is the one mistake a retention viewer
+ * must never make.
+ *
+ * <p>{@code null} is therefore the only representation of "unmapped" for
+ * {@link #retentionTypeCode()} and {@link #expirationActionCode()}: not {@code -1}, not {@code 0}, and
+ * never the enumeration's declaration ordinal, which is a position in the SDK's class file and not a CM
+ * code. This record makes that structural rather than a convention: a CM enum code is never negative, so
+ * the canonical constructor normalises any negative value to {@code null}. Neither this adapter nor a
+ * future one can put a plausible-looking number in the field, and a caller that wants a number must
+ * handle the absence explicitly instead of reading a sentinel as a server value.
  *
  * @param name                the policy name
  * @param description         the policy description, or an empty string
  * @param policyId            the integer policy id, or -1 when IBM does not expose one
- * @param retentionType       the readable retention type, or {@code UNKNOWN(<value>)}
- * @param retentionTypeCode   the exact numeric retention-type value
+ * @param retentionType       the readable retention type, or {@code UNKNOWN(<constant>)}
+ * @param retentionTypeCode   the numeric CM retention-type code, or {@code null} when this build has no
+ *                            established mapping for IBM's constant (never -1)
  * @param retentionEnabled    IBM's "retention is enabled" flag, exactly as reported
  * @param retentionPeriod     the retention period as a number and its unit, for display
  * @param retentionPeriodValue the retention period as a number, or -1 when not applicable
- * @param retentionUnit       the readable period unit, or {@code UNKNOWN(<value>)}
+ * @param retentionUnit       the readable period unit, or {@code UNKNOWN(<constant>)}
  * @param expirationEnabled   IBM's "expiration is enabled" flag, exactly as reported
  * @param expirationPeriod    the expiration period as a number and its unit, for display
  * @param expirationPeriodValue the expiration period as a number, or -1 when not applicable
- * @param expirationUnit      the readable period unit, or {@code UNKNOWN(<value>)}
- * @param expirationAction    the readable expiration action, or {@code UNKNOWN(<value>)}
- * @param expirationActionCode the exact numeric expiration-action value
+ * @param expirationUnit      the readable period unit, or {@code UNKNOWN(<constant>)}
+ * @param expirationAction    the readable expiration action, or {@code UNKNOWN(<constant>)}
+ * @param expirationActionCode the numeric CM expiration-action code, or {@code null} when this build has
+ *                            no established mapping for IBM's constant (never -1)
  * @param autoDeleteSchedule  the auto-delete schedule information, or an empty string when IBM has none
  * @param commitCount         the auto-delete commit count, or -1 when not applicable
  * @param maxRows             the auto-delete maximum rows/items, or -1 when not applicable
@@ -50,7 +64,7 @@ public record RetentionPolicyInfo(
         String description,
         int policyId,
         String retentionType,
-        int retentionTypeCode,
+        Integer retentionTypeCode,
         boolean retentionEnabled,
         String retentionPeriod,
         int retentionPeriodValue,
@@ -60,7 +74,7 @@ public record RetentionPolicyInfo(
         int expirationPeriodValue,
         String expirationUnit,
         String expirationAction,
-        int expirationActionCode,
+        Integer expirationActionCode,
         String autoDeleteSchedule,
         int commitCount,
         int maxRows,
@@ -79,6 +93,22 @@ public record RetentionPolicyInfo(
         expirationAction = expirationAction == null ? "" : expirationAction;
         autoDeleteSchedule = autoDeleteSchedule == null ? "" : autoDeleteSchedule;
         assignedItemTypes = assignedItemTypes == null ? List.of() : List.copyOf(assignedItemTypes);
+        // A CM enum code is never negative, so a negative value is not a code: it is the adapter's old -1
+        // "unmapped" marker, or a defect. Both mean the same thing to a caller - no number - and normalising
+        // them here is what stops such a marker ever reaching an operator as a plausible server value.
+        retentionTypeCode = unavailableWhenNegative(retentionTypeCode);
+        expirationActionCode = unavailableWhenNegative(expirationActionCode);
+    }
+
+    /**
+     * The code itself when it is one, or {@code null} when no numeric CM code has been established.
+     *
+     * <p>The absence is the point: returning {@code null} forces every caller to decide what to show
+     * instead of reading a number that this build invented. It cannot be mistaken for a value IBM CM
+     * reported, which is exactly the failure mode this record exists to prevent.
+     */
+    private static Integer unavailableWhenNegative(Integer code) {
+        return code == null || code < 0 ? null : code;
     }
 
     /** True when IBM assigns at least one ItemType to this policy. */

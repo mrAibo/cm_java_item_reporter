@@ -3,6 +3,7 @@ package com.mraibo.cminsight.test;
 import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
 import com.mraibo.cminsight.repository.RepositoryManager;
+import com.mraibo.cminsight.retention.RetentionPolicyInfo;
 import com.mraibo.cminsight.security.Authenticator;
 import com.mraibo.cminsight.security.LoginThrottle;
 import com.mraibo.cminsight.web.CmApiRoutes;
@@ -188,6 +189,65 @@ public class CmApiRoutesInstallTest {
         Assert.assertFalse(reads.bodyText().isBlank(),
                 "and the refusal must carry a body: an empty response would be indistinguishable from 'this"
                         + " repository has no ItemTypes'");
+    }
+
+    /**
+     * Goal 02A section F at the API boundary: the JSON the routes emit carries NO numeric code where none
+     * has been established - it carries {@code null}.
+     *
+     * <h2>Why this is asserted here and not through a live route</h2>
+     *
+     * <p>Both retention routes serialise through {@code CmApiRoutes.policyJson(RetentionPolicyInfo)}, whose
+     * output is embedded by {@code GET /api/retention/policies} and by
+     * {@code GET /api/retention/policies/{name}}. Reaching either of those with a real policy needs an
+     * activated repository and a live retention read, so the serialiser itself is invoked directly here -
+     * it is the exact code the API returns, not a parallel implementation - and a DTO-level test in the
+     * adapter suite pins the value that reaches it.
+     *
+     * <p>The assertion is deliberately about the WHOLE payload (no {@code -1} anywhere in it) rather than
+     * only about the two fields: the defect section F removes is a doc'd "exact server code" carrying a
+     * number that was never a server code, and a payload that leaks that number under a different key would
+     * be the same defect.
+     */
+    public void theApiJsonCarriesAnAbsentRetentionCodeAsNull() throws Exception {
+        RetentionPolicyInfo unmapped = retentionPolicy(7, null, null);
+        String json = policyJson(unmapped);
+
+        Assert.assertTrue(json.contains("\"retentionTypeCode\":null"),
+                "F: an established-nowhere numeric code must be serialised as null, not as a number: " + json);
+        Assert.assertTrue(json.contains("\"expirationActionCode\":null"),
+                "F: and so must the expiration-action code: " + json);
+        Assert.assertFalse(json.contains("-1"),
+                "F: no part of the policy payload may carry the retired -1 sentinel, because -1 is a number a"
+                        + " reader would take for an exact CM server code: " + json);
+        Assert.assertTrue(json.contains("\"retentionType\":\"UNKNOWN(FIXED_TIME)\""),
+                "F: while the readable field still carries IBM's certain constant identity: " + json);
+
+        String mapped = policyJson(retentionPolicy(7, 3, 11));
+        Assert.assertTrue(mapped.contains("\"retentionTypeCode\":3"),
+                "F: a real code is still reported as the number the server said: " + mapped);
+        Assert.assertTrue(mapped.contains("\"expirationActionCode\":11"),
+                "F: and so is a real expiration-action code: " + mapped);
+    }
+
+    /** A documented retention policy for the JSON assertions; every other numeric is non-negative. */
+    private static RetentionPolicyInfo retentionPolicy(int policyId, Integer retentionTypeCode,
+                                                     Integer expirationActionCode) {
+        return new RetentionPolicyInfo(
+                "Policy", "description", policyId,
+                "UNKNOWN(FIXED_TIME)", retentionTypeCode,
+                true, "period", 30, "DAY",
+                true, "expiration", 90, "DAY",
+                "UNKNOWN(AUTO_DELETE)", expirationActionCode,
+                "", 0, 0, 0, false, List.of("ItemTypeA"));
+    }
+
+    /** The exact serialiser both retention routes use; private today, so it is called reflectively. */
+    private static String policyJson(RetentionPolicyInfo policy) throws Exception {
+        java.lang.reflect.Method policyJson =
+                CmApiRoutes.class.getDeclaredMethod("policyJson", RetentionPolicyInfo.class);
+        policyJson.setAccessible(true);
+        return (String) policyJson.invoke(null, policy);
     }
 
     // ------------------------------------------------------------------ harness

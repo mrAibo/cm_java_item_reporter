@@ -91,8 +91,8 @@ public final class IbmEnumNames {
      *
      * <p>The SDK exposes this as an enum whose numeric mapping to the CM code is NOT recoverable from
      * the class files, so the readable field is reported as unknown and only the constant's own name is
-     * exposed - see {@link #retentionTypeConstantName}. The DTO's numeric field carries
-     * {@link #UNMAPPED_CODE}.
+     * exposed - see {@link #retentionTypeConstantName}. The DTO's numeric field is {@code null} rather
+     * than a sentinel, so "no code established" cannot be read as a number.
      */
     public static String retentionTypeName(DKRetentionPolicyDefICM.DK_ICM_RETENTION_TYPE value) {
         return UNMAPPED;
@@ -156,14 +156,13 @@ public final class IbmEnumNames {
     }
 
     /**
-     * The numeric field reported when the SDK hands back an enum whose CM code this build cannot map.
+     * The text used wherever a numeric value cannot be mapped with certainty.
      *
-     * <p>{@code -1} is used consistently across the DTOs for "not applicable or not recoverable", and it
-     * is deliberately not a plausible CM code: a real code would be believed.
+     * <p>Replaces the retired {@code UNMAPPED_CODE = -1} sentinel: the retention DTO's numeric
+     * enum-code fields are nullable {@code Integer}s now, so "no numeric CM code was established" is
+     * {@code null} and cannot be mistaken for a number, and no sentinel constant is left for a caller to
+     * pass. {@code RetentionPolicyInfo.retentionTypeCode()} documents the null contract.
      */
-    public static final int UNMAPPED_CODE = -1;
-
-    /** The text used wherever a numeric value cannot be mapped with certainty. */
     public static final String UNMAPPED = "UNKNOWN";
 
     /** The text for one specific unknown numeric value. Never a blank and never a guessed neighbour. */

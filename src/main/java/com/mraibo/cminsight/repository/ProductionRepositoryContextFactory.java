@@ -30,6 +30,11 @@ import java.util.Optional;
  * <h2>The activation sequence, and why it is in this order</h2>
  *
  * <ol>
+ *   <li><strong>Refuse an adapter whose vendor runtime is not ready.</strong> Readiness is asked before
+ *       anything is allocated, so an adapter that cannot activate a repository never reaches a session
+ *       factory, a pool or a credential read. Through {@code Main} this is already impossible - the
+ *       registry refuses such an adapter and exposes no provider - and this step is the structural form of
+ *       the same rule for every other route to this factory.</li>
  *   <li><strong>Resolve the credentials the adapter actually needs.</strong> Only the two CM credentials,
  *       never the JDBC pair: this build reads ItemTypes and retention policies and never opens the database,
  *       so requiring a JDBC password would make a read path depend on something it does not use. Resolving
@@ -96,6 +101,14 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
 
         CmPoolSettings poolSettings = settings.pool();
 
+        // 0. Fail closed on an adapter whose vendor runtime cannot activate anything, BEFORE any resource
+        //    exists. Through Main this is unreachable - the registry refuses such an adapter and exposes no
+        //    provider at all - and it is kept because it is the structural form of the same rule: a
+        //    readiness verdict of "not ready" must never be able to produce a pool, a session or a factory,
+        //    whatever route reached this factory. Nothing is allocated above this line, so the refusal
+        //    carries no cleanup context.
+        requireRuntimeReady(profile);
+
         // 1. Fail closed on a credential the adapter cannot use, before any resource exists.
         RepositoryProfile.CmCredentials credentials = resolveCredentials(profile);
 
@@ -152,6 +165,70 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
         //    activated repository - its services are reported as unavailable rather than faked.
         return new RepositoryContext(profile, List.copyOf(resources), published);
     }
+
+    /**
+     * Refuses activation unless the adapter reports its vendor runtime ready.
+     *
+     * <p>Asked before any resource is allocated, and the answer is taken as final: an adapter that says it
+     * cannot activate a repository is never asked for a session factory, so no pool is built and no
+     * credential is even resolved. A readiness answer that throws is treated as NOT ready - the conservative
+     * direction - because a provider that cannot answer has not proven that it can activate anything.
+     *
+     * @throws ActivationFailedException with no cleanup context: nothing exists to clean up
+     */
+    private void requireRuntimeReady(RepositoryProfile profile) throws ActivationFailedException {
+        final CmAdapterProvider.Readiness readiness;
+        try {
+            readiness = provider.readiness();
+        } catch (RuntimeException | Error failure) {
+            throw new ActivationFailedException("Repository '" + profile.id() + "' cannot be activated by"
+                    + " adapter '" + provider.providerId() + "': it did not answer whether its vendor runtime"
+                    + " is ready, and an unproven runtime is not a usable one.");
+        }
+        if (readiness == null || !readiness.ready()) {
+            String reason = readiness == null ? "" : sanitise(readiness.reason());
+            throw new ActivationFailedException("Repository '" + profile.id() + "' cannot be activated by"
+                    + " adapter '" + provider.providerId() + "': the adapter's runtime is not ready"
+                    + (reason.isEmpty() ? "" : " - " + reason)
+                    + ". No CM session pool was created.");
+        }
+    }
+
+    /**
+     * Bounds a provider-supplied readiness sentence so it can appear in one log line.
+     *
+     * <p>The provider is required to sanitize its own reason, but this text crosses a third-party boundary
+     * and is printed, so control characters are dropped and the length is capped here too. The registry
+     * applies the same treatment when it publishes its verdict; a second, cheaper copy at this boundary is
+     * deliberate - the two surfaces are reached by different callers.
+     */
+    private static String sanitise(String reason) {
+        if (reason == null) {
+            return "";
+        }
+        StringBuilder cleaned = new StringBuilder(Math.min(reason.length(), MAX_REASON_LENGTH));
+        boolean lastWasSpace = true;
+        for (int i = 0; i < reason.length() && cleaned.length() < MAX_REASON_LENGTH; i++) {
+            char c = reason.charAt(i);
+            if (c < 0x20 || c == 0x7f) {
+                continue;
+            }
+            if (Character.isWhitespace(c)) {
+                if (lastWasSpace) {
+                    continue;
+                }
+                lastWasSpace = true;
+                cleaned.append(' ');
+                continue;
+            }
+            lastWasSpace = false;
+            cleaned.append(c);
+        }
+        return cleaned.toString().trim();
+    }
+
+    /** {@link #sanitise(String)}'s cap: one readiness sentence, not a paragraph. */
+    private static final int MAX_REASON_LENGTH = 200;
 
     /** The profile's CM-only credentials, resolved and checked. Nothing has been allocated at this point. */
     private RepositoryProfile.CmCredentials resolveCredentials(RepositoryProfile profile) throws ActivationFailedException {

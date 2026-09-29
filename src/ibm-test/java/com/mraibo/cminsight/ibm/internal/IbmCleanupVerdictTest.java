@@ -40,38 +40,63 @@ import static com.mraibo.cminsight.ibm.internal.Assert.assertTrue;
 public final class IbmCleanupVerdictTest {
 
     /**
-     * Only ONE teardown step may be attempted per session, even when it failed.
+     * A teardown whose FINAL step failed is attempted once and then reported.
      *
-     * <p>The failing step is asserted to have been attempted exactly once and the failing session to be
-     * unhealthy, so a "retry the teardown" change is caught rather than silently issuing a second SDK call
-     * against a destroyed handle.
+     * <p>Rewritten for Goal 02A section B. This used to fail the DISCONNECT and require the exception,
+     * which encoded the removed rule: a disconnect failure with a successful destroy is now a proven
+     * cleanup, because IBM documents {@code destroy()} as performing the datastore cleanup. The unproven
+     * case is therefore the one whose destroy did not return, which is what this test now drives - so the
+     * "attempted exactly once, then reported" property is still pinned, on the path that can still lose
+     * physical capacity.
      */
-    public void aFailedTeardownIsAttemptedOnceAndThenReported() {
+    public void aFailedFinalTeardownStepIsAttemptedOnceAndThenReported() {
+        IbmFakes.FakeDatastore datastore = new IbmFakes.FakeDatastore();
+        datastore.onDestroyThrow(new IllegalStateException("destroy threw"));
+        IbmCmSession session = IbmCmSession.live("lifecycle", datastore, null);
+
+        assertThrows(IbmCmCleanupFailure.class, session::close,
+                "C/B: a close whose final teardown step did not return normally MUST throw so the pool can"
+                        + " quarantine the slot; returning normally would free capacity while the session may"
+                        + " still be alive");
+
+        assertEquals(1, datastore.disconnectCalls(), "C: the disconnect that proved clean ran exactly once");
+        assertEquals(1, datastore.destroyCalls(),
+                "C: and the failing destroy was attempted exactly once - a retry against a half-destroyed"
+                        + " handle is not a teardown");
+        assertFalse(session.isHealthy(), "C: a closed session is never healthy");
+    }
+
+    /**
+     * A disconnect failure with a successful destroy does NOT quarantine: the session closes normally.
+     *
+     * <p>The direction section B adds, asserted at the session level (where the pool reads its verdict) and
+     * not only in the shared cleanup rule.
+     */
+    public void aDisconnectFailureWithASuccessfulDestroyDoesNotQuarantine() {
         IbmFakes.FakeDatastore datastore = new IbmFakes.FakeDatastore();
         datastore.onDisconnectThrow(new IllegalStateException("disconnect threw"));
         IbmCmSession session = IbmCmSession.live("lifecycle", datastore, null);
 
-        assertThrows(IbmCmCleanupFailure.class, session::close,
-                "C: a close whose teardown did not return normally MUST throw so the pool can quarantine the"
-                        + " slot; returning normally would free capacity while the session may still be alive");
+        session.close();
 
-        assertEquals(1, datastore.disconnectCalls(), "C: the failing disconnect is attempted exactly once");
-        assertEquals(1, datastore.destroyCalls(),
-                "C: destroy must still be attempted - a half-torn-down session that is never destroyed is the"
-                        + " resource the physical bound cannot account for");
-        assertFalse(session.isHealthy(), "C: a closed session is never healthy");
+        assertEquals(1, datastore.disconnectCalls(), "C/B: the disconnect was attempted");
+        assertEquals(1, datastore.destroyCalls(), "C/B: destroy ran and returned normally");
+        assertFalse(session.isHealthy(), "C: the session is closed either way");
+        assertEquals(List.of("isConnected", "disconnect", "destroy"), new ArrayList<>(datastore.calls),
+                "C/B: and every step the documented lifecycle requires was attempted, in order");
     }
 
     /**
      * A second close is a no-op: no teardown step runs again, and no exception is thrown.
      *
-     * <p>The first close FAILS in this test, which is the hard direction: idempotence must hold after a
+     * <p>The first close FAILS in this test through the DESTROY step - the only remaining path whose
+     * teardown cannot be proven since section B - which is the hard direction: idempotence must hold after a
      * failed teardown too, because the state it leaves is terminal and the physical outcome has already been
      * reported.
      */
     public void closeIsIdempotentAfterAFailedTeardown() {
         IbmFakes.FakeDatastore datastore = new IbmFakes.FakeDatastore();
-        datastore.onDisconnectThrow(new IllegalStateException("disconnect threw"));
+        datastore.onDestroyThrow(new IllegalStateException("destroy threw"));
         IbmCmSession session = IbmCmSession.live("lifecycle", datastore, null);
 
         assertThrows(IbmCmCleanupFailure.class, session::close,

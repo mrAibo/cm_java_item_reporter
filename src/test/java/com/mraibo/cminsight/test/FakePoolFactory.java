@@ -31,6 +31,13 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
     private final AtomicInteger failNextAfterAllocation = new AtomicInteger();
     private final AtomicInteger leakedFailures = new AtomicInteger();
     private volatile boolean failAfterAllocationCleanupProven;
+    /**
+     * Remaining "plain failure after allocation, resource deliberately left alive" attempts; -1 means
+     * every attempt. Separate from {@link #failNextAfterAllocation} so a test cannot confuse the
+     * explicit-verdict shape with the untyped one.
+     */
+    private final AtomicInteger unknownLeakFailures = new AtomicInteger();
+    private volatile java.util.function.Supplier<Throwable> unknownLeakFailure;
     private final List<FakeResource> created = Collections.synchronizedList(new ArrayList<>());
     private final List<FakeResource> closed = Collections.synchronizedList(new ArrayList<>());
     private volatile CountDownLatch closeGate;
@@ -61,6 +68,15 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
         created.add(resource);
         int now = live.incrementAndGet();
         peak.accumulateAndGet(now, Math::max);
+
+        // The untyped shape: the resource physically exists, the factory then fails with a PLAIN
+        // exception (or Error) and never closes it. This is the case section A is about - the pool gets
+        // no cleanup evidence at all, so it must not free the slot on the strength of the throw alone.
+        if (consumeUnknownLeakFailure()) {
+            failures.incrementAndGet();
+            leakedFailures.incrementAndGet();
+            throwUnknownLeakFailure();
+        }
 
         int failingAfterAllocation =
                 failNextAfterAllocation.getAndUpdate(remaining -> Math.max(0, remaining - 1));
@@ -135,6 +151,62 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
     void failNextCreatesAfterAllocation(int count, boolean cleanupProven) {
         failNextAfterAllocation.set(count);
         failAfterAllocationCleanupProven = cleanupProven;
+    }
+
+    /**
+     * Makes the next {@code count} creation attempts allocate a resource and then fail with a PLAIN,
+     * UNTYPED throwable - an {@link java.io.IOException}, a {@link RuntimeException} or an {@link Error}
+     * supplied by the caller - WITHOUT closing the allocated resource.
+     *
+     * <p>This is the shape section A is about and the shape neither existing mode can express: a plain
+     * throw carries no cleanup evidence whatsoever, while {@code live} was already raised, so the physical
+     * resource provably still exists. The pool must therefore quarantine the reserved slot by default; a
+     * pool that released it would authorise a replacement beside a resource that is demonstrably alive.
+     *
+     * <p>The measured consequence is {@link #liveCount()} rising by one per attempt and - on a
+     * corrected pool - {@link #peakLive()} staying at the configured size.
+     *
+     * @param count   how many attempts fail this way; negative means EVERY attempt
+     * @param failure supplies the throwable for one attempt, so each attempt gets a fresh instance
+     */
+    void failNextCreatesAfterAllocationLeaking(int count, java.util.function.Supplier<Throwable> failure) {
+        unknownLeakFailure = java.util.Objects.requireNonNull(failure, "failure");
+        unknownLeakFailures.set(count);
+    }
+
+    /**
+     * Makes EVERY creation attempt allocate a resource and then fail with a plain throwable, leaving it
+     * alive. Used by the mutation control, where the number of attempts is the measurement.
+     */
+    void failEveryCreateAfterAllocationLeaking(java.util.function.Supplier<Throwable> failure) {
+        failNextCreatesAfterAllocationLeaking(-1, failure);
+    }
+
+    private boolean consumeUnknownLeakFailure() {
+        int remaining = unknownLeakFailures.get();
+        if (remaining == 0 || unknownLeakFailure == null) {
+            return false;
+        }
+        if (remaining > 0) {
+            unknownLeakFailures.updateAndGet(value -> Math.max(0, value - 1));
+        }
+        return true;
+    }
+
+    /**
+     * Throws the configured untyped failure unchanged: an {@link Error} as an Error, an exception as
+     * itself. Nothing is wrapped, because the pool's decision must be made on the raw type.
+     */
+    private void throwUnknownLeakFailure() throws Exception {
+        Throwable failure = unknownLeakFailure.get();
+        if (failure instanceof Error fatal) {
+            throw fatal;
+        }
+        if (failure instanceof Exception checked) {
+            throw checked;
+        }
+        throw new IllegalStateException("the fake was told to fail with a Throwable it cannot throw: "
+                + failure);
     }
 
     /**

@@ -46,9 +46,18 @@ import java.util.concurrent.TimeoutException;
  *
  * <p>The retention type, the period unit and the expiration action are IBM enumerations whose numeric codes
  * are not recoverable from the SDK's class files. The DTO's readable field therefore carries
- * {@code UNKNOWN(<value>)} and the numeric field carries {@link IbmEnumNames#UNMAPPED_CODE}, and the
- * SDK's own constant name is reported alongside. A guessed unit would silently mis-state how long customer
- * data is kept, which is the single mistake a retention viewer must never make.
+ * {@code UNKNOWN(<value>)} and its numeric enum-code field is {@code null} - "no CM code available" - which
+ * is why it can never be read, formatted or used as if it were a code. The SDK's own constant name is
+ * reported alongside. A guessed unit would silently mis-state how long customer data is kept, which is the
+ * single mistake a retention viewer must never make.
+ *
+ * <h2>Every vendor failure retires the session, structurally</h2>
+ *
+ * <p>Every SDK call here - the policy management entry point, the listings, the retrieve, the assignment
+ * read and the mapping reads over each policy - runs through {@link IbmCmApi} and its session-aware
+ * wrappers, which classify a failure and mark the borrowed session unusable in the same method, so the
+ * lease return retires it. A {@code DKNotExistException} is the one benign control and retires nothing.
+ * This class never classifies a vendor failure itself and therefore cannot forget to mark.
  *
  * <h2>Absent versus broken</h2>
  *
@@ -116,7 +125,7 @@ public final class CmRetentionService implements RetentionRepository {
                 int read = 0;
                 for (Object element : listed) {
                     if (element instanceof DKRetentionPolicyDefICM policy) {
-                        policies.add(map(session, management, policy));
+                        policies.add(guardedMap(session, management, policy));
                         read++;
                     }
                 }
@@ -149,7 +158,7 @@ public final class CmRetentionService implements RetentionRepository {
                 if (policy == null) {
                     return Optional.<RetentionPolicyInfo>empty();
                 }
-                return Optional.of(map(session, management, policy));
+                return Optional.of(guardedMap(session, management, policy));
             }
         });
     }
@@ -221,6 +230,19 @@ public final class CmRetentionService implements RetentionRepository {
         return List.copyOf(names);
     }
 
+    /**
+     * Maps one SDK policy to an immutable DTO, through the session-aware vendor wrapper.
+     *
+     * <p>The mapping reads a dozen vendor accessors directly, and a failure inside one of them is still a
+     * vendor failure: it must retire the session rather than leave it healthy for the next borrower. The
+     * whole mapping therefore runs through {@link IbmCmApi#read}, which classifies AND marks in one place,
+     * so this class never has to remember to call {@link IbmCmSession#markUnusable(String)}.
+     */
+    private RetentionPolicyInfo guardedMap(IbmCmSession session, DKPolicyMgmtICM management,
+            DKRetentionPolicyDefICM policy) {
+        return IbmCmApi.read(session, "mapRetentionPolicy", () -> map(session, management, policy));
+    }
+
     /** Maps one SDK policy to an immutable DTO, including its assigned ItemTypes. */
     private RetentionPolicyInfo map(IbmCmSession session, DKPolicyMgmtICM management,
             DKRetentionPolicyDefICM policy) {
@@ -241,12 +263,12 @@ public final class CmRetentionService implements RetentionRepository {
                 IbmEnumNames.text(policy.getDescription()),
                 policy.getID(),
                 // The readable name is IBM's own constant identity, which is certain, and it is explicitly
-                // NOT presented as a CM numeric code - see IbmEnumNames. The numeric field reports the
-                // "not recoverable" sentinel together with the constant, so an operator sees exactly what the
-                // SDK said and nothing this build invented.
+                // NOT presented as a CM numeric code - see IbmEnumNames. The numeric field is null: no
+                // numeric CM code has been established for this enum, and null is the only value that
+                // cannot be mistaken for one.
                 readableWithConstant(IbmEnumNames.retentionTypeName(retentionType),
                         IbmEnumNames.retentionTypeConstantName(retentionType)),
-                IbmEnumNames.UNMAPPED_CODE,
+                null,
                 policy.isRetentionEnabled(),
                 periodText(retentionPeriod, IbmEnumNames.policyTimeUnitConstantName(retentionUnit)),
                 retentionPeriod,
@@ -259,7 +281,9 @@ public final class CmRetentionService implements RetentionRepository {
                         IbmEnumNames.policyTimeUnitConstantName(expirationUnit)),
                 readableWithConstant(IbmEnumNames.expirationActionName(expirationAction),
                         IbmEnumNames.expirationActionConstantName(expirationAction)),
-                IbmEnumNames.UNMAPPED_CODE,
+                // null for the same reason as the retention-type code above: the numeric CM expiration
+                // action code is not recoverable, and a sentinel would be a number that could be read.
+                null,
                 IbmEnumNames.text(policy.getDeleteExpiredItemsScheduleInformation()),
                 policy.getDeleteExpiredItemsCommitCount(),
                 policy.getDeleteExpiredItemsMaximumRows(),

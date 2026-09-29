@@ -14,6 +14,12 @@ package com.mraibo.cminsight.connection;
  * configured physical hard bound. Those slots are reported as {@link #quarantined}; a non-zero value
  * means the pool is degraded, which is the safe direction.
  *
+ * <p>A <em>failed creation</em> lands in the same place, and since Goal 02A it does so by default: the
+ * pool releases a creation reservation only when the factory explicitly proved a clean cleanup
+ * ({@link CreationFailure.Cleanup#PROVEN_CLEAN}). A plain exception, a runtime exception, an Error or an
+ * unproven verdict quarantines the slot, because none of them is evidence that the factory allocated
+ * nothing - see {@link ResourceFactory} for the reporting obligation that comes with that default.
+ *
  * <h2>Creation and close counters are deliberately specific</h2>
  *
  * Initial population and replacement creation are different events, so they are counted separately and
@@ -39,11 +45,13 @@ public record PoolMetrics(
         long created,
         long createFailures,
         /**
-         * Creation attempts whose failure reported an UNPROVEN cleanup
-         * ({@link CreationFailure.Cleanup#UNPROVEN}), so their reserved slot was quarantined instead of
-         * released. Separated from {@link #createFailures()} because the two answer different questions:
-         * {@code createFailures} counts attempts that did not produce a resource, while this counts the
-         * ones that also cost the pool a capacity slot for good.
+         * Creation attempts whose failure quarantined the reserved slot. Since Goal 02A that is every
+         * failed creation except one that explicitly reported
+         * {@link CreationFailure.Cleanup#PROVEN_CLEAN}: an explicit {@code UNPROVEN} verdict, an ordinary
+         * exception, a runtime exception and an Error from {@code create()} all count here. Separated from
+         * {@link #createFailures()} because the two answer different questions: {@code createFailures}
+         * counts attempts that did not produce a resource, while this counts the ones that also cost the
+         * pool a capacity slot for good.
          */
         long createQuarantineFailures,
         long closeAttempts,
@@ -63,7 +71,8 @@ public record PoolMetrics(
 
     /**
      * True when at least one slot is quarantined, i.e. the pool is running below its configured
-     * capacity because a close outcome is uncertain. Visible so the degraded state cannot be silent.
+     * capacity for a physical outcome it cannot prove: a close that did not return normally, or a
+     * creation failure that did not prove a clean cleanup. Visible so the degraded state cannot be silent.
      */
     public boolean degraded() {
         return quarantined > 0;

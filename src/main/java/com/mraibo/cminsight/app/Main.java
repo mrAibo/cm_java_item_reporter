@@ -204,8 +204,13 @@ public final class Main {
         // anything is opened, so both --print-config and --check-repository report the same facts the
         // serving path acts on. A cm.pool.* value outside its documented range is a configuration error
         // (exit 3) here exactly as it is on the serving path - there is one reader of those keys.
+        //
+        // Goal 02A (sections C and D): the verdict is the ACTIVATION verdict - an installed adapter whose
+        // IBM runtime is absent is refused here, before any repository manager exists - and the settings
+        // carry the classification rules loaded above from THIS configuration, so the adapter cannot read a
+        // different config file and cannot label ItemTypes with rules Main never printed.
         IbmCmAdapterRegistry adapters = IbmCmAdapterRegistry.discover();
-        CmAdapterSettings adapterSettings = CmAdapterSettings.from(config, secrets);
+        CmAdapterSettings adapterSettings = CmAdapterSettings.from(config, secrets, classifications);
 
         if (printConfig) {
             printEffectiveConfiguration(config, auth, features, profiles, classifications, secretsDir, bind, port,
@@ -226,6 +231,10 @@ public final class Main {
         if (autoActivated != null && adapters.status().refused()) {
             // Section B: auto-activation with no usable adapter is a startup FAILURE. Publishing an empty
             // placeholder context instead would report a working console over a repository nobody can read.
+            //
+            // Section C: this is also the path an INSTALLED adapter whose IBM runtime is absent takes, and
+            // the message says which of the two it is - "not installed" and "installed but its runtime is
+            // not ready" need different operator actions. No session, factory or pool has been created.
             System.err.println("ERROR adapter: " + ConfigCheck.AUTO_ACTIVATE_KEY + "='" + autoActivated.id()
                     + "' is configured but " + adapters.status().describe()
                     + "; refusing to start rather than activating a repository that cannot be read.");
@@ -257,8 +266,14 @@ public final class Main {
         if (provider.isPresent()) {
             return new ProductionRepositoryContextFactory(provider.get(), adapterSettings, secrets);
         }
-        String reason = "no CM adapter provider is available (" + adapters.status().describe()
-                + "); a repository can be listed but not activated";
+        // The two cases need different operator actions, so the refusal names which one it is: an adapter
+        // that is not installed at all, or one that IS installed but reports its IBM runtime not ready
+        // (section C). Both refuse without creating anything - no session, no factory, no pool.
+        IbmCmAdapterRegistry.Status status = adapters.status();
+        String reason = (status.providerInstalled()
+                ? status.describe()
+                : "no CM adapter provider is available (" + status.describe() + ")")
+                + "; a repository can be listed but not activated";
         return profile -> {
             throw new ActivationFailedException(reason);
         };
@@ -285,8 +300,14 @@ public final class Main {
                                           String repositoryId,
                                           PrintStream out,
                                           PrintStream err) {
+        // Section C: this is the ADAPTER-UNAVAILABLE exit path, and it is reached for both shapes of
+        // "cannot activate": no provider at all, and a provider that is installed while its IBM runtime is
+        // not ready. Nothing below this line runs in either case - no profile is looked up, no repository
+        // manager is created, no CM session factory is asked for anything and no pool is built - so the
+        // check reports the adapter verdict instead of walking into an activation that cannot succeed.
         if (!adapters.status().available()) {
             err.println("ERROR adapter: " + adapters.status().describe());
+            err.println("       no repository was activated and no CM session was attempted.");
             return EXIT_ADAPTER_UNAVAILABLE;
         }
 
@@ -309,6 +330,11 @@ public final class Main {
                 + " (adapter " + adapters.status().adapterVersion() + ")");
         out.println("  CM API release: " + adapters.status().sdkReleaseOrUnknown());
         out.println("  CM pool       : " + adapterSettings.pool());
+        // Section D: printed from the settings the adapter is actually given, so a non-default --config
+        // cannot show one rule set here and label ItemTypes with another. Nothing reads a config file a
+        // second time to answer this line.
+        out.println("  classification: " + adapterSettings.classifications().ruleCount() + " rule(s), fallback '"
+                + adapterSettings.classifications().fallbackLabel() + "' (the rules the adapter receives)");
 
         RepositoryManager repositories =
                 new RepositoryManager(new ProductionRepositoryContextFactory(provider, adapterSettings, secrets));
@@ -544,6 +570,12 @@ public final class Main {
         // Value-free by construction: an availability label, a provider id, a version and a release, which
         // is the whole of what discovery is allowed to know.
         System.out.println("  adapter          : " + adapters.status().summary());
+        if (adapters.status().availability() == IbmCmAdapterRegistry.Availability.UNAVAILABLE) {
+            // "installed, unavailable" is the one label that needs its sentence: it means the adapter IS
+            // present and its IBM runtime is not, which is a different operator action from installing an
+            // adapter. Reported from the registry's own sanitized text, never re-derived here.
+            System.out.println("  adapter detail   : " + adapters.status().describe());
+        }
         System.out.println("  repository state : " + repositories.state().name()
                 + " (" + repositories.state().description() + ")"
                 + (repositories.activeRepositoryId() == null ? "" : ", " + repositories.activeRepositoryId()));
@@ -586,14 +618,18 @@ public final class Main {
                         ? "  (SECURITY: non-loopback plain HTTP is permitted by opt-in)" : ""));
         System.out.println("  profiles dir      : " + paths.profilesDir(config));
         System.out.println("  classification    : " + classifications.ruleCount() + " rule(s), fallback '"
-                + classifications.fallbackLabel() + "'");
+                + classifications.fallbackLabel() + "'  (loaded once; the adapter receives this same rule set)");
         System.out.println("  features          :");
         features.states().forEach((id, enabled) ->
                 System.out.println("      " + id + " = " + enabled));
         System.out.println("  repositories      : " + profiles.size());
         // Reported even with no profile configured: "why can I not activate" is answered by the adapter
-        // verdict, and an operator reading --print-config should not have to guess.
+        // verdict, and an operator reading --print-config should not have to guess. The two facts are
+        // printed apart on purpose (section C): "an adapter is installed" and "activation is ready" are
+        // independent, and only the second one permits a repository to be activated.
         System.out.println("  CM adapter        : " + adapters.status().describe());
+        System.out.println("  CM adapter state  : installed=" + adapters.status().providerInstalled()
+                + ", activationReady=" + adapters.status().available());
         for (RepositoryProfile profile : profiles) {
             // credentialSourceSummary covers BOTH indirections; credentialEnvNames is env-only and would
             // print nothing at all for a profile that uses a secret file.

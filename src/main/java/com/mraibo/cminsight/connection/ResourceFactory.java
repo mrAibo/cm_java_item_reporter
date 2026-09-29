@@ -4,50 +4,55 @@ package com.mraibo.cminsight.connection;
  * Creates and validates the resources owned by a {@link BoundedPool}.
  *
  * <p>Implementations must never block indefinitely, and must tell the pool the truth about a failed
- * attempt: either clean up completely, or report that the cleanup is unproven. A partial cleanup is
- * never reported as a clean one.
+ * attempt. Reporting the outcome is mandatory, not optional: since Goal 02A a failed creation releases
+ * its reserved capacity slot <strong>only</strong> when the factory explicitly proves a clean cleanup by
+ * throwing {@link CreationFailure} with {@link CreationFailure.Cleanup#PROVEN_CLEAN}. A partial cleanup
+ * is never reported as a clean one, and an undeclared outcome is treated as the unsafe one.
  *
- * <h2>Why "release before throwing" is a hard requirement, not a nicety</h2>
+ * <h2>Why the failed attempt's outcome has to be declared</h2>
  *
- * A throwing {@code create()} is indistinguishable, from the pool's side, from one that created
- * nothing: the pool never receives the resource, so it cannot account for it, and the slot is returned
- * to the capacity pool as if the attempt had been empty. That is fine only while the contract holds. If
- * an implementation opened a CM session or a JDBC connection and then threw without closing it, that
- * resource would be physically alive while the pool reported
- * {@link com.mraibo.cminsight.core.CloseState#CLOSED_CLEAN} - the one state a repository switch is
- * allowed to trust. The pool cannot detect the leak.
+ * A throwing {@code create()} is invisible to the pool: the pool never receives a resource, so it cannot
+ * account for one. Whether that attempt left something physically alive is knowledge only the factory
+ * has, and it is not optional information - the configured pool size is a hard <em>physical</em> bound.
+ * If an implementation opened a CM session or a JDBC connection and then threw without closing it, that
+ * resource would be alive while the pool believed the attempt was empty, and the next borrow would open a
+ * replacement on top of it. The pool cannot detect that, so the factory must say what happened.
  *
- * <p>So the obligation is split in two, and the second half is now expressible:
+ * <p>The rule, and the outcome to throw:
  *
  * <ul>
- *   <li><strong>Preferred:</strong> close what you opened before the exception leaves, and throw an
- *       ordinary exception. The pool releases the reserved slot and the next borrow may create a
- *       replacement.</li>
- *   <li><strong>When that cannot be proven:</strong> throw a {@link CreationFailure} with
- *       {@link CreationFailure.Cleanup#UNPROVEN}. The pool then <em>quarantines</em> the reserved slot -
- *       it stays consumed for the lifetime of the pool, so no replacement can be created while the old
- *       resource may still exist. Capacity is deliberately lost rather than the physical hard bound being
- *       risked.</li>
+ *   <li><strong>Release the slot - explicitly:</strong> the attempt allocated nothing, or it closed
+ *       everything it allocated and that close returned normally. Throw
+ *       {@code new CreationFailure(Cleanup.PROVEN_CLEAN, message[, cause])}. This is the <em>only</em>
+ *       outcome that lets the pool create a replacement in that slot.</li>
+ *   <li><strong>Quarantine - the conservative default:</strong> anything else. An explicit
+ *       {@code CreationFailure(UNPROVEN)} is the honest declaration of it, and a plain {@link Exception},
+ *       a {@link RuntimeException}, an {@link Error} or an {@link InterruptedException} thrown out of
+ *       {@code create()} is read the same way. The slot then stays consumed for the lifetime of the pool,
+ *       so no replacement is created while the old resource may still exist. Capacity is deliberately
+ *       lost rather than the physical hard bound risked.</li>
  * </ul>
  *
- * <p>This is a real distinction, not a formality: an implementation that can allocate a resource and
- * then fail to remove it - connecting to a server is exactly that shape, because the cleanup of a
- * half-built session can itself fail - must use {@code UNPROVEN} rather than silently claiming a clean
- * failure. Reporting {@code PROVEN_CLEAN} for a cleanup that did not actually complete is the one
- * mistake this contract exists to prevent.
- *
- * <p>An ordinary exception keeps its historical meaning - "this attempt left nothing behind" - so every
- * existing implementation is unaffected. The residual risk is documented in {@code STATUS.md}: a factory
- * that leaks and then throws an ordinary exception is still invisible to the pool.
+ * <p>This default is deliberately the <em>opposite</em> of the pre-Goal-02A contract, where an ordinary
+ * exception meant "this attempt left nothing behind" and released the slot. That reading required every
+ * adapter author to remember a special exception to keep the bound honest - a fail-open dependency on the
+ * caller - and the Goal 02 architecture review rejected it. The practical consequence is narrow: a factory
+ * that knows it failed before allocating anything (argument validation, a missing vendor SDK, a closed
+ * configuration) should now say {@code PROVEN_CLEAN} instead of throwing a plain failure, otherwise it
+ * costs the pool one capacity slot for good. Being wrong in the conservative direction only degrades the
+ * pool; being wrong in the other direction breaches the physical bound.
  */
 public interface ResourceFactory<T extends AutoCloseable> {
 
     /**
      * Creates one resource. A {@code null} return is rejected by the pool.
      *
-     * <p>Contract: on failure, every resource this call allocated must already have been closed before
-     * the exception leaves. The pool only accounts for what {@code create()} returns, so a resource
-     * leaked here is invisible to it - see the class notes.
+     * <p>Contract: on failure the caller must be told what happened to this attempt's allocation, because
+     * the pool releases the reserved capacity slot only for an explicit
+     * {@link CreationFailure.Cleanup#PROVEN_CLEAN}. Close everything you allocated and throw that outcome;
+     * if that is not provable, throw {@link CreationFailure.Cleanup#UNPROVEN} (or let the ordinary failure
+     * propagate, which the pool reads the same way). A resource leaked here is invisible to the pool - see
+     * the class notes.
      */
     T create() throws Exception;
 

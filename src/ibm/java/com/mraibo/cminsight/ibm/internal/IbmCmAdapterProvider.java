@@ -1,7 +1,5 @@
 package com.mraibo.cminsight.ibm.internal;
 
-import com.mraibo.cminsight.config.AppConfig;
-import com.mraibo.cminsight.config.AppPaths;
 import com.mraibo.cminsight.config.ClassificationRules;
 import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.connection.BoundedPool;
@@ -15,8 +13,6 @@ import java.io.InputStream;
 import java.net.JarURLConnection;
 import java.net.URL;
 import java.net.URLConnection;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.jar.Attributes;
 import java.util.jar.Manifest;
 
@@ -49,6 +45,23 @@ import java.util.jar.Manifest;
  * {@link #providerId()}, {@link #adapterVersion()} and {@link #sdkRelease()}. None is a credential, and
  * {@link #toString()} shows nothing else.
  *
+ * <h2>Installed, but not necessarily ready</h2>
+ *
+ * <p>This class, its siblings and the {@code ServiceLoader} descriptor are packaged into the same artifact
+ * as the core, so a build with no vendor JARs still discovers a provider here. That is why
+ * {@link #readiness()} exists and why it - not discovery - decides whether a repository can be activated:
+ * a class path without the CM SDK reports the adapter as installed and its runtime as not ready, and every
+ * activation path refuses before a repository manager, session factory or pool is created. Readiness is a
+ * local class-visibility probe; it never connects.
+ *
+ * <h2>Why this class is not a second config reader</h2>
+ *
+ * <p>Earlier this provider re-read the DEFAULT configuration path to obtain the ItemType classification
+ * rules, while {@code Main} loaded them from the configuration the operator actually selected. A runtime
+ * started with a non-default {@code --config} could therefore label ItemTypes with rules the launcher never
+ * printed or validated. The rules now arrive in {@link CmAdapterSettings#classifications()}, loaded once by
+ * the core; this source set reads no application configuration at all.
+ *
  * <h2>Why this class is not a second pool owner</h2>
  *
  * <p>{@link #services(AdapterContext)} receives the pool the core built, already initialized and already
@@ -71,6 +84,22 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
      * {@code CmAdapterProvider#adapterVersion()} requires.
      */
     public static final String ADAPTER_VERSION = "0.1.0-SNAPSHOT";
+
+    /**
+     * The one fixed, sanitized sentence published when the IBM SDK is not loadable.
+     *
+     * <p>Fixed rather than built from a caught throwable's message, for two reasons that are both
+     * requirements of the seam: the text ends up in {@code --check-repository} output, a startup banner and
+     * an operator diagnostics page, so it must carry no class name, no stack trace and no vendor message;
+     * and the operator action is identical whatever the underlying failure was - the SDK jars the launcher
+     * looks for are not there.
+     *
+     * <p>Public so a test can pin the exact string a packaged, SDK-free runtime publishes instead of
+     * asserting a paraphrase of it.
+     */
+    public static final String SDK_MISSING_REASON =
+            "the IBM Content Manager SDK is not on the class path; place the CM 8.7 SDK jars where the"
+                    + " launcher looks for them";
 
     /**
      * The CM API release as reported by the SDK jar's own manifest, or empty when it cannot be read.
@@ -97,15 +126,16 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
     /**
      * Whether the SDK's own entry-point class is loadable, resolved once.
      *
-     * <p>This adapter's classes name no {@code com.ibm} type, so a provider can be discovered and reported
-     * {@code AVAILABLE} on a class path where the vendor jars are absent - the registration is in the jar, the
-     * SDK is not. Discovery is not the place to fix that (the registry's job is to report what is registered),
-     * but an ACTIVATION failure is, and the honest message is "the SDK is not on the class path" rather than a
-     * generic failure.
+     * <p>This adapter's classes name no {@code com.ibm} type, so a provider can be discovered and described
+     * on a class path where the vendor jars are absent - the registration is in the jar, the SDK is not.
+     * The probe therefore answers {@link #readiness()}, which is what decides the ACTIVATION verdict: a
+     * packaged runtime with no SDK reports "adapter installed, runtime not ready" and refuses activation
+     * before any repository manager, session factory or pool exists, instead of advertising
+     * {@code available=true} and failing later at the first borrow.
      *
-     * <p>The probe is a class lookup, not a class initialisation, so it does not load the SDK: probing must not
-     * make this adapter's own discovery depend on the vendor jars. A negative result is cached, because the
-     * class path does not change while the process runs.
+     * <p>The probe is a class lookup, not a class initialisation, so it does not load the SDK: probing must
+     * not make this adapter's own discovery depend on the vendor jars. A negative result is cached, because
+     * the class path does not change while the process runs.
      */
     private volatile boolean sdkPresentResolved;
     private volatile boolean sdkPresent;
@@ -121,11 +151,6 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
      * than failing.
      */
     private volatile IbmCmSessionFactory sessionFactory;
-
-    /** Cached classification rules, or {@code null} for the documented fallback label. Resolved lazily. */
-    private volatile ClassificationRules classificationRules;
-
-    private volatile boolean classificationRulesResolved;
 
     /**
      * The service registration needs a public no-argument constructor, and it must not do any work: a
@@ -171,11 +196,12 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
         // pool discover a missing vendor jar would produce a class-loading failure several layers down, and an
         // operator reading "could not create and initialize its CM pool" cannot tell a missing SDK from a
         // server that refused the connection.
+        //
+        // In the production wiring this is unreachable: the registry refuses an adapter whose runtime is not
+        // ready and exposes no provider, so no caller can reach this method on an SDK-free class path. It is
+        // kept as the second line of defence for a programmatically built provider.
         if (!sdkPresent()) {
-            throw new IbmCmFailure("sdk-missing",
-                    "the IBM Content Manager SDK is not on the class path, so no repository can be activated;"
-                            + " place the CM 8.7 SDK jars where the launcher looks for them",
-                    null, false);
+            throw new IbmCmFailure("sdk-missing", SDK_MISSING_REASON, null, false);
         }
         IbmCmSessionFactory factory = new IbmCmSessionFactory(profile, settings);
         sessionFactory = factory;
@@ -183,11 +209,42 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
     }
 
     /**
+     * The adapter's vendor-runtime verdict: ready when the CM SDK is loadable, with one fixed sentence when
+     * it is not.
+     *
+     * <h2>What this changes, and why it is the whole of section C</h2>
+     *
+     * <p>The adapter's classes and its {@code ServiceLoader} descriptor are packaged in the same artifact as
+     * the core, so on a class path with no vendor JARs this provider is still found, still loads and still
+     * describes itself. Before this method existed the registry reported {@code AVAILABLE} in that state -
+     * {@code /api/repositories} said {@code available=true}, {@code --check-repository} walked into
+     * activation, and auto-activation took the activation-failure path - while every one of those would then
+     * fail at {@link #sessionFactory}. The registry now decides on THIS answer, so an SDK-free runtime
+     * reports "adapter installed, runtime not ready" and refuses before a repository manager, a session
+     * factory or a pool exists.
+     *
+     * <h2>Cheap, local, total and silent about the connection</h2>
+     *
+     * <p>It is one class lookup, cached after the first answer, and it performs no I/O, no credential read
+     * and - the point - no connection attempt: "can I activate" is answered without asking the server
+     * anything. Every failure mode of the probe becomes {@link #SDK_MISSING_REASON}: a missing class, a
+     * half-visible vendor class path (some SDK classes present, {@code DKDatastoreICM} absent), a linkage
+     * error and an unusable class loader all mean the same thing to the caller, and none of them may escape
+     * as a raw {@code NoClassDefFoundError}.
+     */
+    @Override
+    public CmAdapterProvider.Readiness readiness() {
+        return sdkPresent()
+                ? CmAdapterProvider.Readiness.READY
+                : CmAdapterProvider.Readiness.unavailable(SDK_MISSING_REASON);
+    }
+
+    /**
      * True when the IBM CM SDK is loadable from this JVM's class path.
      *
-     * <p>Exposed for diagnostics and for the smoke command's operator message. A false answer does not mean
-     * this adapter is broken: it means the vendor jars the operator must supply are not on the class path, so
-     * no repository can be activated through it.
+     * <p>Exposed for diagnostics and for the smoke command's operator message, and it is the single probe
+     * behind {@link #readiness()}. A false answer does not mean this adapter is broken: it means the vendor
+     * jars the operator must supply are not on the class path, so no repository can be activated through it.
      */
     public boolean sdkPresent() {
         if (!sdkPresentResolved) {
@@ -219,62 +276,14 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
             factory = new IbmCmSessionFactory(context.profile(), settings);
         }
 
-        ClassificationRules classifications = classificationRules();
+        // The rules come from the settings the CORE built out of the configuration it actually loaded. This
+        // adapter reads no configuration file, so it cannot disagree with what the launcher printed and
+        // validated, and there is no path on which it could fall back to a second, default configuration.
+        ClassificationRules classifications = settings.classifications();
         return new AdapterServices(
                 new CmMetadataService(pool, classifications),
                 new CmRetentionService(pool),
                 new IbmCmPoolDiagnostics(pool, settings, factory));
-    }
-
-    /**
-     * The operator's configured ItemType classification rules, read once, or {@code null} when unavailable.
-     *
-     * <h2>Why the adapter reads this itself</h2>
-     *
-     * <p>{@code CmAdapterSettings} and {@link AdapterContext} carry the pool bounds, the cache TTL and the
-     * secret resolver, but not the classification rules - so there is no hand-off to receive them through,
-     * and {@code CmMetadataService} would otherwise have to label every ItemType with the fallback. Since
-     * {@link RepositoryProfile} already gives the adapter a configuration-derived object, reading the rules
-     * from the same application configuration is the consistent behaviour rather than a new dependency:
-     * it is the same file, the same keys and the same {@link ClassificationRules} parser the launcher uses,
-     * so the adapter cannot disagree with what {@code --print-config} reports.
-     *
-     * <p>The consequence is that {@code ItemTypeInfo.businessClassification} reflects the operator's real
-     * rules. That is the point of the field: a business label no operator can configure would be worse than
-     * the generic fallback, and hard-coding a rule set is forbidden outright.
-     *
-     * <p>Every failure degrades to {@code null} - which {@code CmMetadataService} renders as the documented
-     * fallback label - because a classification rule set the adapter could not read must not stop a
-     * read-only ItemType listing. The parse is lazy and cached: this runs at most once per provider, never
-     * during discovery, and never on a request path.
-     *
-     * @return the configured rules, or {@code null} to use the fallback label
-     */
-    private ClassificationRules classificationRules() {
-        if (!classificationRulesResolved) {
-            classificationRules = loadClassificationRules();
-            classificationRulesResolved = true;
-        }
-        return classificationRules;
-    }
-
-    private static ClassificationRules loadClassificationRules() {
-        try {
-            // The documented default location. The adapter cannot know whether the operator passed --config,
-            // and AppPaths resolves a relative default against the application home exactly as the launcher
-            // does, so this names the same file whenever the operator used the default configuration.
-            Path configFile = AppPaths.resolve().configurationFile(null);
-            if (configFile == null || !Files.isRegularFile(configFile)) {
-                // No configuration file: nothing configured to read, so the fallback label is correct.
-                return null;
-            }
-            return ClassificationRules.load(AppConfig.load(configFile));
-        } catch (IOException | RuntimeException | Error unavailable) {
-            // A rule set that cannot be read is not a reason to refuse a read-only ItemType listing; the
-            // fallback label is the honest, documented answer. The failure is deliberately not logged here,
-            // because this class has no logger and a diagnostics line is the operator-facing surface.
-            return null;
-        }
     }
 
     /**
@@ -283,8 +292,30 @@ public final class IbmCmAdapterProvider implements CmAdapterProvider {
      * <p>Uses {@code Class.forName(..., false, loader)}: the {@code false} matters, because it means the class
      * is resolved but NOT initialised. Initialisation would run IBM's static setup - which reads its own
      * property files and configures logging - during a presence check, and a probe that has side effects is not
-     * a probe. Everything is caught: a missing class, a linkage error and an unusable class loader all mean the
-     * same thing to the caller, and none of them may escape.
+     * a probe.
+     *
+     * <h2>Why this catch is total, and not merely defensive</h2>
+     *
+     * <p>The requirement on {@link #readiness()} is that it never throws, because a raw
+     * {@code NoClassDefFoundError} escaping a readiness probe would turn a missing optional JAR into an
+     * unexplained process failure. {@code Class.forName} has exactly three failure shapes, and all three are
+     * named here:
+     *
+     * <ul>
+     *   <li>{@link ClassNotFoundException} - the class file is not on the class path at all;</li>
+     *   <li>{@link LinkageError} - the class file IS found but does not link, which is the half-visible SDK
+     *       case: some vendor classes present, {@code DKDatastoreICM} (or one of its supertypes) missing.
+     *       Every class-loading {@code Error} is a {@code LinkageError} subclass - {@code NoClassDefFoundError},
+     *       {@code UnsupportedClassVersionError}, {@code VerifyError}, {@code ExceptionInInitializerError},
+     *       {@code ClassCircularityError}, {@code IncompatibleClassChangeError} - so a linkage problem cannot
+     *       slip past this arm;</li>
+     *   <li>{@link RuntimeException} - an unusable class loader, a security-manager refusal and any other
+     *       runtime failure of the lookup itself.</li>
+     * </ul>
+     *
+     * <p>All three mean the same thing to the caller - the vendor runtime is not loadable - so all three
+     * produce the identical fixed answer. The registry adds a second net: it treats a readiness call that
+     * throws as "not ready" rather than letting it escape.
      */
     private static boolean probeSdkPresence() {
         try {

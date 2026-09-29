@@ -63,7 +63,7 @@ public final class IbmMappingRulesTest {
                         + " nothing about unknown values");
     }
 
-    /** No unmapped numeric code is ever rendered as a plausible label. */
+    /** No unmapped numeric code is ever rendered as a plausible label or as a number. */
     public void theUnmappableRetentionEnumsAreReportedAsUnmapped() {
         assertEquals(IbmEnumNames.UNMAPPED, IbmEnumNames.retentionTypeName(null),
                 "the retention-type numeric mapping is not recoverable from the SDK, so it must be reported"
@@ -72,11 +72,12 @@ public final class IbmMappingRulesTest {
                 "the policy time unit is unmapped for the same reason");
         assertEquals(IbmEnumNames.UNMAPPED, IbmEnumNames.expirationActionName(null),
                 "and so is the expiration action");
-        assertEquals(-1, IbmEnumNames.UNMAPPED_CODE,
-                "the DTO's numeric field must carry a documented sentinel for 'unmapped', not a value that"
-                        + " could be mistaken for a real code");
+        assertEquals("UNKNOWN", IbmEnumNames.UNMAPPED,
+                "F: the shared 'cannot be mapped' text is the documented UNKNOWN marker; the numeric side has"
+                        + " no sentinel constant at all any more, because 'no code established' is carried as"
+                        + " an absent value rather than as a number");
         assertFalse("UNKNOWN".equals(IbmEnumNames.retentionTypeConstantName(null)),
-                "the constant's own name is carried separately and must not be collapsed into the sentinel");
+                "the constant's own name is carried separately and must not be collapsed into the marker");
     }
 
     /**
@@ -152,24 +153,81 @@ public final class IbmMappingRulesTest {
                 "the retention policy id is an int too and must not be truncated");
     }
 
-    /** The DTO renders an unmapped numeric field through the sentinel and never as a guessed label. */
-    public void theRetentionDtoCarriesTheSentinelForUnmappedNumbers() {
-        RetentionPolicyInfo policy = policy(7);
+    /**
+     * Goal 02A section F: an unmapped numeric enum code is ABSENT, never a number, and the readable field
+     * still carries IBM's certain constant identity.
+     *
+     * <h2>The defect this pins</h2>
+     *
+     * <p>The DTO used to carry {@code -1} at these two positions under documentation that called the field
+     * the exact numeric code the server returned. {@code -1} is a number, and a number is exactly what an
+     * operator (or a later adapter author) would read as a server value. The contract is now structural:
+     * the fields are nullable, {@code null} is the only representation of "no numeric CM code has been
+     * established", and the canonical constructor normalises a negative input to {@code null} so even a
+     * caller that still passes the old sentinel cannot put a number in the field.
+     *
+     * <h2>What is deliberately NOT asserted</h2>
+     *
+     * <p>A test that only checked {@code null} in, {@code null} out would pass for an adapter that silently
+     * dropped every code, and one that only checked {@code -1} in, {@code null} out would pass for an
+     * implementation that nulled every value. So both directions are asserted against each other: a
+     * negative input is normalised away AND a real non-negative code survives unchanged.
+     */
+    public void anUnmappedNumericCodeIsAbsentAndNeverANumber() {
+        RetentionPolicyInfo unmapped = policy(7);
 
-        assertEquals(IbmEnumNames.UNMAPPED, policy.retentionType(),
-                "the readable retention type is unmapped, not a guessed name");
-        assertEquals(IbmEnumNames.UNMAPPED_CODE, policy.retentionTypeCode(),
-                "and its numeric field carries the sentinel");
+        assertTrue(unmapped.retentionTypeCode() == null,
+                "F: an unmapped retention-type code must be ABSENT; a number here - including -1 - would be"
+                        + " read as an exact CM server code, which is the misleading contract this section"
+                        + " removes. Was: " + unmapped.retentionTypeCode());
+        assertTrue(unmapped.expirationActionCode() == null,
+                "F: and so must an unmapped expiration-action code. Was: " + unmapped.expirationActionCode());
+        assertEquals("UNKNOWN(FIXED_TIME)", unmapped.retentionType(),
+                "F: the READABLE field keeps IBM's own constant identity, which is certain - removing the"
+                        + " misleading number must not make the readable answer vaguer");
+        assertEquals("UNKNOWN(AUTO_DELETE)", unmapped.expirationAction(),
+                "F: same for the expiration action");
+
+        // A real code is a number and must survive: otherwise 'null everywhere' would pass the two
+        // assertions above while making the field useless.
+        RetentionPolicyInfo mapped = policy(7, 3, 11, "UNKNOWN(FIXED_TIME)", "UNKNOWN(AUTO_DELETE)");
+        assertEquals(Integer.valueOf(3), mapped.retentionTypeCode(),
+                "F: a real, non-negative code is preserved unchanged - the field still reports what the"
+                        + " server said when this build does know");
+        assertEquals(Integer.valueOf(11), mapped.expirationActionCode(),
+                "F: and so is a real expiration-action code");
+
+        // The structural floor: a caller that still passes the retired -1 sentinel cannot reintroduce a
+        // number. Asserted through the CANONICAL CONSTRUCTOR, not through the adapter, because the
+        // normalisation is the property that no future adapter can bypass.
+        RetentionPolicyInfo legacySentinel = policy(7, -1, -1, "UNKNOWN(FIXED_TIME)", "UNKNOWN(AUTO_DELETE)");
+        assertTrue(legacySentinel.retentionTypeCode() == null,
+                "F: the retired -1 sentinel is normalised to absent by the DTO itself, so a missed call site"
+                        + " cannot present -1 as a server code. Was: " + legacySentinel.retentionTypeCode());
+        assertTrue(legacySentinel.expirationActionCode() == null,
+                "F: and the expiration-action sentinel likewise. Was: " + legacySentinel.expirationActionCode());
+
+        // A copy must not be able to reintroduce a number either.
+        RetentionPolicyInfo copied = unmapped.withAssignedItemTypes(List.of("ItemTypeA"));
+        assertTrue(copied.retentionTypeCode() == null && copied.expirationActionCode() == null,
+                "F: withAssignedItemTypes() copies every other component, so the absent codes stay absent");
     }
 
-    /** The documented retention DTO, with every unmappable numeric field using the sentinel. */
+    /** The documented retention DTO, with every unmappable numeric field carrying an absent value. */
     private static RetentionPolicyInfo policy(int policyId) {
+        return policy(policyId, null, null, "UNKNOWN(FIXED_TIME)", "UNKNOWN(AUTO_DELETE)");
+    }
+
+    /** The documented retention DTO with explicit enum-code components, for the mapped/unmapped pair. */
+    private static RetentionPolicyInfo policy(int policyId, Integer retentionTypeCode,
+                                             Integer expirationActionCode, String retentionType,
+                                             String expirationAction) {
         return new RetentionPolicyInfo(
                 "Policy", "description", policyId,
-                IbmEnumNames.UNMAPPED, IbmEnumNames.UNMAPPED_CODE,
+                retentionType, retentionTypeCode,
                 true, "period", 30, "DAY",
                 true, "expiration", 90, "DAY",
-                IbmEnumNames.UNMAPPED, IbmEnumNames.UNMAPPED_CODE,
+                expirationAction, expirationActionCode,
                 "", 0, 0, -1, false, List.of("ItemTypeA"));
     }
 

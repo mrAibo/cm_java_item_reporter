@@ -87,6 +87,43 @@ public final class IbmProviderRegistrationTest {
     }
 
     /**
+     * Goal 02A section C, positive direction: on a class path that DOES carry the vendor SDK set, the
+     * adapter reports its runtime READY and discovery reports it activatable.
+     *
+     * <h2>Why this assertion belongs here and not in the core suite</h2>
+     *
+     * <p>Readiness is a class-visibility probe. On this class path the SDK set IS visible - the real IBM CM
+     * 8.7 jars when the operator supplied them in {@code lib/ibm}, otherwise the committed signature stubs -
+     * so {@code ready()} must be true. The core suite deliberately has neither, which is where the negative
+     * direction is asserted ({@code ProviderDiscoveryTest}), together with the assertion that no stub is
+     * visible on a packaged runtime class path.
+     *
+     * <p>What this pins beyond discovery: readiness is a statement about the runtime, so it must be
+     * answerable WITHOUT a connection. Nothing here opens one - the provider is constructed and asked, and
+     * the assertion is that the answer is an unqualified ready with an empty reason, because a reason on the
+     * ready path would be a leaked diagnostic.
+     */
+    public void onAnSdkClassPathTheAdapterReportsItsRuntimeReady() {
+        IbmCmAdapterProvider provider = new IbmCmAdapterProvider();
+
+        assertTrue(provider.sdkPresent(),
+                "C: the SDK's entry-point class is loadable on this class path, which is what readiness"
+                        + " measures");
+        CmAdapterProvider.Readiness readiness = provider.readiness();
+        assertTrue(readiness.ready(),
+                "C: an adapter that can see the vendor SDK must report its runtime ready, or a correctly"
+                        + " installed deployment would refuse to activate. Readiness: " + readiness.describe());
+        assertEquals("", readiness.reason(),
+                "C: and the ready answer carries an empty reason - a reason here would be published on an"
+                        + " operator page as if something were wrong");
+
+        IbmCmAdapterRegistry registry = IbmCmAdapterRegistry.discover();
+        assertTrue(registry.status().providerInstalled(),
+                "C: installed and ready are reported as separate facts, and both are true here");
+        assertTrue(registry.status().available(), "C: so activation is permitted: " + registry.status().describe());
+    }
+
+    /**
      * The advertised SDK release is never null and never a credential.
      *
      * <p>It is empty when the vendor manifest cannot be read - which is the case on a stub class path - and

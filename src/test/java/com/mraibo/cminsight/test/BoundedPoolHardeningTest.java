@@ -124,13 +124,20 @@ public class BoundedPoolHardeningTest {
     }
 
     /**
-     * A1: a creation that throws an {@link Error} must still give the reserved capacity slot back.
+     * A1/02A-A: a creation that throws an {@link Error} is QUARANTINED before the Error propagates.
      *
-     * <p>Fails against a mutant that drops {@code releaseCreationSlot()} from the failure path:
-     * {@code creating} stays incremented, {@code capacityInUse()} reports a stuck slot and the next
-     * borrow waits for the borrow timeout instead of succeeding.
+     * <p>Rewritten for Goal 02A section A. This test used to pin the opposite: the reserved slot came back,
+     * because an Error was read as "this attempt produced nothing". An Error from {@code create()} is no more
+     * evidence of a clean failure than a plain exception, so the conservative rule applies and the slot is
+     * quarantined - which is why the old recovery half of this test had to go: a size-1 pool whose only slot
+     * is quarantined is permanently degraded by design, and asserting that it recovers would assert the
+     * removed rule back into place.
+     *
+     * <p>What is still worth pinning: the Error itself reaches the borrower unchanged (an Error must never be
+     * swallowed or re-wrapped), the reservation is resolved rather than abandoned in flight, the accounting
+     * identities hold for a fatal failure, and no replacement is created on top of the unknown outcome.
      */
-    public void anErrorDuringACreationReturnsTheReservedSlotInsteadOfBurningIt() throws Exception {
+    public void anErrorDuringACreationQuarantinesTheSlotBeforeTheErrorPropagates() throws Exception {
         FakePoolFactory factory = new FakePoolFactory();
         AtomicInteger attempts = new AtomicInteger();
         ResourceFactory<FakeResource> fatalOnce = new ResourceFactory<FakeResource>() {
@@ -157,8 +164,12 @@ public class BoundedPoolHardeningTest {
         CreationError thrown = Assert.assertThrows(CreationError.class, pool::borrow,
                 "an Error from the factory still reaches the borrower");
         Assert.assertEquals("simulated fatal creation failure", thrown.getMessage(), "the same Error is rethrown");
-        Assert.assertEquals(0, pool.metrics().creating(), "the reserved slot was given back");
-        Assert.assertEquals(0, pool.metrics().capacityInUse(), "capacity is not permanently stuck");
+        Assert.assertEquals(0, pool.metrics().creating(), "the reserved slot was resolved, not left in flight");
+        Assert.assertEquals(1, pool.metrics().quarantined(),
+                "A: an Error is not cleanup evidence, so the reserved slot is quarantined");
+        Assert.assertEquals(1, pool.metrics().capacityInUse(), "A: and it still consumes capacity");
+        Assert.assertEquals(1L, pool.metrics().createQuarantineFailures(), "A: the event is counted");
+        Assert.assertTrue(pool.metrics().degraded(), "A: the pool reports the capacity it lost");
         Assert.assertEquals(1L, pool.metrics().createAttempts(), "the failing attempt is counted");
         Assert.assertEquals(1L, pool.metrics().createFailures(),
                 "the accounting identities: an Error from create() is a create failure");
@@ -167,16 +178,14 @@ public class BoundedPoolHardeningTest {
                 "createAttempts == created + createFailures, even for a fatal creation failure");
         Assert.assertEquals(0L, pool.metrics().borrowTimeoutCount(), "a fatal creation failure is not a timeout");
 
-        Lease<FakeResource> lease = pool.borrow();
-        Assert.assertNotNull(lease, "the pool recovers once the factory works again");
-        Assert.assertEquals(1, factory.liveCount(), "the retry created exactly one resource");
-        // The borrow counter counts ATTEMPTS, so a borrow refused by a fatal creation failure is still
-        // visible: one failed attempt plus one successful one.
-        Assert.assertEquals(2L, pool.metrics().borrowCount(),
-                "borrowCount counts the failed attempt and the successful one");
-        Assert.assertEquals(1L, pool.metrics().leased(), "exactly one lease is out");
-        Assert.assertEquals(0L, pool.metrics().borrowTimeoutCount(), "the retry did not wait for a stuck slot");
-        lease.close();
+        Assert.assertThrows(TimeoutException.class, pool::borrow,
+                "A: a quarantined slot does not authorise a replacement for a fatal failure either");
+        Assert.assertEquals(0, factory.createAttempts(),
+                "A: the refused borrow never reached the factory at all - the wrapper throws before it"
+                        + " delegates - so the factory saw no attempt, which is exactly what 'created"
+                        + " nothing beside the unknown outcome' means");
+        Assert.assertTrue(factory.created().isEmpty(),
+                "A: and the delegate factory really created no resource");
         pool.close();
     }
 
@@ -778,19 +787,29 @@ public class BoundedPoolHardeningTest {
                 "F9: the failed attempt's wait is reported, got " + metrics.maxBorrowWaitMs());
         Assert.assertTrue(metrics.averageBorrowWaitMs() >= 150.0,
                 "F9: the average covers the attempted borrow, got " + metrics.averageBorrowWaitMs());
-        Assert.assertEquals(0, metrics.capacityInUse(), "the reserved slot was released");
+        Assert.assertEquals(1, metrics.quarantined(),
+                "A: the plain failure quarantines the slot it reserved - the wait metrics are asserted on the"
+                        + " same event, so this also pins that the quarantine did not replace the reporting");
+        Assert.assertEquals(1, metrics.capacityInUse(), "A: and the quarantined slot consumes capacity");
         pool.close();
     }
 
     /**
-     * Pool review F3/F4: the two accounting identities must hold even when an {@link Error} - not an
-     * exception - comes out of {@code create()} or {@code close()}.
+     * Pool review F3/F4, adjusted for Goal 02A section A: the two accounting identities must hold even when
+     * an {@link Error} - not an exception - comes out of {@code create()} or {@code close()}.
      *
-     * <p>Nothing tested these before, which is exactly how the miscounts survived: a lost create or
-     * close failure makes capacity loss unexplainable from the metrics.
+     * <p>Nothing tested these before, which is exactly how the miscounts survived: a lost create or close
+     * failure makes capacity loss unexplainable from the metrics.
+     *
+     * <p>The create and close halves use SEPARATE pools on purpose. Before section A a fatal creation
+     * released its slot, so one pool could carry both halves. A fatal creation now quarantines the only slot
+     * of a size-1 pool on purpose, and a pool in that state refuses every later borrow rather than opening a
+     * resource next to one whose outcome is unknown - so a single pool could not reach the close half at all,
+     * and asserting that it could would be asserting the removed rule back into place.
      */
     public void theAccountingIdentitiesHoldForFatalFailures() throws Exception {
-        FakePoolFactory factory = new FakePoolFactory();
+        // ---- create identities: a fatal creation is counted and quarantines its reservation ----------
+        FakePoolFactory createFactory = new FakePoolFactory();
         AtomicInteger attempts = new AtomicInteger();
         ResourceFactory<FakeResource> fatalFirstCreate = new ResourceFactory<FakeResource>() {
             @Override
@@ -798,12 +817,12 @@ public class BoundedPoolHardeningTest {
                 if (attempts.incrementAndGet() == 1) {
                     throw new CreationError("simulated fatal creation failure");
                 }
-                return factory.create();
+                return createFactory.create();
             }
 
             @Override
             public boolean isHealthy(FakeResource resource) {
-                return factory.isHealthy(resource);
+                return createFactory.isHealthy(resource);
             }
 
             @Override
@@ -811,24 +830,36 @@ public class BoundedPoolHardeningTest {
                 return "fatal-once";
             }
         };
-        BoundedPool<FakeResource> pool = new BoundedPool<>("identities", 1, GENEROUS, fatalFirstCreate);
-        Assert.assertThrows(CreationError.class, pool::borrow, "the first creation fails fatally");
+        BoundedPool<FakeResource> createPool = new BoundedPool<>("identities-create", 1, GENEROUS,
+                fatalFirstCreate);
+        Assert.assertThrows(CreationError.class, createPool::borrow, "the first creation fails fatally");
 
-        Lease<FakeResource> lease = pool.borrow();
+        PoolMetrics createMetrics = createPool.metrics();
+        Assert.assertTrue(createMetrics.createFailures() >= 1L, "the fatal creation is counted as a failure");
+        Assert.assertEquals(1, createMetrics.quarantined(),
+                "A: the fatal creation quarantines the reservation it held");
+        Assert.assertEquals(1L, createMetrics.createQuarantineFailures(), "A: and the quarantine is counted");
+        Assert.assertEquals(createMetrics.createAttempts(), createMetrics.created() + createMetrics.createFailures(),
+                "createAttempts == created + createFailures");
+        Assert.assertEquals(0, createMetrics.creating(), "A: no reservation is left in flight");
+        createPool.close();
+
+        // ---- close identities: a fatal close is counted and quarantines its slot ----------------------
+        FakePoolFactory closeFactory = new FakePoolFactory();
+        BoundedPool<FakeResource> closePool = new BoundedPool<>("identities-close", 1, GENEROUS, closeFactory);
+        Lease<FakeResource> lease = closePool.borrow();
         FakeResource resource = lease.value();
         resource.setHealthy(false);
         resource.failCloseWith(new ResourceCloseError("simulated fatal close"));
         Assert.assertThrows(ResourceCloseError.class, lease::close, "the close fails fatally");
 
-        PoolMetrics metrics = pool.metrics();
-        Assert.assertTrue(metrics.createFailures() >= 1L, "the fatal creation is counted as a failure");
-        Assert.assertTrue(metrics.closeFailures() >= 1L, "the fatal close is counted as a failure");
-        Assert.assertEquals(metrics.createAttempts(), metrics.created() + metrics.createFailures(),
-                "createAttempts == created + createFailures");
-        Assert.assertEquals(metrics.closeAttempts(), metrics.closeSuccesses() + metrics.closeFailures(),
+        PoolMetrics closeMetrics = closePool.metrics();
+        Assert.assertTrue(closeMetrics.closeFailures() >= 1L, "the fatal close is counted as a failure");
+        Assert.assertEquals(1, closeMetrics.quarantined(), "the fatal close quarantines the slot");
+        Assert.assertEquals(closeMetrics.closeAttempts(), closeMetrics.closeSuccesses() + closeMetrics.closeFailures(),
                 "closeAttempts == closeSuccesses + closeFailures");
-        Assert.assertEquals(1, metrics.quarantined(), "the fatal close quarantines the slot");
-        pool.close();
+        Assert.assertEquals(0, closeMetrics.creating(), "no create reservation is left over");
+        closePool.close();
     }
 
     /** An {@link Error} raised by {@code factory.create()}, {@code isHealthy()} or {@code close()}. */

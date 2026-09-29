@@ -122,19 +122,23 @@ public final class IbmErrorSanitizer {
     /**
      * True when the failure means the physical session must not be returned to the pool.
      *
-     * <p>A not-found answer is a healthy server replying "no", so the session is fine. Everything else
-     * from the SDK is treated as a broken session: the conservative reading costs one session
-     * re-creation, and the optimistic reading risks serving wrong data from a wedged connection.
+     * <p><strong>{@code DKNotExistException} is the ONE benign control</strong> - a healthy server answering
+     * "there is no such thing" - so the session that produced it is still perfectly usable. Everything else
+     * is conservative: a broken or wedged session costs one re-creation, and the optimistic reading risks
+     * serving wrong data from a connection whose state is unknown.
+     *
+     * <p>That includes an unexpected {@link RuntimeException}. The earlier rule deliberately excluded it
+     * ({@code !(failure instanceof RuntimeException)}), which classified a plain runtime failure from a
+     * vendor call - a {@code NullPointerException} from an SDK object that was not what the adapter thought,
+     * an {@code IllegalStateException} from a connection that had already given up - as REUSABLE and
+     * returned the session, healthy, to the pool. The Goal 02A review rejected that reading: a vendor call
+     * that threw at all is evidence about the session, whatever its exception type. An {@link Error} was
+     * already conservative and stays that way.
      */
     public static boolean backendUnusable(Throwable failure) {
         if (failure == null) {
             return true;
         }
-        if (failure instanceof DKNotExistException) {
-            return false;
-        }
-        return failure instanceof DKException
-                || failure instanceof Error
-                || !(failure instanceof RuntimeException);
+        return !(failure instanceof DKNotExistException);
     }
 }

@@ -24,6 +24,19 @@ import java.util.Optional;
  * adapters must be resolved by an operator, not by iteration order. {@link IbmCmAdapterRegistry} reports
  * all three cases without ever surfacing a raw class-loading failure.
  *
+ * <h2>Installed is not the same as ready</h2>
+ *
+ * <p>These provider classes are packaged in the SAME artifact as the core, so a build with no vendor JARs
+ * still has a provider that loads and describes itself. "An adapter is installed" therefore says nothing
+ * about whether a repository can be activated through it, and conflating the two is the defect
+ * {@link #readiness()} exists to remove: a registry verdict of {@code AVAILABLE}, an API answer of
+ * {@code available=true}, and then a class-loading failure several layers down at the moment of
+ * activation - or, worse, a refusal whose message looks like legitimate core-only mode.
+ *
+ * <p>So the seam carries two independent answers: the declared provider values and
+ * {@link #readiness()}, a cheap LOCAL statement about the vendor runtime. Activation follows readiness,
+ * never installation.
+ *
  * <h2>What a provider may expose</h2>
  *
  * <p>Only three things, all value-free: a stable id, the adapter build version and the advertised release
@@ -47,6 +60,55 @@ public interface CmAdapterProvider {
 
     /** The vendor API release the adapter talks to, for example {@code 8.7.0.000}; empty when unknown. */
     String sdkRelease();
+
+    /**
+     * The fixed reason published when an adapter does not answer {@link #readiness()}.
+     *
+     * <p>A constant sentence rather than an exception message: the registry only ever publishes text from
+     * a fixed set, so a diagnostics page cannot be reached by an unexpected value.
+     */
+    String READINESS_NOT_REPORTED =
+            "the adapter does not report whether its vendor runtime is ready to activate a repository";
+
+    /**
+     * Whether this adapter's vendor RUNTIME can activate a repository in this JVM right now.
+     *
+     * <h2>Two concepts, and this is the second one</h2>
+     *
+     * <p>"The adapter's classes are on the class path" and "the adapter can open a CM session" are
+     * different facts, and only the second may decide activation. This method answers the second one, and
+     * {@link IbmCmAdapterRegistry} refuses activation when the answer is negative - BEFORE any repository
+     * manager, session factory or pool exists.
+     *
+     * <h2>What an implementation must and must not do</h2>
+     *
+     * <ul>
+     *   <li><strong>Cheap and local.</strong> A class-visibility probe at most. No connection, no
+     *       round trip, no credential and no I/O beyond what the class loader already holds. A readiness
+     *       check runs on a diagnostics read, so anything expensive would turn a status page into an
+     *       outage.</li>
+     *   <li><strong>Total.</strong> It must never throw. A missing vendor class, a half-visible vendor
+     *       class path and a linkage error all mean the same thing to the caller - runtime not ready -
+     *       and every one of them must become {@link Readiness#unavailable(String)} with a FIXED,
+     *       sanitized reason. A raw {@code NoClassDefFoundError} escaping from here would turn a missing
+     *       optional JAR into an unexplained process failure, which is exactly the defect this seam
+     *       removes.</li>
+     *   <li><strong>Value-free.</strong> {@link Readiness#reason()} ends up on an operator page: it names
+     *       a missing dependency or a linkage problem, never a credential and never a raw vendor
+     *       message.</li>
+     * </ul>
+     *
+     * <h2>Why the default is "not ready" rather than "ready"</h2>
+     *
+     * <p>An adapter that does not answer has made no statement about its runtime, and the core may not
+     * invent one: assuming readiness is fail-open, and it is the exact shape of the defect where a
+     * completely unusable adapter advertised itself as available. The fail-closed default costs one
+     * method in a new adapter's implementation and produces a clear, actionable refusal instead of a
+     * failure at the first borrow.
+     */
+    default Readiness readiness() {
+        return Readiness.unavailable(READINESS_NOT_REPORTED);
+    }
 
     /**
      * The session factory for one activation.
@@ -81,6 +143,56 @@ public interface CmAdapterProvider {
      */
     default AdapterServices services(AdapterContext context) {
         return AdapterServices.NONE;
+    }
+
+    /**
+     * The adapter's own answer to "can I activate a repository in this JVM", and the reason when it cannot.
+     *
+     * <p>Two things are deliberately NOT part of this answer:
+     *
+     * <ul>
+     *   <li><strong>Nothing has been connected.</strong> Readiness is asked before any repository is
+     *       selected, so {@link #ready()} means "my vendor runtime is loadable", never "the server
+     *       answered". Reachability is discovered by an ordinary activation later, and pretending
+     *       otherwise here would make a diagnostics read depend on the network.</li>
+     *   <li><strong>No credential, and no vendor text.</strong> {@link #reason()} is published as an
+     *       operator-facing sentence. It names a missing dependency or a linkage problem, as fixed text
+     *       produced by the adapter - never a secret, never an SDK exception message, never a stack
+     *       trace.</li>
+     * </ul>
+     *
+     * @param ready  true when this adapter can build sessions against its vendor runtime in this JVM
+     * @param reason why it cannot, as one fixed sanitized sentence; empty when {@code ready} is true
+     */
+    record Readiness(boolean ready, String reason) {
+
+        /** The one shared ready answer. */
+        public static final Readiness READY = new Readiness(true, "");
+
+        public Readiness {
+            reason = reason == null ? "" : reason.trim();
+        }
+
+        /**
+         * Not ready, with a fixed value-free reason.
+         *
+         * @param reason the adapter's own sentence; a blank or absent one is replaced by the documented
+         *               {@link CmAdapterProvider#READINESS_NOT_REPORTED} text, so the published reason is
+         *               never empty
+         */
+        public static Readiness unavailable(String reason) {
+            return new Readiness(false, reason == null || reason.isBlank() ? READINESS_NOT_REPORTED : reason);
+        }
+
+        /** A one-line description for diagnostics, a banner or a refusal message. */
+        public String describe() {
+            return ready ? "ready" : "not ready: " + reason;
+        }
+
+        @Override
+        public String toString() {
+            return "CmAdapterReadiness[" + describe() + "]";
+        }
     }
 
     /**

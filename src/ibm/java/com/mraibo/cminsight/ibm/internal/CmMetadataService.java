@@ -57,6 +57,15 @@ import java.util.concurrent.TimeoutException;
  * the SDK's own "not found" answer - and throws only when the repository could not be read. The distinction
  * is what lets the API layer answer {@code 404} for the first and {@code 502} for the second, instead of
  * making a typo in a URL look like an outage.
+ *
+ * <h2>Every vendor failure retires the session, structurally</h2>
+ *
+ * <p>This service never classifies or remembers: every vendor call - the datastore definition, the name
+ * listing, the per-ItemType retrieve, the retention-policy-name getter, and the mapping reads over the
+ * returned ItemType - runs through {@link IbmCmApi} and its session-aware wrappers, which classify a
+ * failure and mark the borrowed session unusable in the same method. A {@code DKNotExistException} is the
+ * one benign control and retires nothing. There is deliberately no bare vendor accessor call left in this
+ * class to forget the rule at.
  */
 public final class CmMetadataService implements MetadataRepository {
 
@@ -109,7 +118,9 @@ public final class CmMetadataService implements MetadataRepository {
                 IbmCmSession session = IbmCmSessionFactory.icmSession(lease);
                 DKItemTypeDefICM itemType = retrieveItemType(session, requested);
                 lease.recordOperation();
-                return itemType == null ? Optional.<ItemTypeInfo>empty() : Optional.of(map(itemType));
+                return itemType == null
+                        ? Optional.<ItemTypeInfo>empty()
+                        : Optional.of(guardedMap(session, itemType));
             }
         });
     }
@@ -156,7 +167,7 @@ public final class CmMetadataService implements MetadataRepository {
                             // view. Skipping it is right - reporting an empty ItemType would be a lie.
                             continue;
                         }
-                        details.add(map(itemType));
+                        details.add(guardedMap(session, itemType));
                         read++;
                     }
                 }
@@ -184,13 +195,28 @@ public final class CmMetadataService implements MetadataRepository {
     }
 
     /**
+     * Maps one SDK ItemType to an immutable DTO, through the session-aware vendor wrapper.
+     *
+     * <p>The mapping reads a dozen vendor accessors directly, and a failure inside one of them is still a
+     * vendor failure: it must retire the session rather than leave it healthy for the next borrower. Rather
+     * than asking this method (or each accessor) to remember to call
+     * {@link IbmCmSession#markUnusable(String)}, the whole mapping runs through {@link IbmCmApi#read},
+     * which classifies AND marks in one place - see the class notes there. A bug in this adapter's own
+     * mapping code retires a session too, which costs one re-creation; reusing a session whose vendor
+     * object just misbehaved is the expensive mistake.
+     */
+    private ItemTypeInfo guardedMap(IbmCmSession session, DKItemTypeDefICM itemType) {
+        return IbmCmApi.read(session, "mapItemType", () -> map(session, itemType));
+    }
+
+    /**
      * Maps one SDK ItemType to an immutable DTO.
      *
      * <p>Every read happens here, while the session is still leased, and every value is copied out: no SDK
      * object survives this method, which is what makes the DTO safe to cache, serialise and hand to the web
      * layer.
      */
-    private ItemTypeInfo map(DKItemTypeDefICM itemType) {
+    private ItemTypeInfo map(IbmCmSession session, DKItemTypeDefICM itemType) {
         String name = IbmEnumNames.text(itemType.getName());
         if (name.isEmpty()) {
             // A nameless ItemType cannot be addressed, looked up or displayed. Deriving a name from the id
@@ -209,7 +235,7 @@ public final class CmMetadataService implements MetadataRepository {
         // ask the policy tables, so a repository with retention disabled can answer "none" by throwing. A
         // retention policy is a nice-to-have here, so an unavailable answer degrades to empty and an
         // unreadable one is reported - never a broken ItemType listing.
-        String policyName = readRetentionPolicyName(itemType);
+        String policyName = retentionPolicyNameOf(session, itemType);
 
         return new ItemTypeInfo(
                 name,
@@ -234,21 +260,25 @@ public final class CmMetadataService implements MetadataRepository {
     /**
      * The assigned retention policy name, or empty.
      *
-     * <p>Read through {@link IbmCmApi#readOrAbsent} because "this ItemType has no retention policy" is an
-     * answer the SDK may deliver as an exception, and it must not be reported as a failure. Any other failure
-     * is surfaced, because silently reporting "no policy" for an unreadable policy table would tell an
-     * operator that nothing is retained when the opposite may be true.
+     * <p>Read through {@link IbmCmApi#readOrAbsent} - the SAME session-aware vendor wrapper as every other
+     * SDK call - because "this ItemType has no retention policy" is an answer the SDK may deliver as a
+     * {@code DKNotExistException}, and it must not be reported as a failure. Any other failure is surfaced,
+     * because silently reporting "no policy" for an unreadable policy table would tell an operator that
+     * nothing is retained when the opposite may be true.
+     *
+     * <p>Going through the wrapper is also what makes this getter obey the Goal 02A invariant: a failure
+     * that is not "not found" is classified backend-unusable AND marks this session unusable in the same
+     * method, so the lease return retires the session instead of handing a session with an unreadable
+     * policy table to the next borrower.
+     *
+     * <p>Package-private (rather than private) so the IBM test suite can drive this exact read with a fake
+     * ItemType, which is otherwise impossible: the vendor class hands out its accessors from a concrete
+     * type the suite cannot construct for real. Same seam rationale as {@link IcmDatastore}.
      */
-    private String readRetentionPolicyName(DKItemTypeDefICM itemType) {
-        try {
-            return IbmEnumNames.text(itemType.getItemTypeRetentionPolicyName());
-        } catch (com.ibm.mm.sdk.common.DKNotExistException absent) {
-            return "";
-        } catch (Exception failure) {
-            throw new IbmCmFailure(IbmErrorSanitizer.category(failure),
-                    IbmErrorSanitizer.describe("itemTypeRetentionPolicyName", failure), failure,
-                    IbmErrorSanitizer.backendUnusable(failure));
-        }
+    static String retentionPolicyNameOf(IbmCmSession session, DKItemTypeDefICM itemType) {
+        String name = IbmCmApi.readOrAbsent(session, "itemTypeRetentionPolicyName",
+                itemType::getItemTypeRetentionPolicyName);
+        return IbmEnumNames.text(name);
     }
 
     /** The configured business classification of one ItemType name. */

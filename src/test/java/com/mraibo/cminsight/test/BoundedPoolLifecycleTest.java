@@ -39,11 +39,25 @@ public class BoundedPoolLifecycleTest {
         Assert.assertEquals(3L, pool.metrics().closeSuccesses(), "every resource was closed exactly once");
     }
 
-    public void initializeFailureClosesWhatItCreatedAndLeavesThePoolRetryable() throws Exception {
+    /**
+     * A partial {@code initialize()} failure closes what it created and quarantines the failed attempt's
+     * reservation.
+     *
+     * <p>Rewritten for Goal 02A section A. This factory throws a plain {@link IOException} BEFORE it
+     * allocates anything, and the pre-correction pool read that as "the attempt was empty" and returned the
+     * reservation. That reading is exactly what the correction removes: a plain throw is not cleanup
+     * evidence, so the failed attempt's slot is quarantined, the pool is left with one slot permanently
+     * consumed, and it therefore refuses to be filled again - the honest operator-facing answer being "build
+     * a new pool" rather than "retry into a slot whose physical outcome is unknown".
+     *
+     * <p>The resources that WERE created are still asserted to be closed: a quarantine of the failed
+     * attempt must not abandon its neighbours.
+     */
+    public void initializeFailureClosesWhatItCreatedAndQuarantinesTheFailedSlot() throws Exception {
         FakePoolFactory factory = new FakePoolFactory();
         AtomicInteger attempts = new AtomicInteger();
         AtomicBoolean failTheThird = new AtomicBoolean(true);
-        ResourceFactory<FakeResource> flaky = new ResourceFactory<FakeResource>() {
+        ResourceFactory<FakeResource> flaky = new ResourceFactory<>() {
             @Override
             public FakeResource create() throws Exception {
                 if (attempts.incrementAndGet() == 3 && failTheThird.getAndSet(false)) {
@@ -72,14 +86,22 @@ public class BoundedPoolLifecycleTest {
         PoolMetrics metrics = pool.metrics();
         Assert.assertEquals(0, metrics.available(), "the pool is left empty");
         Assert.assertEquals(0, metrics.leased(), "nothing is leased");
-        Assert.assertEquals(0, metrics.capacityInUse(), "no slot is still reserved");
+        Assert.assertEquals(0, metrics.creating(),
+                "A: every reservation is resolved; the failing attempt is not left in flight");
+        Assert.assertEquals(1, metrics.quarantined(),
+                "A: a plain failure is not cleanup evidence, so the failed attempt's slot is quarantined");
+        Assert.assertEquals(1L, metrics.createQuarantineFailures(), "A: and the event is counted");
+        Assert.assertEquals(1, metrics.capacityInUse(),
+                "A: the quarantined slot is the only capacity left accounted for");
         Assert.assertEquals(3L, metrics.createAttempts(), "the failing attempt is counted");
         Assert.assertEquals(1L, metrics.createFailures(), "the failure is counted");
 
-        pool.initialize();
-        Assert.assertEquals(3, pool.metrics().available(), "the pool can be initialized again after a failure");
-        Assert.assertEquals(3, factory.liveCount(), "the retry filled every slot");
-        pool.close();
+        IllegalStateException refused = Assert.assertThrows(IllegalStateException.class, pool::initialize,
+                "A: a pool that lost a slot to a quarantine must refuse to be filled again");
+        Assert.assertTrue(refused.getMessage().contains("quarantined=1"),
+                "A: the refusal names the quarantine rather than a phantom lease: " + refused.getMessage());
+        Assert.assertEquals(1, metrics.capacityInUse(), "A: the refused retry changed no accounting");
+        Assert.assertEquals(1, metrics.quarantined(), "A: and quarantined nothing further");
     }
 
     public void closeRefusesFurtherBorrowsAndReleasesEveryResource() throws Exception {
@@ -300,7 +322,18 @@ public class BoundedPoolLifecycleTest {
         Assert.assertEquals(0, factory.liveCount(), "nothing is left alive after close()");
     }
 
-    public void aFactoryFailureOnBorrowSurfacesAsAPoolExceptionWithNoLeak() {
+    /**
+     * A factory failure on borrow surfaces as a {@code PoolException}, leaks nothing, and quarantines the
+     * reserved slot.
+     *
+     * <p>Rewritten for Goal 02A section A: the pre-correction pool let the next borrow create a replacement
+     * here, because the plain {@link IOException} was read as "this attempt produced nothing". That reading
+     * is no longer part of the contract, so the decisive assertion is now the opposite one - the pool does
+     * NOT recover in the same instance, it applies backpressure - and the "no leak" property is asserted
+     * where it still holds: the factory allocated nothing at all, and nothing physically alive is left
+     * unaccounted for.
+     */
+    public void aFactoryFailureOnBorrowSurfacesAsAPoolExceptionAndQuarantinesTheSlot() {
         FakePoolFactory factory = new FakePoolFactory();
         factory.failNextCreates(1);
         BoundedPool<FakeResource> pool = new BoundedPool<>("create-fail", 1, Duration.ofMillis(300), factory);
@@ -312,16 +345,16 @@ public class BoundedPoolLifecycleTest {
                 "the message names the pool: " + failure.getMessage());
         Assert.assertEquals(0, factory.liveCount(), "nothing was left alive");
         Assert.assertEquals(1L, pool.metrics().createFailures(), "the failure is counted");
-        Assert.assertEquals(0, pool.metrics().capacityInUse(), "the reserved slot was released");
+        Assert.assertEquals(1, pool.metrics().quarantined(),
+                "A: a plain failure quarantines its reserved slot - releasing it is the removed rule");
+        Assert.assertEquals(1L, pool.metrics().createQuarantineFailures(), "A: and the event is counted");
+        Assert.assertEquals(0, pool.metrics().creating(), "A: nothing is left in flight");
+        Assert.assertEquals(1, pool.metrics().capacityInUse(), "A: the quarantined slot consumes capacity");
 
-        Lease<FakeResource> lease;
-        try {
-            lease = pool.borrow();
-        } catch (InterruptedException | java.util.concurrent.TimeoutException e) {
-            throw new AssertionError("a healthy factory must succeed after a failed attempt", e);
-        }
-        Assert.assertNotNull(lease, "the pool recovers once the factory works again");
-        lease.close();
+        Assert.assertThrows(java.util.concurrent.TimeoutException.class, pool::borrow,
+                "A: the pool must NOT hand out a replacement for a slot whose outcome is unknown");
+        Assert.assertEquals(1, factory.createAttempts(),
+                "A: no replacement creation was attempted on top of the unknown outcome");
         pool.close();
     }
 

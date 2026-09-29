@@ -31,10 +31,18 @@ import com.mraibo.cminsight.connection.CmSession;
  *
  * <h2>Teardown is attempted in full, and its outcome is never assumed</h2>
  *
- * <p>{@link #close()} performs {@code disconnect()} and {@code destroy()} - every step, even when an
- * earlier one failed - and throws {@link IbmCmCleanupFailure} if any step did not return normally. It is
- * idempotent: a second call is a no-op, which matters because both the pool and the activation failure
- * path can race to release the same session.
+ * <p>{@link #close()} releases the datastore through {@link IbmCmCleanupFailure#releaseQuietly(IcmDatastore)}
+ * - the one implementation of IBM's documented order, shared with the failed-connect path in
+ * {@link IbmCmConnectionFactory} - so every step that should run is attempted, even when an earlier one
+ * failed. It is idempotent: a second call is a no-op, which matters because both the pool and the
+ * activation failure path can race to release the same session.
+ *
+ * <p>The verdict is the documented one: {@code proven = destroyProven}, NOT
+ * {@code disconnectProven && destroyProven}. A {@code disconnect()} failure is retained as a sanitised
+ * diagnostic but no longer reports the teardown as unproven, because IBM documents {@code destroy()} as
+ * performing the datastore cleanup if needed; a {@code destroy()} that does not return normally still
+ * throws {@link IbmCmCleanupFailure} regardless of the disconnect result. The full reasoning is written
+ * down at {@link IbmCmCleanupFailure#releaseQuietly(IcmDatastore)}, where a reviewer will look for it.
  *
  * <p>The datastore field is deliberately NOT cleared when teardown begins. Nulling it first would look
  * tidy and would make the state below unprovable: the object is the only handle through which
@@ -178,18 +186,24 @@ public final class IbmCmSession implements CmSession {
     /**
      * Releases the physical session, attempting every teardown step and reporting an unproven outcome.
      *
-     * <p>Order matters and is the proven one: {@code disconnect()} while the datastore reports itself
-     * connected, then {@code destroy()} ALWAYS - {@code destroy()} releases the local SDK object, and
+     * <p>Order matters and is the documented one: {@code isConnected()}, then {@code disconnect()} when a
+     * connection was established (or when the answer cannot be read), then {@code destroy()} ALWAYS -
+     * {@code destroy()} releases the local SDK object and performs the datastore cleanup if needed, and
      * skipping it because {@code disconnect()} threw is precisely how a half-torn-down session survives.
+     * The steps live in {@link IbmCmCleanupFailure#releaseQuietly(IcmDatastore)}, together with the verdict
+     * rule and its documented justification.
      *
-     * <p>Failures are collected, never swallowed, and surfaced as {@link IbmCmCleanupFailure}, which is
-     * what makes {@code BoundedPool} quarantine the capacity slot instead of freeing it. Freeing a slot
-     * whose session may still exist is the one outcome the hard physical bound cannot survive.
+     * <p>Failures are collected, never swallowed. A {@code destroy()} that did not return normally is
+     * surfaced as {@link IbmCmCleanupFailure}, which is what makes {@code BoundedPool} quarantine the
+     * capacity slot instead of freeing it; a {@code disconnect()} problem that {@code destroy()} then made
+     * moot is RETAINED as a sanitised diagnostic, because losing it would turn a real server-side symptom
+     * into silence. Freeing a slot whose session may still exist is the one outcome the hard physical bound
+     * cannot survive.
      *
      * <p>Idempotent, and safe to call after {@link #markUnusable()}: the second call observes a terminal
      * state and returns.
      *
-     * @throws IbmCmCleanupFailure when a teardown step did not return normally
+     * @throws IbmCmCleanupFailure when {@code destroy()} did not return normally, so cleanup is unproven
      */
     @Override
     public void close() {
@@ -201,31 +215,11 @@ public final class IbmCmSession implements CmSession {
             state = State.UNCERTAIN;
         }
 
-        boolean disconnectProven = true;
-        boolean destroyProven = true;
-        String disconnectDetail = "";
+        IbmCmCleanupFailure.Teardown teardown = handle == null
+                ? new IbmCmCleanupFailure.Teardown(true, "")
+                : IbmCmCleanupFailure.releaseQuietly(handle);
+        boolean proven = teardown.destroyProven();
 
-        if (handle != null) {
-            boolean connected = isConnectedQuietly(handle);
-            if (connected) {
-                try {
-                    handle.disconnect();
-                } catch (Exception | Error failure) {
-                    disconnectProven = false;
-                    disconnectDetail = IbmErrorSanitizer.describe("disconnect", failure);
-                }
-            }
-            try {
-                handle.destroy();
-            } catch (Exception | Error failure) {
-                destroyProven = false;
-                if (disconnectDetail.isEmpty()) {
-                    disconnectDetail = IbmErrorSanitizer.describe("destroy", failure);
-                }
-            }
-        }
-
-        boolean proven = disconnectProven && destroyProven;
         synchronized (this) {
             // The state is set only now, after the physical outcome is known. That ordering is the
             // point: a concurrent markUnusable() during teardown sees UNCERTAIN and stays out of the way,
@@ -234,28 +228,17 @@ public final class IbmCmSession implements CmSession {
         }
 
         if (!proven) {
-            String text = "session teardown did not return normally (" + disconnectDetail + ")";
+            String text = "session teardown did not return normally; destroy() did not prove cleanup ("
+                    + teardown.diagnostics() + ")";
             record(text);
-            throw new IbmCmCleanupFailure(disconnectProven ? "destroy" : "disconnect", text, null);
+            throw new IbmCmCleanupFailure("destroy", text, null);
         }
-    }
-
-    /**
-     * Asks whether the datastore currently considers itself connected.
-     *
-     * <p>Used only during teardown, where the answer decides whether {@code disconnect()} is attempted.
-     * It is never used as a health probe - see the class notes.
-     *
-     * <p>Any unchecked failure - or a linkage error from a half-visible SDK - is read as "connected", because
-     * the conservative reading is to attempt the disconnect: if the call then fails, the slot is quarantined,
-     * which is the safe direction. Reading a failure as "not connected" would skip a needed teardown and let a
-     * live session be forgotten.
-     */
-    private static boolean isConnectedQuietly(IcmDatastore handle) {
-        try {
-            return handle.isConnected();
-        } catch (RuntimeException | Error unknown) {
-            return true;
+        if (!teardown.diagnostics().isEmpty()) {
+            // destroy() proved cleanup, but a step still reported a problem - a disconnect failure after a
+            // failed connect is exactly this case. Retained as a sanitised diagnostic, because losing it
+            // would turn a real server-side symptom into silence. It does NOT quarantine the slot: only a
+            // destroy() that did not return normally can do that.
+            record("session teardown reported a problem (" + teardown.diagnostics() + ")");
         }
     }
 

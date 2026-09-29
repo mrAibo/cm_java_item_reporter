@@ -23,7 +23,8 @@ package com.mraibo.cminsight.connection;
  * <dl>
  *   <dt>{@link Cleanup#PROVEN_CLEAN}</dt>
  *   <dd>Nothing was allocated, or everything that was allocated was closed and that close returned
- *       normally. The reserved slot is released and a later borrow may create a replacement.</dd>
+ *       normally. This is the <strong>only</strong> outcome that releases the reserved slot, so a later
+ *       borrow may create a replacement.</dd>
  *
  *   <dt>{@link Cleanup#UNPROVEN}</dt>
  *   <dd>Something may have been allocated and its removal was not proven. The reserved slot is
@@ -38,13 +39,24 @@ package com.mraibo.cminsight.connection;
  *
  * <h2>Relationship to a plain exception</h2>
  *
- * <p>A {@code create()} that throws something which is <em>not</em> a {@code CreationFailure} keeps the
- * historical reading: the slot is released. That keeps every Goal 01 behaviour and every existing
- * {@code ResourceFactory} implementation working unchanged, and it is why this is a distinct type rather
- * than a flag on a generic exception. A factory that can allocate a physical resource and then fail
- * uncertainly - the CM adapter is the first - must throw this type to say so. The residual risk is
- * recorded in {@code STATUS.md}: a factory that opens a resource, fails to clean it up and then throws an
- * ordinary exception is still invisible to the pool.
+ * <p>A {@code create()} that throws something which is <em>not</em> a {@code CreationFailure} is read the
+ * same way as an explicit {@code UNPROVEN} verdict: conservatively. Since Goal 02A the pool releases a
+ * reservation only when this type carries {@code PROVEN_CLEAN}, so an ordinary exception, a runtime
+ * exception, an {@link Error} and an {@link InterruptedException} from the factory all quarantine the
+ * slot instead.
+ *
+ * <p>That default is the <em>opposite</em> of the pre-Goal-02A reading, where an untyped failure released
+ * the reservation and only an explicit {@code UNPROVEN} kept it. The old default made the physical hard
+ * bound depend on every factory author remembering a special exception, which is a fail-open dependency
+ * on the caller; the Goal 02 architecture review rejected it. The contract change is deliberate and is
+ * recorded in {@code STATUS.md}.
+ *
+ * <p>The consequence for an implementation is small but real: a factory that <em>knows</em> it failed
+ * before allocating anything - because it validated its own arguments, or because the vendor SDK turned
+ * out to be absent - should say {@code PROVEN_CLEAN} explicitly rather than throw a plain exception,
+ * which would otherwise cost the pool a capacity slot for the lifetime of the pool. When in doubt report
+ * {@code UNPROVEN}: the safe direction is always to under-claim, and reporting {@code PROVEN_CLEAN} for a
+ * cleanup that did not actually complete is the one mistake this class exists to prevent.
  */
 public class CreationFailure extends Exception {
 
