@@ -78,7 +78,8 @@ public final class SelfTest {
             CmApiRoutesInstallTest.class,
             ProviderDiscoveryTest.class,
             CoreIbmIsolationTest.class,
-            IbmSourceReadOnlyGuardTest.class);
+            IbmSourceReadOnlyGuardTest.class,
+            ScriptPermissionTest.class);
 
     private SelfTest() {
     }
