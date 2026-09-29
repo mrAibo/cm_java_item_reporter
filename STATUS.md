@@ -15,10 +15,68 @@
 - Goal 02A final reviewed remote HEAD: `ff4b2aa32617a6037b541143b008947ed095cfdc`
 - Goal 02B reviewed checkpoint (the review that required this goal): `9ff2b474d6a42260bdd0c0a2e311b315e79fe5a5`
 - Goal 02B implementation commit (the commit this section describes): `1049ab4c50c66adc682457971290deaa7dec17de`
-- Stage: **Goal 02B EXECUTED, PUSHED and GREEN on both Actions events; awaiting architecture review**
-- Current approved goal: `harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md` (executed)
-- Goals 03-05: PROVISIONAL; do not execute
-- Next goal: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+- Goal 02B final reviewed remote HEAD: `30f8a31aaa41522c2d00b0b894801576f74ed401`
+- Stage: **Goal 02B REVIEWED / ACCEPTED; Goal 03 FAST ANALYTICS APPROVED**
+- Current approved goal: `harness/GOAL_03_FAST_ANALYTICS.md`
+- Goal 03: APPROVED / EXECUTE
+- Goals 04-05: PROVISIONAL; do not execute
+- Next goal after Goal 03: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+
+## Goal 02B external architecture review
+
+Reviewed remote SHA:
+
+`30f8a31aaa41522c2d00b0b894801576f74ed401`
+
+Formal evidence verified from GitHub:
+
+- branch HEAD exactly matched `30f8a31aaa41522c2d00b0b894801576f74ed401`;
+- final push Actions run `36593216495`: **success**, exact same head SHA;
+- final pull_request Actions run `36593224416`: **success**, exact same head SHA;
+- implementation push `36592065472` and pull_request `36592073280`: **success**, exact implementation SHA `1049ab4c50c66adc682457971290deaa7dec17de`;
+- PR #1 remained open, draft and unmerged;
+- zero JAR files are tracked in the reviewed Git tree.
+
+### Review verdict
+
+**ACCEPTED. Goal 02B closes the resource-contract gap found after Goal 02A. Goal 03 may now build the
+JDBC analytics half of RepositoryContext on the hardened generic pool contract.**
+
+Source review confirmed:
+
+- pre-allocation request/profile/credential failures now explicitly report
+  `CreationFailure(PROVEN_CLEAN)`, so a disappearing credential does not quarantine an empty slot;
+- the physical allocation boundary is explicit and unknown post-boundary failures remain untyped and
+  therefore quarantined by BoundedPool;
+- `lastAttemptLeftResources` is written once per attempt and cannot remain stale from an older failure;
+- `ResourceFactory.isHealthy` is abstract, so every future physical-resource factory must state a cheap,
+  local health policy;
+- an already-translated backend-unusable `IbmCmFailure` idempotently marks the current session before
+  it leaves `IbmCmApi`;
+- the IBM test runner fails closed on a runnable compiled suite omitted from its explicit list;
+- retention numeric-code absence is represented only by `null`; an explicitly supplied number is not
+  rewritten merely because it is negative;
+- the Goal 01C repository close/quiescence latch was not redesigned by this correction.
+
+The credential-loss regression is strong evidence because it reaches the production factory/pool seam,
+measures zero additional physical connection attempts, zero quarantine and successful recovery after the
+credential source returns. The opposite post-allocation controls still quarantine.
+
+### One non-blocking evidence wording correction
+
+The real-SDK run proves that the **directory-root** IBM suite registration guard works while the suites
+link against the real IBM SDK. It does **not** by itself execute the `jar:` branch of
+`IbmSuiteRegistration`: `IbmAdapterTest` is still loaded from the compiled test directory, while the
+SDK dependency is the JAR. The jar-root implementation is retained and code-reviewed, but it is not
+claimed as measured evidence until the test runner itself is packaged and loaded from a JAR.
+
+This is documentation/evidence precision only, not a Goal 02B code blocker.
+
+### Goal state after review
+
+- Goal 02B: **COMPLETED / REVIEWED / ACCEPTED**.
+- Goal 03: **APPROVED / EXECUTE** as rewritten in `harness/GOAL_03_FAST_ANALYTICS.md`.
+- Goals 04-05: provisional; do not execute.
 
 ## Goal 02B execution record
 
@@ -138,7 +196,8 @@ committed tests. `./bin/doctor.sh` **exit 0** (0 failures). `./build.sh --check-
 **Real IBM CM 8.7 SDK, reported separately as required:** `./build.sh --require-ibm` **exit 0**
 with the real jars staged, compiling **17 adapter sources and 12 test sources** against
 `cmbicmsdk81.jar` (8.7.00.400.44) and running the **full IBM suite 51/0 on the real-SDK class
-path** - so the section D jar-enumeration branch is **measured**, not merely read. Without the
+path**. This measures the directory-root registration guard while linking against the real SDK; the
+separate `jar:` root branch remains code-reviewed but is not claimed as executed evidence. Without the
 jars it refuses with **exit 1**. Only this is SDK validation; the stub compile is a compile check
 and is never described as validation. No vendor JAR is committed or left untracked.
 

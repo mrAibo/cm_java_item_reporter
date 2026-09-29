@@ -153,11 +153,42 @@ enabled.
 
 ## Statistics
 
-Metadata comes from IBM CM Java API. High-volume counts use JDBC.
+Metadata comes from the IBM CM Java API. High-volume counts use JDBC through a separate hard-bounded
+`BoundedPool<JdbcSession>`; JDBC connections never come from the IBM adapter and never bypass that pool.
 
-Root physical table mapping starts from the working CM_retention approach using ICMSTCOMPDEFS + ICMSTITEMTYPEDEFS and COMPONENTTYPEID / SEGMENTID, then caches the result.
+Goal 03 freezes the logical-count semantics before SQL is written:
 
-One aggregate query should calculate total + today + 7d + 30d + current year where practical. DB2/Oracle syntax differences live in DatabaseDialect.
+- a logical item is one distinct IBM CM `ItemID`, not one physical root row;
+- IBM documents root rows as `(ItemID, VersionID)`, and versioning keeps the same ItemID across all
+  versions, so `COUNT(*)` on a versioned root table is not a logical-item count;
+- physical root mapping starts from the proven CM_retention query over `ICMSTCOMPDEFS` and
+  `ICMSTITEMTYPEDEFS`, but analytics represents all expected physical segments, not only the current one;
+- if `ICMSTITEMTYPEDEFS.SegmentID` is N, segments 1..N are part of the mapping. A missing/ambiguous
+  segment is an error; analytics never silently counts only the current segment.
+
+The time-window source is the creation date encoded in IBM's immutable ItemID. IBM documents that ItemID
+is generated when the item is created, and positions 9-14 encode century/year/month/day. The root-table
+`CreateTS` is only the timestamp when that physical entry was created and therefore is not accepted as
+proof of original logical-item creation for a versioned item.
+
+Goal 03 reporting windows are database-local calendar windows, anchored once per scan from the database
+current date:
+
+- today: today through tomorrow, exclusive;
+- last 7 days: today plus the preceding 6 calendar days;
+- last 30 days: today plus the preceding 29 calendar days;
+- current year: January 1 through January 1 of the next year, exclusive.
+
+The aggregate query deduplicates ItemID across versions and all physical root segments first, then computes
+total + the four window counts. DB2/Oracle syntax belongs behind `DatabaseDialect`. Versions and Parts
+remain `UNAVAILABLE`.
+
+Authoritative IBM CM 8.7 evidence used to freeze these rules:
+
+- https://www.ibm.com/docs/en/content-manager/8.7.0?topic=tables-icmutnnnnnsss-component-roots
+- https://www.ibm.com/docs/en/content-manager/8.7.0?topic=tables-icmstitems-items
+- https://www.ibm.com/docs/en/content-manager/8.7.0?topic=concepts-versioning
+- https://www.ibm.com/docs/en/content-manager/8.7.0?topic=settings-icmstitemtypedefs-item-type-definitions
 
 ## Versions and Parts
 
