@@ -1,8 +1,14 @@
 # Goal 02B - Resource contract closure before JDBC
 
-**Status: APPROVED / EXECUTE**
+**Status: COMPLETED / PUSHED / GREEN - AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
 
-This is the final narrow contract-hardening gate after the architecture review of Goal 02A.
+Implementation commit: `1049ab4c50c66adc682457971290deaa7dec17de`.
+Both exact-SHA GitHub Actions runs are green for it: push `36592065472`, pull_request `36592073280`.
+Core 253 tests and IBM 51 tests green on the stub path, and `--require-ibm` green against the real
+IBM CM 8.7 SDK with the full IBM suite running on that class path.
+No live CM validation has been performed - no server is reachable from the execution host.
+
+This was the final narrow contract-hardening gate after the architecture review of Goal 02A.
 
 Reviewed Goal 02A remote SHA:
 

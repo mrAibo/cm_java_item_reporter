@@ -13,10 +13,205 @@
 - Goal 02A reviewed checkpoint (the review that required this goal): `67d058c1d26d706ce75b73011e959f23c00c5868`
 - Goal 02A implementation commit (the commit this section describes): `4b810b361c3c34b0b9118ddcbc560ee47d21560b`
 - Goal 02A final reviewed remote HEAD: `ff4b2aa32617a6037b541143b008947ed095cfdc`
-- Stage: **Goal 02A REVIEWED; Goal 02B resource-contract closure APPROVED**
-- Current approved goal: `harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md`
+- Goal 02B reviewed checkpoint (the review that required this goal): `9ff2b474d6a42260bdd0c0a2e311b315e79fe5a5`
+- Goal 02B implementation commit (the commit this section describes): `1049ab4c50c66adc682457971290deaa7dec17de`
+- Stage: **Goal 02B EXECUTED, PUSHED and GREEN on both Actions events; awaiting architecture review**
+- Current approved goal: `harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md` (executed)
 - Goals 03-05: PROVISIONAL; do not execute
-- Next goal after Goal 02B: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+- Next goal: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+
+## Goal 02B execution record
+
+Date/time: end of the Goal 02B execution session (local time). Branch:
+`bootstrap/cm-insight-architecture`. **PR #1 remains OPEN, draft, unmerged.**
+
+Checkpoint protocol: a commit cannot truthfully record its own SHA, and this file
+changes the tree, so the commit above is the last completed **implementation** commit
+this section describes. The authoritative head is read from Git
+(`git rev-parse HEAD` / `git ls-remote origin refs/heads/bootstrap/cm-insight-architecture`),
+and the handoff report records the exact local and verified remote HEAD after this
+documentation commit has been pushed.
+
+### A. Known-clean pre-allocation CM failures now release the creation slot
+
+**The blocking regression, and it was a real capacity leak.** `IbmCmSessionFactory.create()`
+ran `validateProfile()` and `resolveCredentials()` **before** the verdict-producing
+try/catch, and both throw `IbmCmFailure`. Since Goal 02A correctly made every UNTYPED
+failure quarantine, a CM credential that disappeared after successful activation made a
+replacement creation fail **before any `DKDatastoreICM` was allocated** and nevertheless
+burn the pool slot permanently. The application re-resolves credentials for every
+replacement session, so this was reachable in normal operation rather than theoretical.
+
+**The allocation boundary is now an explicit concept**: the `connections.connect(...)`
+call. **Above** it - request mismatch, blank SSID, unresolvable credential - the attempt
+reports `CreationFailure(PROVEN_CLEAN)`, because nothing physical exists. **At or below**
+it, Goal 02A semantics are unchanged: `IbmCmFailure` -> PROVEN_CLEAN,
+`IbmCmCleanupFailure` -> UNPROVEN, and anything else stays **untyped -> quarantine**,
+with no catch-all that could relabel an unknown physical outcome as clean. A fatal `Error`
+above the boundary stays conservative, documented at the site with both reasons.
+`lastAttemptLeftResources` now has exactly **one** write site, a `finally`, so it always
+describes the current attempt instead of going stale after a later clean failure.
+
+**Measured through the real pool and factory**, only the physical layer faked:
+
+| | connectAttempts | quarantined | createQuarantineFailures | capacityInUse |
+| --- | --- | --- | --- | --- |
+| before the credential-loss replacement | 1 | 0 | 0 | 0 |
+| after it | **1 (zero additional)** | **0** | **0** | **0** |
+| after the credential is restored | 2 | 0 | 0 | 1 (`available=1`, `replacementCreations=1`) |
+
+**The opposite control, built independently by the verifier with the adapter removed**: an
+untyped `RuntimeException` kept its own type and **quarantined** (`1/1/1`, `degraded`). The
+fix cannot be abused to relabel every failure clean - relabelling is confined to the
+pre-boundary paths. And it is a genuine regression test, not a vacuous pass: the same suite
+against the **pre-fix** factory from HEAD is **51/7**.
+
+### B. ResourceFactory health semantics are now mandatory
+
+`ResourceFactory.isHealthy` had a permissive default body `return resource != null`, so safe
+retirement depended on every composition root remembering to override it - and Goal 03 is
+about to add another physical-resource factory. The method is now **abstract**: no default,
+no convenience overload and no "always healthy" policy object.
+
+**This is a deliberate COMPILE-BREAKING change**, and that is the point - it forces every
+implementation to state a policy. Verified by enumerating the compiled output: the interface
+declares **zero defaults** and **15/15 implementations** declare `isHealthy`. Three delegate
+to a real local read; the ones whose resource is a bare live-counter have a **stated constant
+with the reason at the site**, because a bare `return true` is indistinguishable from the
+oversight this closes. Both composition-root factories were already explicit, so production
+behaviour is unchanged. The health check remains cheap and local: production probes are single
+local reads performing **zero vendor calls**, which matters because `BoundedPool` calls them
+while holding its lock on the borrow path, the return path and a rotation sweep.
+
+### C. Backend-unusable reasserts structurally
+
+`IbmCmApi`'s already-translated rethrow path now reasserts the invariant: when the failure's
+own `backendUnusable()` is true it marks the current session unusable **before** rethrowing;
+when false it leaves the session reusable, so **`DKNotExist` stays benign**. The property is
+now a property **of the wrapper** rather than of call-site memory. The proving test throws a
+**preconstructed** translated failure from a `ReadCall` that does **not** mark, so it fails
+against the previous rethrow-unchanged implementation; a negative control confirms a benign or
+reusable failure poisons nothing. Marking is idempotent and records only the failure's own
+already-sanitised text, never raw vendor text.
+
+### D. The IBM runner can no longer silently omit a suite
+
+Goal 02A found four **core** suites that had never executed because the runner's list omitted
+them; the core runner now detects that, and the IBM runner had no equivalent. It keeps its
+explicit list for deterministic ordering and adds a **fail-closed guard** that derives its
+expectation from the **compiled** tree using the runner's own discovery predicate, so the
+guard and the runner cannot drift, and it handles a **jar class path explicitly** rather than
+silently finding nothing. Proven by planting a real unlisted suite: build **RED** naming it,
+then green after removal. It earned its keep immediately - it caught the new section A suite in
+the real tree before it was registered, which is exactly the defect class it exists for.
+
+### E. Retention numeric absence is exactly `null`
+
+Goal 02A replaced the misleading `-1` sentinel with nullable fields but **additionally
+normalised every negative value to `null`**, on a premise nothing in the SDK evidence
+establishes - `javap` showed those enum classes carry **no numeric code field at all**, so the
+server's value range is simply unknown. That normalisation is **deleted**: `null` is the only
+representation of absent, an explicitly supplied code is **preserved verbatim whether positive
+or negative**, and no `-1` sentinel constant or call site returns. Measured through the real
+serializer: `-7` and `-23` are preserved as data, `null` renders JSON `null`, `0` is preserved.
+The test asserting the deleted rule was **updated, not preserved**.
+
+### Also fixed en route, found by running rather than reading
+
+The new section A suite created its fixtures with `Files.createTempDirectory`, which **this
+environment denies** under `java.io.tmpdir`. The project already solved this in Goal 01 -
+`TestSupport` documents the denial and derives its scratch root from the compiled test classes -
+and the new suite reintroduced the trap, so **six of its tests could not run at all**. Fixed the
+same way, with no assertion weakened, and proven by pointing `java.io.tmpdir` at a nonexistent
+path: fixed tree **51/0**, same tree with only that line reverted **51/6**. Worth recording
+because GitHub's Linux runners allow `/tmp`, so this would have been **green in CI and red only
+on a restricted machine** - the mirror image of the Windows executable-bit problem this project
+hit three times in Goal 02.
+
+### Tests actually run, with results
+
+**Stub path** (`./build.sh`): **exit 0**, core **253/0**, IBM **51/0** (304 PASS / 0 FAIL),
+jar packaged. `./tests/selftest.sh` **exit 0**. `./tests/shell/run.sh` **exit 0** - all four
+committed tests. `./bin/doctor.sh` **exit 0** (0 failures). `./build.sh --check-ibm-isolation`
+**exit 0**.
+
+**Real IBM CM 8.7 SDK, reported separately as required:** `./build.sh --require-ibm` **exit 0**
+with the real jars staged, compiling **17 adapter sources and 12 test sources** against
+`cmbicmsdk81.jar` (8.7.00.400.44) and running the **full IBM suite 51/0 on the real-SDK class
+path** - so the section D jar-enumeration branch is **measured**, not merely read. Without the
+jars it refuses with **exit 1**. Only this is SDK validation; the stub compile is a compile check
+and is never described as validation. No vendor JAR is committed or left untracked.
+
+**Independent verification:** the verifier wrote none of the production changes, hash-verified
+its evidence against `1049ab4`, and returned **PASS on every in-scope criterion**: the
+physical connect count and pool metrics, an opposite control it built itself, the diagnostics
+walk (`true -> false -> true -> false`, so no stale flag), reflection over the compiled
+interface and all 15 implementations, the plant/unplant attack on the runner, the serializer
+output, and all eleven Goal 02A non-regression items - including confirming
+`RepositoryManager.java` is **byte-identical** to the reviewed `ff4b2aa`.
+
+### Live CM status - honest
+
+**No live CM server is reachable from this machine, so no live read-only CM validation has been
+performed, in this goal or any earlier one.** The real-SDK work above is compilation plus the
+deterministic test suite on a real-SDK class path. No failed-connection smoke was used as
+evidence in this goal, and nothing here is described as live CM validation.
+
+### GitHub Actions - both events, same SHA
+
+| Commit | push run | pull_request run |
+| --- | --- | --- |
+| `1049ab4` (implementation) | `36592065472` **success** | `36592073280` **success** |
+
+Both verified through the GitHub API to have `headSha` equal to the commit above.
+
+### Unresolved risks
+
+1. **No live IBM CM validation** - still the largest gap, a data gap rather than a code gap.
+2. **A failing `destroy()` cannot be forced against a real server**, so that case remains proven
+   with fakes only.
+3. **The fatal-`Error`-before-allocation path stays conservative** (it quarantines). Deliberate
+   and documented at the site, but it means an `OutOfMemoryError` during credential resolution
+   can still consume a slot.
+4. **`ResourceFactory.isHealthy` is now abstract, so any factory added in Goal 03 must state a
+   policy** - that is the intent, but it is a new obligation for the JDBC pool.
+5. **The classification mapping helper remains source-verified** rather than unit-verified,
+   because it needs a vendor `ItemTypeDef`.
+6. **Concurrent builds in one working tree still produce misleading red results** on this host,
+   because `flock` is unavailable in the MSYS shell so `build.sh` cannot detect the second run.
+   Use a private copy for verification; the CI runner has no such contention.
+7. **The SDK needs its own logging configuration** - a real-SDK run emits vendor
+   attention/`NoClassDefFoundError` lines for `log4j-core`/`cmblogconfig.properties` on stderr.
+   It does not affect compilation, tests or lifecycle verdicts.
+
+### Architecture decisions and goal state
+
+No architecture rule was changed. Goal 02B **narrows** one safety default (untyped create
+failure), **makes explicit** one previously inherited contract (factory health), **strengthens**
+one invariant from convention to structure (backend-unusable marking), **closes** one
+diagnostic hole (the attempt flag), **extends** one guard to the second runner, and **removes**
+one undocumented guess (negative values meaning absent).
+
+**Next goal: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 03.
+Do not merge PR #1.
+
+### Resume / review instruction
+
+"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
+Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
+harness/MASTER_GOAL.md, harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md and
+harness/GOAL_02_IMPLEMENTATION_SPEC.md completely. Goals 01 through 01C are accepted; Goal 02 was
+reviewed with changes required; Goal 02A is accepted; Goal 02B is executed, pushed and green on
+both Actions events for the same SHA. REVIEW Goal 02B before approving anything further - do not
+re-execute it and do not execute Goal 03. Preserve the accepted optional-SDK/read-only/API
+architecture and every Goal 01A-01C hard-bound, fail-closed, Linux lifecycle and security
+invariant. Carry forward three facts: no live IBM CM validation has been performed because no CM
+server is reachable from the execution host; this repository is developed on Windows where git
+does not record the executable bit; and for the same reason a second build in one working tree
+cannot be detected, so verify in a private copy."
+
+## Goal 02A execution record (superseded, retained for the review trail)
+
 
 ## Goal 02A external architecture review
 
@@ -95,7 +290,7 @@ These are intentionally one small Goal 02B, not a reopening of Goal 02A.
 ### Goal state after review
 
 - Goal 02A: completed/reviewed; its main corrections are accepted.
-- Goal 02B: **APPROVED / EXECUTE**.
+- Goal 02B: **COMPLETED / PUSHED / GREEN - AWAITING ARCHITECTURE REVIEW** (superseded; see the Goal 02B execution record at the top).
 - Goal 03: **PROVISIONAL / DO NOT EXECUTE** until 02B review passes.
 
 ## Goal 02A execution record
@@ -454,21 +649,22 @@ make the unavailable-code semantics explicit and must not imply -1 came from IBM
 Review first:
 
 1. `harness/MASTER_GOAL.md`
-2. `harness/GOAL_02A_IBM_ADAPTER_SEMANTICS_HARDENING.md` and the Goal 02A execution record above
+2. `harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md` and the Goal 02B execution record at the top of this file
 
 ## Resume instruction
 
 "Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
 Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
-harness/MASTER_GOAL.md, harness/GOAL_02A_IBM_ADAPTER_SEMANTICS_HARDENING.md and
+harness/MASTER_GOAL.md, harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md and
 harness/GOAL_02_IMPLEMENTATION_SPEC.md completely. Goals 01 through 01C are accepted; Goal 02 was
-reviewed with changes required; Goal 02A is executed, pushed and green on both Actions events for the
-same SHA. REVIEW Goal 02A before approving anything further - do not re-execute it and do not execute
-Goal 03. Preserve the accepted optional-SDK/read-only/API architecture and every Goal 01A-01C
-hard-bound, fail-closed, Linux lifecycle and security invariant. Carry forward two facts: no live IBM
-CM validation has been performed, because no CM server is reachable from the execution host; and this
-repository is developed on Windows, where git does not record the executable bit, so validate on Linux
-with JDK 17 before trusting a CI-touching change."
+reviewed with changes required; Goal 02A is accepted; Goal 02B is executed, pushed and green on both
+Actions events for the same SHA. REVIEW Goal 02B before approving anything further - do not re-execute
+it and do not execute Goal 03. Preserve the accepted optional-SDK/read-only/API architecture and every
+Goal 01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Carry forward three
+facts: no live IBM CM validation has been performed because no CM server is reachable from the
+execution host; this repository is developed on Windows where git does not record the executable bit,
+so validate on Linux with JDK 17 before trusting a CI-touching change; and for the same reason a
+second build in one working tree cannot be detected on that host, so verify in a private copy."
 
 ## Mandatory checkpoint rule
 
