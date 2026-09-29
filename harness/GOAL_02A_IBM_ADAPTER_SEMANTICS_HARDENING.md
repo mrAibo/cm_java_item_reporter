@@ -1,8 +1,13 @@
 # Goal 02A - IBM adapter semantics hardening
 
-**Status: APPROVED / EXECUTE**
+**Status: COMPLETED / PUSHED / GREEN - AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
 
-This is a focused correction gate after the architecture/code review of Goal 02.
+Implementation commit: `4b810b361c3c34b0b9118ddcbc560ee47d21560b`.
+Both exact-SHA GitHub Actions runs are green for it: push `36527200713`, pull_request `36527204017`.
+Core 252 tests and IBM 41 tests green, plus `--require-ibm` against the real CM 8.7 SDK.
+No live CM validation has been performed - no server is reachable from the execution host.
+
+This was a focused correction gate after the architecture/code review of Goal 02.
 
 It is NOT Goal 03. Do not add JDBC analytics, DB2/Oracle counting SQL, Versions/Parts, retention
 administration, content viewing, migration or write operations.
