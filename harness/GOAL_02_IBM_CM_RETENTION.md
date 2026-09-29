@@ -1,6 +1,6 @@
 # Goal 02 - IBM CM adapter, ItemTypes and read-only retention viewer
 
-**Status: APPROVED / EXECUTE**
+**Status: COMPLETED / ARCHITECTURE REVIEWED — CHANGES REQUIRED. DO NOT RE-EXECUTE.**
 
 Goal 01 / 01A / 01B / 01C are accepted core-runtime foundations. This is the first real IBM Content
 Manager 8.7 integration.
