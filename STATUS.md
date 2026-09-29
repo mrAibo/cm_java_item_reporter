@@ -34,8 +34,8 @@ Formal evidence verified from GitHub:
 
 ### Review verdict
 
-**The five Goal 02A corrections are substantively accepted. One resource-contract regression and three
-small structural traps must be closed before Goal 03 may introduce a JDBC resource factory.**
+**The five Goal 02A corrections are substantively accepted. One resource-contract regression and four
+small contract/coverage traps must be closed before Goal 03 may introduce a JDBC resource factory.**
 
 Accepted after source review:
 
