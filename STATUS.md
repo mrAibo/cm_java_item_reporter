@@ -19,10 +19,142 @@
 - Goal 03 reviewed checkpoint (the review that approved this goal): `c9751c290dcd7c7879503776befe1be2faec6aae`
 - Goal 03 implementation commit: `1a52f908741005e82b4bf12eac17aab7373fb489`
 - Goal 03 CI fix commit (the commit this section describes): `dc24dbb31b51619719416cf7da2b51b506cc6cb8`
-- Stage: **Goal 03 EXECUTED, PUSHED and GREEN on both Actions events; awaiting architecture review**
-- Current approved goal: `harness/GOAL_03_FAST_ANALYTICS.md` (executed)
-- Goal 03: COMPLETED / PENDING ARCHITECTURE REVIEW
+- Goal 03 final reviewed remote HEAD: `1dcd8f30b20cf57b2abfb688cc12b1e710e4ef6a`
+- Stage: **Goal 03 REVIEWED; Goal 03A scan-lifecycle/SQL-guard hardening APPROVED**
+- Current approved goal: `harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md`
+- Goal 03: COMPLETED / REVIEWED — CORRECTIONS REQUIRED
+- Goal 03A: APPROVED / EXECUTE
 - Goals 04-05: PROVISIONAL; do not execute
+
+## Goal 03 external architecture review
+
+Reviewed remote SHA:
+
+`1dcd8f30b20cf57b2abfb688cc12b1e710e4ef6a`
+
+Formal evidence verified from GitHub:
+
+- branch HEAD exactly matched `1dcd8f30b20cf57b2abfb688cc12b1e710e4ef6a`;
+- final push Actions run `36616502870`: **success**, exact same head SHA;
+- final pull_request Actions run `36616509445`: **success**, exact same head SHA;
+- PR #1 remained open, draft and unmerged.
+
+### Review verdict
+
+**THE JDBC/SQL ANALYTICS CORE IS SUBSTANTIALLY ACCEPTED. TWO SCAN-LIFECYCLE BLOCKERS AND TWO SAFETY
+HARDENING GAPS MUST BE CLOSED BEFORE GOAL 04.**
+
+Accepted after source review:
+
+- lazy hard-bounded JDBC pool; no eager database connection on repository activation;
+- one production `DriverManager.getConnection` allocation boundary in `JdbcSessionFactory`;
+- known-clean pre-allocation JDBC failures use explicit `PROVEN_CLEAN`, and post-allocation unknown
+  cleanup remains conservative/quarantined;
+- mandatory local-only `ResourceFactory.isHealthy`;
+- DB2/Oracle complete-statement dialect design;
+- the DB2 anchor query uses SELECT rather than VALUES, preserving the SELECT-only surface;
+- PhysicalSchemaResolver uses the proven CM metadata query, requires exactly one root component and
+  enumerates every expected segment 1..N;
+- logical counts deduplicate ItemID across versions and segments;
+- creation-date windows use the frozen ItemID date-key semantics and one database date per completed scan;
+- versions/parts remain unavailable;
+- immutable snapshot publication and partial-failure accounting;
+- authenticated statistics routes and action guard;
+- source/type guards keep JDBC handles inside the db package and vendor JARs out of Git.
+
+No live DB2/Oracle server validation was available, so SQL correctness remains documented semantics +
+deterministic fake-driver evidence until a reachable CM database exists.
+
+### BLOCKER 1 — a timed-out/cancelled scan can release the one-scan gate while an old worker is still alive
+
+`ScanCoordinator.runScan()` performs:
+
+1. join workers until the scan deadline;
+2. on lingering workers, cancel/interrupt them;
+3. perform a second join for the fixed `DRAIN_GRACE`;
+4. **ignore whether that second join still found a living worker**;
+5. call `finishScan()`.
+
+`finishScan()` then clears `active`, sets `scanInFlight=false` and clears the tracked thread list.
+
+Therefore a worker/driver that ignores `Statement.cancel()` and interruption beyond the grace period can
+still be executing and holding a JDBC lease after the coordinator reports no scan in flight. A new refresh
+can then start and overlap the old physical query. The old thread is also no longer tracked.
+
+That contradicts the advertised invariant "one scan per RepositoryContext" and the Javadoc claim that the
+gate is released only after all workers are gone.
+
+The correction must keep the scan ownership/gate latched until every old scan worker is actually dead. A
+deadline may make the scan terminal-for-publication (TIMED_OUT, publish nothing), but it does not prove the
+physical work has stopped.
+
+### BLOCKER 2 — the overall scan deadline does not cover the database-current-date query
+
+The coordinator computes `deadlineNanos`, then synchronously calls
+`engine.databaseCurrentDate()` before worker startup.
+
+That call:
+
+- has no `ScanCancellation` parameter;
+- does not register `JdbcSession.cancelInFlight`;
+- is not bounded by the remaining overall scan deadline;
+- uses only the independent statement query timeout.
+
+The configuration allows `statistics.query.timeout.seconds` to exceed
+`statistics.scan.timeout.seconds`. Therefore the scan can exceed its advertised overall timeout while the
+anchor query is blocked, and an explicit scan cancellation/context close cannot reliably reach
+`Statement.cancel()` for that query.
+
+The one database anchor remains the correct semantic design, but it must participate in the same
+cancellation/deadline mechanism as ItemType queries.
+
+### HIGH 3 — current-schema SQLException can return a broken connection to the idle pool
+
+When no schema is configured, `JdbcSession.currentSchema()` calls `Connection.getSchema()`.
+Every query SQLException conservatively poisons a session, but currentSchema currently catches every
+SQLException and leaves the session healthy.
+
+A feature-not-supported answer can legitimately leave the connection reusable. A generic SQL failure
+(connection loss, driver failure, etc.) is not proof of health and should retire the session before the
+lease returns.
+
+Goal 03A must distinguish the benign unsupported case from other SQL failures and add a subsequent-borrow
+test proving a poisoned session is not handed out again.
+
+### HIGH 4 — SELECT/WITH prefix checking is not a structural write-proof
+
+The current runtime `requireSelect()` verifies only that SQL begins with `SELECT` or `WITH`.
+The committed source guard rejects write statements whose literals begin with a DML/control keyword.
+
+That is useful defence, but it is not sufficient for the product claim that the analytics query surface
+cannot express a write. Both DB2 and Oracle SQL families have statement shapes where a SELECT/WITH can
+contain a data-changing construct; a prefix-only admission rule therefore proves the first token, not the
+absence of a write.
+
+Current production SQL is generated and review-clean, so this is a hardening gap rather than evidence that
+Goal 03 currently executes DML. Close it before adding persistent history/report code:
+
+- strengthen the runtime/generated-query gate so dangerous DML/control tokens cannot be smuggled inside an
+  admitted SELECT/WITH statement;
+- refuse multi-statement/comment-obfuscation shapes that the approved generated queries do not need;
+- preserve all currently generated DB2/Oracle SELECT/CTE analytics SQL;
+- add planted controls such as a SELECT data-change-table-reference and a WITH/DML shape, proving the
+  runtime gate and source guard reject them.
+
+Do not build a general SQL parser. A deliberately narrow allow-list for this application's generated
+read-only SQL is preferred to an incomplete permissive parser.
+
+### Non-blocking observations
+
+- Oracle still lacks a local real-driver discovery run and neither database family has live SQL execution.
+- ItemID string-window ordering has deterministic tests but still needs representative live DB validation.
+- The CI executable-bit defect was fixed by `dc24dbb`; the final exact-SHA runs are green.
+
+### Goal state after review
+
+- Goal 03: completed/reviewed; JDBC/SQL architecture accepted, correction required.
+- Goal 03A: **APPROVED / EXECUTE**.
+- Goals 04-05: **PROVISIONAL / DO NOT EXECUTE**.
 
 ## Goal 03 execution record
 

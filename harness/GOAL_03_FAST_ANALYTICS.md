@@ -1,6 +1,6 @@
 # Goal 03 - Fast DB2/Oracle analytics, bounded JDBC pool and snapshot API
 
-**Status: COMPLETED / PUSHED / GREEN - AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
+**Status: COMPLETED / ARCHITECTURE REVIEWED — ANALYTICS CORE ACCEPTED, COORDINATOR/SAFETY CORRECTIONS REQUIRED. DO NOT RE-EXECUTE.**
 
 Implementation commit: `1a52f908741005e82b4bf12eac17aab7373fb489`.
 CI fix commit: `dc24dbb31b51619719416cf7da2b51b506cc6cb8` (this carries the green runs).
