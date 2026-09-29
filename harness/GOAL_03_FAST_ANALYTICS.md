@@ -1,6 +1,14 @@
 # Goal 03 - Fast DB2/Oracle analytics, bounded JDBC pool and snapshot API
 
-**Status: APPROVED / EXECUTE**
+**Status: COMPLETED / PUSHED / GREEN - AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
+
+Implementation commit: `1a52f908741005e82b4bf12eac17aab7373fb489`.
+CI fix commit: `dc24dbb31b51619719416cf7da2b51b506cc6cb8` (this carries the green runs).
+Push run `36615110466` **success**, pull_request run `36615118636` **success**, both for `dc24dbb`.
+Core 341 tests and IBM 51 tests green on the stub path; `--require-ibm` green against the real
+IBM CM 8.7 SDK. No live DB2/Oracle database is reachable, so there is NO live SQL validation.
+
+The first JDBC implementation goal, still V1/V2 read-only.
 
 Reviewed prerequisites:
 

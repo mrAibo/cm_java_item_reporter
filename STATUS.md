@@ -16,10 +16,305 @@
 - Goal 02B reviewed checkpoint (the review that required this goal): `9ff2b474d6a42260bdd0c0a2e311b315e79fe5a5`
 - Goal 02B implementation commit (the commit this section describes): `1049ab4c50c66adc682457971290deaa7dec17de`
 - Goal 02B final reviewed remote HEAD: `30f8a31aaa41522c2d00b0b894801576f74ed401`
-- Stage: **Goal 02B REVIEWED / ACCEPTED; Goal 03 FAST ANALYTICS APPROVED**
-- Current approved goal: `harness/GOAL_03_FAST_ANALYTICS.md`
-- Goal 03: APPROVED / EXECUTE
+- Goal 03 reviewed checkpoint (the review that approved this goal): `c9751c290dcd7c7879503776befe1be2faec6aae`
+- Goal 03 implementation commit: `1a52f908741005e82b4bf12eac17aab7373fb489`
+- Goal 03 CI fix commit (the commit this section describes): `dc24dbb31b51619719416cf7da2b51b506cc6cb8`
+- Stage: **Goal 03 EXECUTED, PUSHED and GREEN on both Actions events; awaiting architecture review**
+- Current approved goal: `harness/GOAL_03_FAST_ANALYTICS.md` (executed)
+- Goal 03: COMPLETED / PENDING ARCHITECTURE REVIEW
 - Goals 04-05: PROVISIONAL; do not execute
+
+## Goal 03 execution record
+
+Date/time: end of the Goal 03 execution session (local time). Branch:
+`bootstrap/cm-insight-architecture`. **PR #1 remains OPEN, draft, unmerged.**
+
+Checkpoint protocol: a commit cannot truthfully record its own SHA, and this file
+changes the tree, so the commits above are the implementation and CI-fix commits this
+section describes. The authoritative head is read from Git (`git rev-parse HEAD` /
+`git ls-remote origin refs/heads/bootstrap/cm-insight-architecture`), and the handoff
+report records the exact local and verified remote HEAD after this documentation commit
+has been pushed.
+
+### Exact logical-item counting semantics
+
+**A logical item is ONE DISTINCT `ItemID`.** IBM documents the component-root table as
+carrying `(ItemID, VersionID)` and documents that all versions of one item share the same
+`ItemID`, so a bare `COUNT(*)` over an `ICMUT` root table is **not** a logical-item count
+and is never used. Every aggregate branch is `SELECT DISTINCT`, branches are combined with
+`UNION` (never `UNION ALL`), and the total is `COUNT(DISTINCT ITEMID)` as an independent
+second guard. `COUNT(*)` appears nowhere in the analytics production path.
+
+For a segmented ItemType the logical set is the **union of every expected root segment
+1..N**. `PhysicalSchema` carries the whole ordered table list and its constructor refuses
+an empty list and refuses `rootTables.size() != currentSegmentId`, so "count only the
+current segment" is not expressible. A **missing middle segment fails that ItemType's
+mapping** and names it (e.g. "segment 2 of 3"); it is never skipped.
+
+This dedup requirement bit twice, and both were invisible from reading one side of a seam:
+
+1. `UNION` deduplicates only **across branches**. For a **single-segment** ItemType there is
+   no `UNION` operator, so a versioned item's several root rows each carried their own
+   window flag and the `SUM` counted that item once per **version**, inflating every window
+   count. That is the most common ItemType shape. Fixed by making every branch
+   `SELECT DISTINCT` plus `COUNT(DISTINCT ItemID)`.
+2. The verifier independently confirmed the semantics with a live control: for a catalogue
+   where `ItemID` A has two versions in segment 1 **and** a row in segment 2, the logical
+   total is **1** where a bare `COUNT(*)` shape yields 4, and removing `DISTINCT`/
+   `COUNT(DISTINCT)` makes the same statement report 4 instead of 3.
+
+### Exact creation-date and window semantics
+
+The creation date comes from the **immutable `ItemID`**, never root-row `CreateTS`: IBM
+records `CreateTS` as when that physical entry was created, and a versioned item has
+several root rows, so it is not proof of original logical creation. The documented encoding
+is position 9 (`A`=20xx, `B`=21xx), positions 10-11 year, position 12 month `A`..`L`,
+positions 13-14 day. The six-character key `SUBSTR(ItemID, 9, 6)` is fixed-width, so it
+**sorts chronologically as text** and a window test is a relational comparison on the
+encoded string rather than a decode inside SQL.
+
+Only the documented 2000-2199 range is supported. Outside it `ItemIdDateKey.encode`
+answers empty - it does **not** invent a century mapping - and the four time metrics become
+`UNAVAILABLE` while the **total stays `AVAILABLE`**, because the total never uses the date
+key. The verifier decoded the whole range independently (73,049 days) and confirmed the
+ordering property and the month/year/leap boundaries.
+
+**One anchor per scan:** the anchor is the **database's** current date read **once** at scan
+start through the selected dialect, and every ItemType in that snapshot uses it, so a long
+scan cannot cross midnight into inconsistent windows. No JVM-local date decides a boundary
+(verified independently: the JVM date is never consulted for a window).
+
+Windows are half-open, `[start, end)`: today `[today, tomorrow)`; last 7 days
+`[today-6d, tomorrow)`; last 30 days `[today-29d, tomorrow)`; current year
+`[Jan 1, Jan 1 next year)`. One shared `tomorrow` boundary serves the first three.
+
+### JDBC pool and resource contract
+
+`BoundedPool<JdbcSession>` is the **only** source of JDBC connections: exactly **one**
+`DriverManager.getConnection` call site exists in the whole tree, inside the JDBC
+`ResourceFactory`. There is no emergency, diagnostic, schema-discovery or retry connection
+outside the pool.
+
+Creation is **lazy**. The pool object exists so the context can own and close it, but
+`initialize()` is **never** called on it, so activation opens no connection at all.
+
+Create/close verdicts follow Goal 02B exactly. The allocation boundary is the successful
+**return** of a `Connection` from `DriverManager.getConnection`. Above it - URL/vendor
+mismatch, absent driver, driver present but unregistered, invalid configuration, missing
+credential, and **any** `SQLException` from `getConnection` - the attempt is explicitly
+`CreationFailure(PROVEN_CLEAN)`, with the `SQLException` preserved as a sanitised cause and
+its raw message never used. Below it, a setup failure closes that exact `Connection` and the
+verdict follows the close: normal -> `PROVEN_CLEAN`, threw -> `UNPROVEN`/quarantine. There
+is **no catch-all**, so an unrecognised failure stays conservative.
+
+`isHealthy` is a local volatile flag read and nothing else - no `isValid()`, no `SELECT 1`,
+no metadata call - because `BoundedPool` invokes it while holding its lock. Measured: a
+probe of 1000 health answers moved the driver-call counter by **exactly 0**, with an
+opposite control showing the same counter moves on a real query. A query `SQLException`
+retires the session before its lease returns; a `Connection.close()` failure propagates so
+the slot is quarantined. Physical peak never exceeds the configured size, measured with a
+breach control.
+
+### Activation behaviour when analytics is unavailable
+
+**JDBC is optional to repository activation.** A working IBM CM repository stays selectable
+and its metadata/retention routes keep working when the feature is off, the driver is
+absent, the driver is present but unregistered, the vendor/URL mismatched, the schema
+unusable, the credential unresolvable or the database unreachable. In every one of those
+cases the capability returns an unavailable service registering **zero** resources and
+opening **zero** connections - verified as **0 driver calls during a successful analytics
+activation**. The statistics API reports an explicit unavailable state and never deactivates
+the repository.
+
+### DB2 and Oracle dialect, and the resolver
+
+The bootstrap three-method dialect was **replaced, not extended**. It exposed
+`oneRowSuffix()`, and the two implementations disagreed about what a suffix is: DB2
+returned `" FETCH FIRST 1 ROW ONLY"` (a trailing clause) while Oracle returned
+`" AND ROWNUM = 1"` (valid only inside a `WHERE`). Every operation is now a **complete
+statement**, so an invalid combination cannot be assembled from correct-looking parts.
+
+| | DB2 | Oracle |
+| --- | --- | --- |
+| current date | `SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1` | `SELECT TRUNC(SYSDATE) FROM DUAL` |
+| zero-row probe | `... WHERE 1 = 0 FETCH FIRST 1 ROW ONLY` | `... WHERE 1 = 0 AND ROWNUM <= 1` |
+
+The aggregate shape is
+`WITH LOGICAL_ITEMS AS (SELECT DISTINCT ITEMID, <four CASE window flags> FROM <segment 1>
+UNION SELECT DISTINCT ... <segment N>) SELECT COUNT(DISTINCT ITEMID) AS TOTAL_ITEMS,
+COALESCE(SUM(W_...), 0) ... FROM LOGICAL_ITEMS`, with **eight bind markers per segment**
+in the order today_lo, today_hi, 7day_lo, today_hi, 30day_lo, today_hi, year_lo, year_hi -
+the shared `today_hi` is bound three times. Markers appear in ascending column order, and
+`AggregateQuery`'s constructor counts the `?` markers and rejects a mismatch, so SQL text
+and bound values cannot drift. Columns 2..5 are `COALESCE(SUM(...), 0)` and are **never
+NULL**, so "no rows matched" cannot be read as "not measurable". `ItemTypeID` is always
+**bound**, never interpolated.
+
+This replacement immediately paid for itself: DB2's date query was first written as
+`VALUES CURRENT DATE`, which is valid DB2 but is **refused by the session's SELECT-only
+read-only guard**, so a DB2 scan could never have read its anchor and every DB2 scan would
+have failed. Caught by an end-to-end test driving a real session over a fake driver. Fixed
+to the documented SELECT form, and the guard was **not** widened - "SELECT or WITH" is the
+structural read-only rule this goal rests on.
+
+### Snapshot publication and the scan coordinator
+
+At most **one** scan per context, won by an atomic CAS before any work and released only
+after every worker has been joined. Concurrency is exactly `statistics.workers` daemon
+threads sharing one atomic index over a `List.copyOf`-ed frozen list - **no ExecutorService
+and no queue at all**, so the peak concurrent query count is structurally the worker count.
+`statistics.workers` greater than `jdbc.pool.size` is **refused** at validation, naming both
+keys, never clamped.
+
+A snapshot is published once, after the whole frozen list was visited, and the snapshot type
+**refuses a result count that differs from the frozen count**, so a half-built snapshot is
+unrepresentable. Catastrophic cancellation, overall-deadline abort, context close and
+coordinator failure publish **nothing**, and the previous completed snapshot stays visible.
+Coverage and `partialFailureCount` travel with every totals object, so a subtotal from 98
+ItemTypes is never presented as a total for 100, and **Versions and Parts stay
+`UNAVAILABLE`** in every per-ItemType result and total.
+
+The JDBC pool is an owned resource registered **before** the coordinator, so the context
+closes the scan first and the pool second, and `CLOSING`/`CLOSED_UNCERTAIN` flow through the
+existing Goal 01C derivation: a late JDBC lease yields `Refusal.PENDING` and a quarantine
+yields `Refusal.UNCERTAIN` permanently. `RepositoryManager` needed **no change** and no CM
+pool semantic was weakened.
+
+### Read-only guarantee
+
+Structural, and enforced twice. A committed guard scans a real, non-empty analytics tree,
+**fails if the tree disappears**, and refuses `executeUpdate`, `executeLargeUpdate`, update
+batches, `commit`, `rollback`, `prepareCall` and SQL beginning with INSERT/UPDATE/DELETE/
+MERGE/TRUNCATE/CREATE/ALTER/DROP/GRANT/REVOKE. Its planted control refuses **15** separate
+forbidden writes plus a text block whose `DELETE` is on the next line. `Connection.setReadOnly(true)`
+is attempted as defence in depth and is explicitly **not** the boundary. No `java.sql` type
+escapes the database package: a type-level sweep over all 187 classes found only 4 mentioning
+`java.sql`, all in `db/` and all non-public.
+
+### Tests actually executed, with results
+
+**Stub path**, on Linux with JDK 17 from a clean tree: `./build.sh` **exit 0**, core
+**"Tests run: 341, failures: 0"**, IBM **"Tests run: 51, failures: 0"**, jar packaged;
+`./tests/selftest.sh` **exit 0**; `./tests/shell/run.sh` **exit 0**, 5 passed / 0 failed;
+`./bin/doctor.sh` **exit 0** (0 failures, 15 warnings); `./build.sh --check-ibm-isolation`
+**exit 0**.
+
+**Real IBM CM 8.7 SDK, reported separately:** `./build.sh --require-ibm` **exit 0** with the
+real jars staged (4 jars, then removed), compiling **17 adapter sources and 12 test sources**
+against `cmbicmsdk81.jar` (8.7.00.400.44) and running the full IBM suite **51/0 on that real-SDK
+class path**. The independent verifier ran with `lib/ibm` empty and therefore reports the
+real-SDK path as unverified **in its own run** - both statements are true and neither is a
+contradiction: the SDK path was exercised by the lead on this revision and by the verifier's
+predecessor pass, but not by the verifier's final run.
+
+**Driver discovery, reported separately from any database claim:** with no driver present,
+`--print-config` exits **0** and reports `NOT ready`; with the real `db2jcc4.jar` staged in
+`lib/db2` it reports `ready (driver com.ibm.db2.jcc.DB2Driver)`. Discovery is class loading
+and `DriverManager` inspection only, the tool prints that it attempted no connection, and a
+loadable driver is **not** live database validation.
+
+**Independent verification: PASS on `1a52f90`**, 104 checks, 0 failures, by a verifier that
+wrote none of the implementation and pinned the revision into a pristine `git archive`
+extract because concurrent builds corrupt the shared `build/` tree here. It reproduced the
+counting semantics with a live `COUNT(*)`-shaped control, all nine multi-segment failure
+modes, 22 hostile identifiers refused, the independently decoded date encoding, the
+read-exactly-once anchor, the pool peak with a breach control, zero-`isHealthy`-driver-calls,
+the five activation failure modes with zero connects, the coordinator bounds and atomicity,
+and diff-level non-regression (`RepositoryManager`/`BoundedPool`/`CreationFailure`/
+`CloseState` byte-identical to `c9751c2`). Two non-blocking observations: `requireSelect` is
+a prefix test rather than a full statement parse, and the analytics guard is textual with no
+generic `execute()` pattern.
+
+### Live DB2/Oracle status - honest
+
+**No live DB2 or Oracle CM database is reachable from this machine, so no live SQL validation
+and no comparison against a trusted source has been performed.** The frozen IBM-documented
+semantics plus deterministic query tests are the whole basis of the counting claims, and the
+absence of live execution is the **single largest verification gap** for the next environment
+that can reach one. A driver JAR being loadable is not live database validation and is not
+presented as it.
+
+### GitHub Actions - both events, same SHA
+
+| Commit | push run | pull_request run |
+| --- | --- | --- |
+| `1a52f90` (implementation) | `36612056614` **failure** | `36612065724` **failure** |
+| `dc24dbb` (CI fix) | `36615110466` **success** | `36615118636` **success** |
+
+The `1a52f90` failures were at CI's **first** step, "Verify script permissions":
+`tests/shell/analytics_guard.sh` and `tests/shell/analytics_source_guard_test.sh` were
+committed `100644`. That mode is invisible on the Windows development host, where git is
+configured `core.filemode=false`. This is the **fourth** occurrence of this class in this
+project, so `dc24dbb` also adds `ScriptPermissionTest`, which reads the **committed mode from
+the git index** rather than the filesystem - `Files.isExecutable` answers from extension
+heuristics on Windows and would pass on the very host that introduces the bug. The check is
+scoped to files something invokes, explicitly exempts the sourced `bin/lib` modules by name,
+and asserts that git actually answered and that its predicate matches at least one real path
+so it cannot degrade into "scanned nothing, therefore passed". That self-check caught a real
+bug in its own first version, which tested the whole index line instead of the path inside it
+and matched nothing. Planted control: removing one bit fails the build naming the file and
+the fix.
+
+### Unresolved risks
+
+1. **No live DB2/Oracle validation and no comparison against a trusted source** - the largest
+   gap, a data gap rather than a code gap. The counting semantics rest on IBM's documentation
+   plus deterministic tests.
+2. **Oracle is not exercised beyond generated SQL and fakes** - there is no Oracle driver in
+   the local runtime and no Oracle database; the DB2 driver got a real local-discovery check
+   and Oracle did not.
+3. **`requireSelect` is a prefix test, not a statement parse.** A statement whose first
+   keyword is `SELECT`/`WITH` is admitted; the guard does not parse the rest. It is a real
+   narrowing rather than a proof, which is why the source guard and the driver-level
+   `setReadOnly(true)` exist alongside it.
+4. **The analytics read-only guard is textual** and has no generic `execute()` pattern, so a
+   write routed through a helper method the guard does not name would not be caught
+   textually. The type-level check that no `java.sql` type escapes `db/` limits where such a
+   call could live.
+5. **No `jshell`-style live smoke of the analytics routes against a real database** - the
+   routes were proven over real sockets against the production wiring, but with no database
+   behind them.
+6. **The full IBM CM 8.7 SDK path was not re-run by the final verifier**, which had `lib/ibm`
+   empty; it was run by the lead on this revision.
+7. **Concurrent builds in one working tree still corrupt `build/`** on this host because
+   `flock` is unavailable in the MSYS shell, producing misleading `NoClassDefFoundError`
+   failures. Serialise builds, or verify in a private copy - `flock` does work under WSL.
+8. **The SDK needs its own logging configuration** (unchanged from Goal 02B).
+9. **`StatisticsAvailability`'s static `available()` factory is unreferenceable** because the
+   record accessor shadows it - reported by the api member, cosmetic.
+
+### Architecture decisions and goal state
+
+No architecture rule was changed. Goal 03 **replaced** one bootstrap interface that could not
+express its own contract (`DatabaseDialect` -> `JdbcDialect` with complete statements),
+**narrowed** one safety default inherited from Goal 02B (the JDBC create-failure verdict),
+**made explicit** the distinction between a loadable driver and a reachable database, and
+**added** one narrowly scoped exemption to the IBM isolation guard for the DB2 driver's class
+name - scoped to the reference, never to a file, with the shell guard and its Java twin now
+asserted to agree after they briefly disagreed.
+
+**Next goal: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 04 or
+Goal 05. Do not merge PR #1.
+
+### Resume / review instruction
+
+"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
+Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
+DATA_MODEL.md, harness/MASTER_GOAL.md and harness/GOAL_03_FAST_ANALYTICS.md completely. Goals 01
+through 01C are accepted; Goal 02 was reviewed with changes required; Goals 02A and 02B are
+accepted; Goal 03 is executed, pushed and green on both Actions events for the same SHA.
+REVIEW Goal 03 before approving anything further - do not re-execute it and do not execute
+Goal 04 or Goal 05. Preserve the accepted optional-SDK/read-only/API architecture, the frozen
+distinct-ItemID counting semantics, the one-anchor-per-scan rule, the hard-bounded lazy JDBC
+pool with no connection outside its factory, and every Goal 01A-01C hard-bound, fail-closed,
+Linux lifecycle and security invariant. Carry forward four facts: no live IBM CM validation and
+no live DB2/Oracle SQL validation has been performed because neither a CM server nor a database
+is reachable from the execution host; this repository is developed on Windows where git does not
+record the executable bit, so validate on Linux with JDK 17 before trusting a CI-touching change;
+for the same reason a second build in one working tree cannot be detected on that host, so verify
+in a private copy; and the real IBM CM 8.7 SDK jars are a local prerequisite that must never be
+committed."
+
 - Next goal after Goal 03: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
 
 ## Goal 02B external architecture review
@@ -75,7 +370,7 @@ This is documentation/evidence precision only, not a Goal 02B code blocker.
 ### Goal state after review
 
 - Goal 02B: **COMPLETED / REVIEWED / ACCEPTED**.
-- Goal 03: **APPROVED / EXECUTE** as rewritten in `harness/GOAL_03_FAST_ANALYTICS.md`.
+- Goal 03: **COMPLETED / PUSHED / GREEN - AWAITING ARCHITECTURE REVIEW** (superseded; see the Goal 03 execution record at the top).
 - Goals 04-05: provisional; do not execute.
 
 ## Goal 02B execution record
@@ -703,27 +998,30 @@ make the unavailable-code semantics explicit and must not imply -1 came from IBM
 
 ## Exact next goal
 
-**NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 03.
+**NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 04 or Goal 05.
 
 Review first:
 
 1. `harness/MASTER_GOAL.md`
-2. `harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md` and the Goal 02B execution record at the top of this file
+2. `harness/GOAL_03_FAST_ANALYTICS.md` and the Goal 03 execution record at the top of this file
 
 ## Resume instruction
 
 "Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
 Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
-harness/MASTER_GOAL.md, harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md and
-harness/GOAL_02_IMPLEMENTATION_SPEC.md completely. Goals 01 through 01C are accepted; Goal 02 was
-reviewed with changes required; Goal 02A is accepted; Goal 02B is executed, pushed and green on both
-Actions events for the same SHA. REVIEW Goal 02B before approving anything further - do not re-execute
-it and do not execute Goal 03. Preserve the accepted optional-SDK/read-only/API architecture and every
-Goal 01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Carry forward three
-facts: no live IBM CM validation has been performed because no CM server is reachable from the
-execution host; this repository is developed on Windows where git does not record the executable bit,
-so validate on Linux with JDK 17 before trusting a CI-touching change; and for the same reason a
-second build in one working tree cannot be detected on that host, so verify in a private copy."
+DATA_MODEL.md, harness/MASTER_GOAL.md and harness/GOAL_03_FAST_ANALYTICS.md completely. Goals 01
+through 01C are accepted; Goal 02 was reviewed with changes required; Goals 02A and 02B are accepted;
+Goal 03 is executed, pushed and green on both Actions events for the same SHA. REVIEW Goal 03 before
+approving anything further - do not re-execute it and do not execute Goal 04 or Goal 05. Preserve the
+accepted optional-SDK/read-only/API architecture, the frozen distinct-ItemID counting semantics, the
+one-anchor-per-scan rule, the hard-bounded lazy JDBC pool with no connection outside its factory, and
+every Goal 01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Carry forward four
+facts: no live IBM CM validation and no live DB2/Oracle SQL validation has been performed because
+neither a CM server nor a database is reachable from the execution host; this repository is developed
+on Windows where git does not record the executable bit, so validate on Linux with JDK 17 before
+trusting a CI-touching change; for the same reason a second build in one working tree cannot be
+detected on that host, so verify in a private copy; and the real IBM CM 8.7 SDK jars are a local
+prerequisite that must never be committed."
 
 ## Mandatory checkpoint rule
 
