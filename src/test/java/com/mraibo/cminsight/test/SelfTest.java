@@ -1,12 +1,21 @@
 package com.mraibo.cminsight.test;
 
+import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * The dependency-free test suite entry point used by {@code build.sh} and {@code tests/selftest.sh}.
@@ -58,8 +67,12 @@ public final class SelfTest {
             RepositorySwitchQuiescenceTest.class,
             StatisticsContractTest.class,
             RouterTest.class,
+            RouterActionGuardTest.class,
             WebServerSocketTest.class,
-            CmApiRoutesInstallTest.class);
+            CmApiRoutesInstallTest.class,
+            ProviderDiscoveryTest.class,
+            CoreIbmIsolationTest.class,
+            IbmSourceReadOnlyGuardTest.class);
 
     private SelfTest() {
     }
@@ -68,6 +81,20 @@ public final class SelfTest {
         long startedNanos = System.nanoTime();
         int run = 0;
         int failures = 0;
+
+        // Before anything runs: refuse to report a pass while a suite in this package is not in the list.
+        // A test class that exists but is never registered does not run, does not fail, and does not
+        // change any count - the suite simply reports success without it. That happened for real in this
+        // project: four committed suites, including an isolation guard and a POST action-guard suite,
+        // sat unregistered and had never executed a single assertion, while the build reported green.
+        // Evidence that does not run is not evidence, so the omission is now an error rather than a
+        // silent absence.
+        List<String> unregistered = unregisteredSuites();
+        for (String name : unregistered) {
+            System.out.println("FAIL  " + name + ".<registration>: the class exists in this package but is not"
+                    + " in SelfTest.TEST_CLASSES, so it would never run");
+            failures++;
+        }
 
         for (Class<?> testClass : TEST_CLASSES) {
             List<Method> tests = discover(testClass);
@@ -103,9 +130,91 @@ public final class SelfTest {
         System.exit(run > 0 && failures == 0 ? 0 : 1);
     }
 
+    /**
+     * Test classes present in this package that {@link #TEST_CLASSES} does not list, and that look like
+     * suites rather than helpers.
+     *
+     * <p>A class is reported only when it would have been RUN had it been registered: it must be
+     * {@code public} with a public no-argument constructor and declare at least one public no-argument
+     * {@code void} method, which is exactly the shape {@link #discover(Class)} looks for. That keeps every
+     * legitimate helper out of the result - {@code Assert}, {@code TestSupport}, {@code FakeResource},
+     * {@code FakeTransport} and the rest are package-private or fixture types with no test methods, so
+     * they are not suites and never appear here. Requiring the full shape rather than "is public" matters:
+     * a rule that flagged helpers would be satisfied by adding noise to an allow-list, and the list would
+     * stop meaning anything.
+     *
+     * <p>The package is enumerated through the CLASS LOADER rather than a directory walk, so the check
+     * still works when the suite is run from a jar or with a class path that has no source tree beside it.
+     * If the package cannot be enumerated at all the check reports nothing - it is a guard against a
+     * forgotten registration, not a replacement for running the tests, and a guard that cannot see the
+     * package must not invent a failure.
+     */
+    private static List<String> unregisteredSuites() {
+        String packageName = SelfTest.class.getPackageName();
+        String packagePath = packageName.replace('.', '/');
+        List<String> unregistered = new ArrayList<>();
+        try {
+            ClassLoader loader = SelfTest.class.getClassLoader();
+            Enumeration<URL> roots = loader.getResources(packagePath);
+            Set<String> examined = new TreeSet<>();
+            while (roots.hasMoreElements()) {
+                URL root = roots.nextElement();
+                if (!"file".equals(root.getProtocol())) {
+                    // A jar has no listable entries through this URL; skip rather than guess.
+                    continue;
+                }
+                Path directory = Path.of(root.toURI());
+                if (!Files.isDirectory(directory)) {
+                    continue;
+                }
+                try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory, "*.class")) {
+                    for (Path entry : entries) {
+                        String fileName = entry.getFileName().toString();
+                        if (fileName.contains("$")) {
+                            continue; // a nested or anonymous class belongs to its outer class
+                        }
+                        String simpleName = fileName.substring(0, fileName.length() - ".class".length());
+                        if (!examined.add(simpleName)) {
+                            continue;
+                        }
+                        if (isUnregisteredSuite(packageName + "." + simpleName)) {
+                            unregistered.add(packageName + "." + simpleName);
+                        }
+                    }
+                }
+            }
+        } catch (IOException | URISyntaxException | RuntimeException | LinkageError ignored) {
+            return List.of();
+        }
+        return List.copyOf(unregistered);
+    }
+
+    /** True when this class name is a runnable suite that {@link #TEST_CLASSES} does not list. */
+    private static boolean isUnregisteredSuite(String className) {
+        for (Class<?> registered : TEST_CLASSES) {
+            if (registered.getName().equals(className)) {
+                return false;
+            }
+        }
+        try {
+            Class<?> candidate = Class.forName(className, false, SelfTest.class.getClassLoader());
+            if (!Modifier.isPublic(candidate.getModifiers()) || candidate.isInterface()
+                    || Modifier.isAbstract(candidate.getModifiers())) {
+                return false;
+            }
+            if (candidate.getDeclaredConstructor().getModifiers() != Modifier.PUBLIC) {
+                return false;
+            }
+            return !discover(candidate).isEmpty();
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError notASuite) {
+            // Not loadable as a suite: either a helper this check cannot instantiate or something that is
+            // not a test at all. Reporting it would be a false alarm, so it is left alone.
+            return false;
+        }
+    }
+
     /** Public no-argument {@code void} methods declared by the test class, in stable name order. */
-    private static List<Method> discover(Class<?> testClass) {
-        List<Method> tests = new ArrayList<>();
+    private static List<Method> discover(Class<?> testClass) {        List<Method> tests = new ArrayList<>();
         for (Method method : testClass.getMethods()) {
             if (method.getDeclaringClass() == Object.class) {
                 continue;
