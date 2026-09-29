@@ -35,6 +35,17 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link SelfTest} as a suite, it is used by {@link UncertainCreationTest} alone, and its only output is
  * the physical leak it demonstrates. The corrected {@code BoundedPool} remains the only pool the product
  * has.
+ *
+ * <h2>Goal 02B's mandatory {@code isHealthy} has no counterpart here</h2>
+ *
+ * <p>This mutant <em>consumes</em> a {@link ResourceFactory} and never implements one, so section B's
+ * compile-breaking change - every factory must state a health policy, with no permissive default - asks
+ * nothing of this class: there is no inherited health method to replace, and none of its resource paths
+ * reads one. Adding an unused probe would be dead code in a class whose whole value is a faithful
+ * re-statement of the ONE mutated rule (a reserved creation slot is released whenever {@code create()}
+ * throws); the mutation control's factory always throws after allocating, so no resource ever reaches this
+ * pool's idle set where a probe could matter. The choice is written down here so that the absence is
+ * visibly deliberate rather than an omission section B was meant to catch.
  */
 final class LegacyReleasePool<T extends AutoCloseable> {
 

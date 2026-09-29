@@ -101,6 +101,13 @@ final class FakePoolFactory implements ResourceFactory<FakeResource> {
         return resource;
     }
 
+    /**
+     * Goal 02B: the health policy this factory states is a real LOCAL state read - {@link
+     * FakeResource#isHealthy()} is one volatile field, with no I/O, no vendor call and no lock other than
+     * the deterministic gate the tests install. It deliberately delegates rather than returning a constant,
+     * because the fake resource HAS a health state ("a returned lease retires it"), which is exactly the
+     * case the corner method must read.
+     */
     @Override
     public boolean isHealthy(FakeResource resource) {
         awaitHealthGate();

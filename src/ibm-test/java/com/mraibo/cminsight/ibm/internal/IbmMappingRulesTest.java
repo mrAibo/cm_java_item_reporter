@@ -154,24 +154,33 @@ public final class IbmMappingRulesTest {
     }
 
     /**
-     * Goal 02A section F: an unmapped numeric enum code is ABSENT, never a number, and the readable field
-     * still carries IBM's certain constant identity.
+     * Goal 02A section F, corrected by Goal 02B section E: an unmapped numeric enum code is ABSENT, never a
+     * number, and the readable field still carries IBM's certain constant identity.
      *
      * <h2>The defect this pins</h2>
      *
      * <p>The DTO used to carry {@code -1} at these two positions under documentation that called the field
      * the exact numeric code the server returned. {@code -1} is a number, and a number is exactly what an
-     * operator (or a later adapter author) would read as a server value. The contract is now structural:
-     * the fields are nullable, {@code null} is the only representation of "no numeric CM code has been
-     * established", and the canonical constructor normalises a negative input to {@code null} so even a
-     * caller that still passes the old sentinel cannot put a number in the field.
+     * operator (or a later adapter author) would read as a server value. The contract is now: the fields are
+     * nullable and {@code null} - passed explicitly by a caller with no established mapping - is the ONLY
+     * representation of "no numeric CM code has been established".
      *
-     * <h2>What is deliberately NOT asserted</h2>
+     * <h2>What Goal 02B section E removed, and why this test changed with it</h2>
      *
-     * <p>A test that only checked {@code null} in, {@code null} out would pass for an adapter that silently
-     * dropped every code, and one that only checked {@code -1} in, {@code null} out would pass for an
-     * implementation that nulled every value. So both directions are asserted against each other: a
-     * negative input is normalised away AND a real non-negative code survives unchanged.
+     * <p>Goal 02A additionally made the canonical constructor normalise EVERY negative value to {@code null},
+     * on the premise that a CM enum code can never be negative. That premise was never established by SDK
+     * evidence - the SDK's enumeration classes carry no numeric code field at all, so no CM code range is
+     * known - which makes the sign restriction the same class of guess as inventing a number. The
+     * normalisation is therefore deleted, and this test no longer asserts {@code -1 -> null}: it asserts the
+     * corrected semantics instead. Neither direction may be dropped. A test that only checked
+     * {@code null in, null out} would pass for an adapter that silently dropped every code, and a test that
+     * only checked a positive code would pass for an implementation that still discarded negatives. So three
+     * things are asserted against each other: absence stays absent, a real non-negative code survives, and an
+     * explicitly supplied NEGATIVE code is preserved as data.
+     *
+     * <p>What must NOT return is the {@code -1} <em>sentinel</em> at a construction site: the adapter's own
+     * mapping still passes {@code null} where it has no mapping (see {@code CmRetentionService}), which the
+     * absent case above and the API JSON test pin.
      */
     public void anUnmappedNumericCodeIsAbsentAndNeverANumber() {
         RetentionPolicyInfo unmapped = policy(7);
@@ -197,20 +206,33 @@ public final class IbmMappingRulesTest {
         assertEquals(Integer.valueOf(11), mapped.expirationActionCode(),
                 "F: and so is a real expiration-action code");
 
-        // The structural floor: a caller that still passes the retired -1 sentinel cannot reintroduce a
-        // number. Asserted through the CANONICAL CONSTRUCTOR, not through the adapter, because the
-        // normalisation is the property that no future adapter can bypass.
-        RetentionPolicyInfo legacySentinel = policy(7, -1, -1, "UNKNOWN(FIXED_TIME)", "UNKNOWN(AUTO_DELETE)");
-        assertTrue(legacySentinel.retentionTypeCode() == null,
-                "F: the retired -1 sentinel is normalised to absent by the DTO itself, so a missed call site"
-                        + " cannot present -1 as a server code. Was: " + legacySentinel.retentionTypeCode());
-        assertTrue(legacySentinel.expirationActionCode() == null,
-                "F: and the expiration-action sentinel likewise. Was: " + legacySentinel.expirationActionCode());
+        // The corrected section E contract, replacing the retired 'negative means absent' normalisation. An
+        // explicitly supplied code is DATA, whatever its sign, because this build has no evidence for any
+        // sign restriction. Two DIFFERENT negatives are used so that a surviving rule which happened to null
+        // only -1 (the old sentinel) cannot pass here.
+        RetentionPolicyInfo explicitlyNegative =
+                policy(7, -1, -7, "UNKNOWN(FIXED_TIME)", "UNKNOWN(AUTO_DELETE)");
+        assertEquals(Integer.valueOf(-1), explicitlyNegative.retentionTypeCode(),
+                "E: an explicitly supplied negative code is preserved as data, not normalised away - 'do not"
+                        + " guess' cuts both ways, and no SDK evidence establishes that a CM code is"
+                        + " non-negative. Was: " + explicitlyNegative.retentionTypeCode());
+        assertEquals(Integer.valueOf(-7), explicitlyNegative.expirationActionCode(),
+                "E: and so is a second, different negative code, so the old -1-specific sentinel rule cannot"
+                        + " masquerade as the corrected behaviour. Was: "
+                        + explicitlyNegative.expirationActionCode());
 
-        // A copy must not be able to reintroduce a number either.
+        // A copy must not be able to change a code in either direction.
+        RetentionPolicyInfo copiedNegative = explicitlyNegative.withAssignedItemTypes(List.of("ItemTypeA"));
+        assertEquals(Integer.valueOf(-1), copiedNegative.retentionTypeCode(),
+                "E: withAssignedItemTypes() copies every other component, so a supplied negative code survives"
+                        + " the copy verbatim");
+        assertEquals(Integer.valueOf(-7), copiedNegative.expirationActionCode(),
+                "E: and both code fields are asserted, so 'null everything' cannot pass this test");
         RetentionPolicyInfo copied = unmapped.withAssignedItemTypes(List.of("ItemTypeA"));
         assertTrue(copied.retentionTypeCode() == null && copied.expirationActionCode() == null,
-                "F: withAssignedItemTypes() copies every other component, so the absent codes stay absent");
+                "E: while an ABSENT code stays absent through the copy - null is the only representation of"
+                        + " 'no numeric CM code established', and it is not a number a reader could mistake for"
+                        + " a server value");
     }
 
     /** The documented retention DTO, with every unmappable numeric field carrying an absent value. */

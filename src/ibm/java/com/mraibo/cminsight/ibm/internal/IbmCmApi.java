@@ -58,6 +58,11 @@ import com.ibm.mm.sdk.server.DKDatastoreICM;
  *       idle-and-healthy;</li>
  *   <li>an {@link Error} from a vendor call is marked FIRST and then rethrown unchanged, so the pool can
  *       never observe a healthy session on the way out;</li>
+ *   <li>an already-translated {@link IbmCmFailure} is re-checked at this boundary: when the failure's own
+ *       classification says {@link IbmCmFailure#backendUnusable()}, the session is marked unusable again
+ *       before the rethrow. A lower wrapper normally did that already, and the second marking is an
+ *       idempotent local flag write, so the cost is nil in the common case - but the invariant now holds
+ *       for a failure built anywhere, including one whose call site forgot;</li>
  *   <li>{@code DKNotExistException} is the one explicit benign control: {@link #readOrAbsent} answers
  *       "absent" (and {@link #read} classifies it {@code cm-not-found}) without retiring anything.</li>
  * </ul>
@@ -106,6 +111,12 @@ final class IbmCmApi {
      * The one vendor-call guard: runs the call, and makes sure a failure can never reach a caller without
      * the session having been retired when it must be.
      *
+     * <p>This includes the failure that arrives already translated: rethrowing an {@link IbmCmFailure}
+     * unchanged is only correct when its {@link IbmCmFailure#backendUnusable()} answer has already been
+     * applied to the session, and this method is where that is enforced rather than assumed. The check is
+     * conditional, idempotent and uses the failure's own sanitised text, so it neither poisons a reusable
+     * session nor leaks vendor text.
+     *
      * @param absentIsAnAnswer true for {@link #readOrAbsent}, where {@code DKNotExistException} is the
      *                         benign control that returns {@code null} and retires nothing
      */
@@ -114,9 +125,32 @@ final class IbmCmApi {
         try {
             return call.run();
         } catch (IbmCmFailure alreadyTranslated) {
-            // A nested wrapper (a service mapping an ItemType through read(), for example) already
-            // classified this failure and already marked the session. Re-translating would bury the real
-            // sanitised detail under a second category and would mark twice for no reason.
+            // A nested wrapper (a service mapping an ItemType through read(), for example) normally
+            // classified this failure AND marked the session. The invariant, however, is this wrapper's:
+            // "every backend-unusable failure leaving a vendor call has already marked the session
+            // unusable" must not depend on which call site built the failure. So the classification the
+            // failure already carries is reasserted here.
+            //
+            // Why this is not redundant. Relying on the lower wrapper made correctness a property of
+            // call-site memory: any future path that constructs an IbmCmFailure(backendUnusable=true)
+            // without marking - a service, a helper, a new adapter - would let a poisoned session go back
+            // into the pool, which is precisely the Goal 02A defect shape. Re-checking at the boundary
+            // makes the retirement structural.
+            //
+            // Why it is safe. markUnusable() is documented idempotent: a second call on an already
+            // unusable session is a local volatile write that changes no state, and the diagnostic sink
+            // keeps only the last sanitised text, so a nested failure cannot accumulate duplicates. The
+            // text used here is the failure's OWN already-sanitised message - produced by
+            // IbmErrorSanitizer when the failure was constructed - so nothing raw from the vendor is read,
+            // re-described or recorded at this point.
+            //
+            // Why it is conditional. A benign failure must stay benign: DKNotExistException is answered by
+            // readOrAbsent (below) and never reaches here, and a failure whose own classification says the
+            // backend is usable must leave the session reusable, or every not-found answer would retire a
+            // healthy session. Only backendUnusable() == true poisons anything.
+            if (alreadyTranslated.backendUnusable()) {
+                session.markUnusable(alreadyTranslated.getMessage());
+            }
             throw alreadyTranslated;
         } catch (InterruptedException interrupted) {
             // Restore the flag and report the interruption rather than disguising it: swallowing an

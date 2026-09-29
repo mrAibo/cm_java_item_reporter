@@ -49,6 +49,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * other failure has already attempted cleanup and observed it succeed, so it reports
  * {@link CreationFailure.Cleanup#PROVEN_CLEAN} and the slot is released.
  *
+ * <p>That reading applies AT AND BELOW the allocation boundary - the
+ * {@link IbmCmConnectionFactory#connect} call, see {@link #createFor(RepositoryProfile)}. ABOVE it this
+ * class reports {@code PROVEN_CLEAN} too, for a stronger reason: nothing physical exists yet, so the attempt
+ * is provably empty. Both of those pre-boundary paths are reachable - a blank SSID, and a CM credential that
+ * cannot be resolved - and neither may cost the pool a capacity slot. The claim is made per path and never by
+ * a catch-all: a failure type this class does not recognise crosses {@code create()} untyped and keeps the
+ * pool's conservative quarantine default.
+ *
  * <h2>Health</h2>
  *
  * <p>{@link #isHealthy(CmSession)} asks {@link IbmCmSession#isHealthy()}, which is one volatile read. It
@@ -112,15 +120,13 @@ public final class IbmCmSessionFactory implements CmSessionFactory, AdapterError
      *
      * <p>The profile argument is accepted because the interface declares it, and it is verified to be the
      * same repository rather than silently ignored, so a caller cannot connect this factory to a different
-     * SSID and believe it worked.
+     * SSID and believe it worked. That verification happens inside the attempt skeleton below, so a rejected
+     * request reports a cleanup verdict like every other pre-allocation failure instead of an untyped
+     * failure that would quarantine the pool's reserved slot.
      */
     @Override
     public CmSession open(RepositoryProfile requested) throws Exception {
-        if (requested != null && !profile.id().equals(requested.id())) {
-            throw new IbmCmFailure("cm", "this session factory is bound to repository '" + profile.id()
-                    + "' but was asked to open '" + requested.id() + "'", null, false);
-        }
-        return create();
+        return createFor(requested);
     }
 
     /**
@@ -131,29 +137,157 @@ public final class IbmCmSessionFactory implements CmSessionFactory, AdapterError
      * slot may come back.
      */
     public CmSession create() throws Exception {
-        validateProfile();
-        IbmCmCredentials credentials = resolveCredentials();
+        return createFor(null);
+    }
+
+    /**
+     * One creation attempt, from the reservation the pool made to the verdict it needs.
+     *
+     * <h2>Every failure path states its verdict, and the allocation boundary decides it</h2>
+     *
+     * <p>Since Goal 02A {@code BoundedPool} releases a reserved capacity slot <strong>only</strong> for an
+     * explicit {@link CreationFailure.Cleanup#PROVEN_CLEAN}; every untyped failure - a plain exception, a
+     * runtime exception, an {@link Error} - quarantines it instead. That default is right for a failure
+     * whose physical outcome is unknown, but it is wrong for the failures this class can prove allocated
+     * nothing, so those paths must say so explicitly:
+     *
+     * <ul>
+     *   <li>a request for a different repository, and a blank SSID - both refused BEFORE anything physical
+     *       exists;</li>
+     *   <li>a CM credential that cannot be resolved - also BEFORE anything physical exists, and reachable
+     *       in NORMAL OPERATION: the adapter deliberately re-resolves credentials for every replacement
+     *       session, so a secret removed after activation fails that replacement. Reported as an untyped
+     *       failure, this would quarantine an EMPTY slot and permanently cost the pool one CM session,
+     *       which is the Goal 02B regression this structure exists to close;</li>
+     *   <li>a connect failure whose cleanup the connection layer proved.</li>
+     * </ul>
+     *
+     * <p>The boundary is the {@link IbmCmConnectionFactory#connect} call, and it is the only thing that
+     * decides the verdict - never the failure's type alone. Above the boundary nothing physical can exist
+     * for this attempt, so it is provably clean. At and below it the physical outcome is unknown unless the
+     * connection layer produces its own evidence: {@link IbmCmFailure} means cleanup was attempted and
+     * {@code destroy()} returned normally, {@link IbmCmCleanupFailure} means it did not. A failure this
+     * method does not recognise is deliberately left untyped, so the pool's conservative default quarantines
+     * the slot: relabelling an unknown connection-layer outcome as clean would authorise a replacement
+     * beside a session that may still be alive, which is the one mistake Goal 02A exists to prevent.
+     *
+     * <h2>The fatal-{@code Error}-before-allocation decision, on the record</h2>
+     *
+     * <p>An {@link Error} raised above the boundary - a JVM-level failure while validating the request or
+     * resolving credentials - deliberately stays UNTYPED and therefore quarantines the reserved slot, even
+     * though this class knows nothing was allocated. Two reasons, the first binding:
+     *
+     * <ol>
+     *   <li>an {@code Error} must propagate unchanged. Reporting a clean verdict would require wrapping it in
+     *       the checked {@link CreationFailure}, which swallows {@code OutOfMemoryError},
+     *       {@code StackOverflowError} and their kin - and an {@code Error} means the JVM state is not
+     *       trustworthy enough for any part of it to accept this class's "nothing was allocated" claim;</li>
+     *   <li>it costs nothing an operator can cause: no ordinary validation or configuration failure is an
+     *       {@code Error}. Both pre-boundary paths raise {@link IbmCmFailure}, a {@code RuntimeException},
+     *       and those ARE reported clean. Ordinary failures are not allowed to burn capacity; this one may,
+     *       and keeping it conservative is what leaves the Error contract intact.</li>
+     * </ol>
+     *
+     * @param requested the repository the caller asked for; {@code null} from {@link #create()}
+     */
+    private CmSession createFor(RepositoryProfile requested) throws Exception {
+        // The attempt diagnostic must describe THIS attempt, so it is written exactly once - in the finally
+        // below - from the outcome. It starts conservative because an attempt that ends in an untyped
+        // failure or an Error, whose physical outcome this class cannot see, has not proved it left nothing
+        // behind; both reported verdicts and a successful return overwrite it with what actually happened.
+        // A previous UNPROVEN attempt can therefore never leave it stale after a later known-clean
+        // pre-allocation failure, which is the diagnostic defect Goal 02B calls out.
+        boolean leftResources = true;
+        try {
+            CmSession session = attempt(requested);
+            // Success is proof too: the physical session leaves this method inside the caller's lease, so
+            // this attempt left nothing unaccounted for.
+            leftResources = false;
+            return session;
+        } catch (CreationFailure reported) {
+            leftResources = reported.cleanup() == CreationFailure.Cleanup.UNPROVEN;
+            throw reported;
+        } finally {
+            lastAttemptLeftResources.set(leftResources);
+        }
+    }
+
+    /**
+     * Runs one attempt and reports the cleanup verdict of a failure as a {@link CreationFailure}.
+     *
+     * <p>Split out so there is exactly one site that writes the attempt diagnostic, and so the allocation
+     * boundary is visible in one method: everything above the {@code connections.connect(...)} call below is
+     * provably before any physical resource for this attempt exists, and everything at or below it is not.
+     */
+    private CmSession attempt(RepositoryProfile requested) throws Exception {
+        // ------------------------------------------------------------ BEFORE the allocation boundary
+        if (requested != null && !profile.id().equals(requested.id())) {
+            // Request validation, never a physical operation: the factory refuses to connect a different
+            // repository's SSID, and the pool's reserved slot must come back.
+            throw clean(new IbmCmFailure("cm", "this session factory is bound to repository '" + profile.id()
+                    + "' but was asked to open '" + requested.id() + "'", null, false));
+        }
+        try {
+            validateProfile();
+        } catch (IbmCmFailure refusal) {
+            throw clean(refusal);
+        }
+        final IbmCmCredentials credentials;
+        try {
+            credentials = resolveCredentials();
+        } catch (IbmCmFailure refusal) {
+            // The credential source disappeared or was never usable. Nothing was allocated, so this is a
+            // known-clean failure and NOT allowed to consume a capacity slot.
+            throw clean(refusal);
+        }
+
+        // ------------------------------------------------------------ AT AND BEYOND the boundary
         try {
             // The credential values live only in this call's argument list. Nothing here stores, logs or
             // formats them, and no failure message below can contain them.
             IcmDatastore handle = connections.connect(profile.ssid(), credentials.user(), credentials.password());
             IbmCmSession session = IbmCmSession.live(profile.id(), handle, this);
             stamps.put(session, new IbmCmPoolDiagnostics.SessionStamp(System.nanoTime()));
-            lastAttemptLeftResources.set(false);
             return session;
         } catch (IbmCmCleanupFailure cleanupUnproven) {
-            lastAttemptLeftResources.set(true);
-            recordAdapterError(cleanupUnproven.getMessage());
-            throw new CreationFailure(CreationFailure.Cleanup.UNPROVEN,
-                    "could not open a CM session for repository '" + profile.id() + "': "
-                            + cleanupUnproven.getMessage(), cleanupUnproven);
+            // A teardown step did not return normally, so a physical session may still exist: this attempt
+            // must NOT claim a clean cleanup, and the pool quarantines the slot.
+            throw reported(CreationFailure.Cleanup.UNPROVEN, cleanupUnproven);
         } catch (IbmCmFailure failure) {
-            lastAttemptLeftResources.set(false);
-            recordAdapterError(failure.getMessage());
-            throw new CreationFailure(CreationFailure.Cleanup.PROVEN_CLEAN,
-                    "could not open a CM session for repository '" + profile.id() + "': "
-                            + failure.getMessage(), failure);
+            // The connection layer attempted cleanup and observed destroy() return normally, so the slot may
+            // be released. Note what this is NOT: it is not a catch-all. A failure of any other type crosses
+            // this method untyped and stays conservative in the pool.
+            throw reported(CreationFailure.Cleanup.PROVEN_CLEAN, failure);
         }
+    }
+
+    /**
+     * A failure that provably happened before the allocation boundary: nothing was allocated, so the pool's
+     * reserved slot must come back.
+     */
+    private CreationFailure clean(IbmCmFailure refusal) {
+        return reported(CreationFailure.Cleanup.PROVEN_CLEAN, refusal);
+    }
+
+    /**
+     * The one place a failure becomes the pool's verdict.
+     *
+     * <p>Records the sanitised cause as the adapter diagnostic and builds the {@link CreationFailure} the pool
+     * accounts for. The cause is always the original sanitised failure - never a wrapper, never raw vendor
+     * text - and the message is that same sanitised text prefixed with the repository id, so an operator can
+     * see which attempt failed and why without any credential being reproduced.
+     */
+    private CreationFailure reported(CreationFailure.Cleanup cleanup, Throwable cause) {
+        String detail = messageOf(cause);
+        recordAdapterError(detail);
+        return new CreationFailure(cleanup,
+                "could not open a CM session for repository '" + profile.id() + "': " + detail, cause);
+    }
+
+    /** The sanitised description of a failure: its message, or its type name when it carries none. */
+    private static String messageOf(Throwable failure) {
+        String message = failure.getMessage();
+        return message == null || message.isBlank() ? failure.getClass().getSimpleName() : message;
     }
 
     /**
@@ -270,6 +404,10 @@ public final class IbmCmSessionFactory implements CmSessionFactory, AdapterError
      * of use rather than an assumption about a caller. A blank SSID must never reach {@code connect()}: the
      * SDK's behaviour for it is unspecified, and "unspecified" is not a state a fail-closed lifecycle can
      * handle.
+     *
+     * <p>Runs before the allocation boundary, so its {@link IbmCmFailure} is reported as
+     * {@link CreationFailure.Cleanup#PROVEN_CLEAN}: nothing was allocated, and the pool's reserved slot must
+     * come back rather than be quarantined for a configuration mistake.
      */
     private void validateProfile() {
         String ssid = profile.ssid();
@@ -287,6 +425,11 @@ public final class IbmCmSessionFactory implements CmSessionFactory, AdapterError
      * translated into an {@link IbmCmFailure} whose message is the configuration text - which names a config
      * key and a source, never a value - so the failure travels through the same sanitised path as any SDK
      * error.
+     *
+     * <p>Runs before the allocation boundary, so every failure here is reported as
+     * {@link CreationFailure.Cleanup#PROVEN_CLEAN}. That matters in normal operation, not only in theory: a
+     * credential removed after a successful activation fails the NEXT replacement session, and this class
+     * must not let that cost the pool a capacity slot for a physical resource it never created.
      */
     private IbmCmCredentials resolveCredentials() {
         try {

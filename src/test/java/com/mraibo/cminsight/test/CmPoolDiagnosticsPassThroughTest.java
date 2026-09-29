@@ -437,6 +437,11 @@ public final class CmPoolDiagnosticsPassThroughTest {
 
         @Override
         public boolean isHealthy() {
+            // Goal 02B: this fixture has no physical state left to probe - close() releases nothing and no
+            // vendor call exists - so a stated constant is the honest local answer rather than an inherited
+            // "non-null means healthy". The suite's subject is the pool's accounting and its diagnostics
+            // pass-through; real session liveness is pinned by the IBM adapter suites, where the flag is a
+            // real state read.
             return true;
         }
 

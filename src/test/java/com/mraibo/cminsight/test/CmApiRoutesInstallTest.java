@@ -230,6 +230,41 @@ public class CmApiRoutesInstallTest {
                 "F: and so is a real expiration-action code: " + mapped);
     }
 
+    /**
+     * Goal 02B section E at the API boundary: an explicitly supplied NEGATIVE numeric code is DATA, and the
+     * serializer reports it as the number it was given.
+     *
+     * <h2>Why the API needs this assertion beside the absent-code one</h2>
+     *
+     * <p>Goal 02A's DTO normalised every negative code to {@code null}. Removing that normalisation is only
+     * observable end to end if the shipped payload actually carries a supplied negative number, and the
+     * dangerous failure in the other direction is a serializer or a JSON writer that quietly drops a value it
+     * does not like - which would look exactly like an absence. So the two cases are asserted apart: the test
+     * above pins {@code null} for an absence (and forbids the retired {@code -1} sentinel), and this one pins
+     * that a supplied negative code is neither nulled nor rewritten.
+     *
+     * <p>The values are deliberately not {@code -1}: a payload-level rule that happened to preserve only the
+     * old sentinel while nulling every other negative would pass a test written with {@code -1} alone.
+     */
+    public void theApiJsonPreservesAnExplicitlySuppliedNegativeRetentionCode() throws Exception {
+        String json = policyJson(retentionPolicy(7, -2, -13));
+
+        Assert.assertTrue(json.contains("\"retentionTypeCode\":-2"),
+                "E: a supplied negative retention-type code must be rendered as that number - 'do not guess'"
+                        + " means neither inventing a code nor discarding one, and discarding it here would be"
+                        + " indistinguishable from an absence: " + json);
+        Assert.assertTrue(json.contains("\"expirationActionCode\":-13"),
+                "E: and likewise for the expiration-action code, with a second value so a -1-only rule cannot"
+                        + " pass: " + json);
+        Assert.assertFalse(json.contains("\"retentionTypeCode\":null"),
+                "E: a supplied code must not be turned into an absence by the serializer: " + json);
+        Assert.assertFalse(json.contains("\"expirationActionCode\":null"),
+                "E: in either field: " + json);
+        Assert.assertTrue(json.contains("\"retentionType\":\"UNKNOWN(FIXED_TIME)\""),
+                "E: while the readable field keeps IBM's certain constant identity, exactly as it does for an"
+                        + " absent code: " + json);
+    }
+
     /** A documented retention policy for the JSON assertions; every other numeric is non-negative. */
     private static RetentionPolicyInfo retentionPolicy(int policyId, Integer retentionTypeCode,
                                                      Integer expirationActionCode) {

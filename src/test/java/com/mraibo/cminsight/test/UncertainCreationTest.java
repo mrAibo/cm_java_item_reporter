@@ -504,6 +504,15 @@ public final class UncertainCreationTest {
             public FakeResource create() throws Exception {
                 throw new InterruptedException("interrupted while connecting");
             }
+
+            @Override
+            public boolean isHealthy(FakeResource resource) {
+                // Goal 02B: stated CONSTANT on purpose, not an inherited "non-null means healthy". This
+                // fixture's create() ALWAYS throws, so it never returns a resource and this probe can never be
+                // reached; there is no resource state to read. The finer health state of the shared fake
+                // resource is asserted by the factories above, which delegate to it.
+                return true;
+            }
         };
         BoundedPool<FakeResource> pool = new BoundedPool<>("cm", 1, IMPATIENT, interrupted);
         InterruptedException propagated = Assert.assertThrows(InterruptedException.class, pool::borrow,

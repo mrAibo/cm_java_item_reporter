@@ -101,6 +101,102 @@ public final class IbmSessionPoisoningTest {
     }
 
     /**
+     * Goal 02B section C: the ALREADY-TRANSLATED rethrow path reasserts the backend-unusable invariant.
+     *
+     * <h2>Why this test does not hand the work to a lower wrapper</h2>
+     *
+     * <p>{@code IbmCmApi.vendorCall} catches an {@link IbmCmFailure} that a nested call already translated
+     * and rethrows it. Every production construction site marks the session before such a failure can
+     * travel, so a test whose {@code ReadCall} classified AND marked would pass with or without any
+     * reassertion - it would assert the fake, not the wrapper. This test therefore throws a PRECONSTRUCTED
+     * failure from a {@code ReadCall} that does NOT mark: it stands in for a future path that built the
+     * failure and forgot, which is precisely the shape the invariant must not depend on.
+     *
+     * <p>The assertion is on the SESSION at the instant the failure is observable outside
+     * {@code IbmCmApi.read} - not on the failure's type and not on some later lease return, because the only
+     * moment at which the marking can still save the pool is while the session is in the caller's hands.
+     * Against the pre-02B wrapper (which rethrew unchanged) this test fails.
+     */
+    public void anAlreadyTranslatedBackendUnusableFailureMarksTheSessionBeforeItLeaves() {
+        IbmFakes.FakeReadDatastore datastore = new IbmFakes.FakeReadDatastore();
+        RecordingSink sink = new RecordingSink();
+        IbmCmSession session = IbmCmSession.live("reassert", datastore, sink);
+        IbmCmFailure preconstructed = new IbmCmFailure("cm-system", "cm-system(dkSystemError)",
+                new IllegalStateException("RAW VENDOR TEXT must never be recorded: repository=secret"),
+                true);
+
+        IbmCmFailure surfaced = assertThrows(IbmCmFailure.class,
+                () -> IbmCmApi.read(session, "reassertedRead", () -> {
+                    // Deliberately NOT session.markUnusable(...): the wrapper owns the invariant.
+                    throw preconstructed;
+                }),
+                "C: a preconstructed backend-unusable failure still leaves the wrapper as an IbmCmFailure");
+
+        assertTrue(surfaced == preconstructed,
+                "C: the already-translated failure is rethrown UNCHANGED - re-translating it would bury the"
+                        + " real sanitised detail under a second category");
+        assertEquals("cm-system", surfaced.category(), "C: and its own sanitised category survives");
+        assertFalse(session.isHealthy(),
+                "C: by the time the failure is observable outside IbmCmApi.read the session is unusable - the"
+                        + " wrapper reasserts the classification the failure already carries instead of"
+                        + " trusting the call site to have applied it");
+        assertTrue(session.isLive(),
+                "C: it is still LIVE - marking is not closing, so its capacity slot stays accounted for until"
+                        + " the lease return retires it");
+        assertNotNull(sink.last(),
+                "C: the reassertion records a sanitised diagnostic rather than marking silently");
+        assertFalse(sink.last().contains("RAW VENDOR TEXT"),
+                "C: and records the failure's OWN already-sanitised text, never the raw vendor text its cause"
+                        + " carries: " + sink.last());
+        assertTrue(sink.last().contains("cm-system"),
+                "C: the recorded text is the failure's sanitised classification: " + sink.last());
+        assertEquals(0, datastore.calls.size(),
+                "C: marking is one local flag write - it must not cause a vendor call while the pool may hold"
+                        + " its lock: " + datastore.calls);
+    }
+
+    /**
+     * Goal 02B section C, the two negatives: a failure classified REUSABLE must leave the session reusable,
+     * and a not-found answer must stay BENIGN.
+     *
+     * <p>Without these, "reassert backend-unusable" degenerates into "poison on any rethrow", which is just
+     * as wrong in the other direction: a healthy session is destroyed for a benign answer, and every miss
+     * pays for a new connection. Both halves are asserted on the same session, and the reusable half is
+     * asserted to still SERVE afterwards, not merely to have a true health flag.
+     */
+    public void aReusableTranslatedFailureAndANotFoundAnswerBothLeaveTheSessionReusable() {
+        IbmFakes.FakeReadDatastore datastore = new IbmFakes.FakeReadDatastore();
+        IbmCmSession session = IbmCmSession.live("reusable", datastore, null);
+        IbmCmFailure reusable = new IbmCmFailure("cm-not-found", "cm-not-found(dkNotExistException)",
+                null, false);
+
+        IbmCmFailure surfaced = assertThrows(IbmCmFailure.class,
+                () -> IbmCmApi.read(session, "reusableRead", () -> {
+                    throw reusable;
+                }),
+                "C: a preconstructed failure with backendUnusable=false still travels as itself");
+
+        assertTrue(surfaced == reusable,
+                "C: unchanged - the rethrow path decides nothing new about it");
+        assertEquals("cm-not-found", surfaced.category(), "C: its category is intact");
+        assertTrue(session.isHealthy(),
+                "C: backendUnusable=false MUST leave the session reusable. Poisoning it here is the"
+                        + " blanket-relabel failure this negative exists to catch");
+        assertEquals("value", IbmCmApi.read(session, "read", () -> "value"),
+                "C: and the session still serves a later read rather than merely reporting a true flag");
+        assertTrue(session.isLive(), "C: nothing was torn down");
+
+        Object absent = IbmCmApi.readOrAbsent(session, "retrieveEntity", () -> {
+            throw new com.ibm.mm.sdk.common.DKNotExistException("no such item type");
+        });
+        assertTrue(absent == null, "C: DKNotExist stays an absence, not a failure");
+        assertTrue(session.isHealthy(),
+                "C: and the benign control must not poison the session - recreating a connection for every"
+                        + " miss is the failure mode the control prevents");
+        assertTrue(session.isLive(), "C: the physical session is still held");
+    }
+
+    /**
      * An {@link Error} marks the session unusable BEFORE the Error propagates, and is not swallowed.
      *
      * <p>"Before" is asserted the only way it can be: the Error is caught by the test, and at that instant
@@ -256,6 +352,28 @@ public final class IbmSessionPoisoningTest {
     }
 
     // ------------------------------------------------------------------ harness
+
+    /**
+     * Records the last sanitised failure an {@link AdapterErrorSink} was handed.
+     *
+     * <p>Asserting on what was RECORDED, not only on the resulting health flag, is what makes the
+     * "do not leak the raw vendor text while marking" half of section C checkable: the health flag turns
+     * false either way, but only the recorded text can show whether the marking used the failure's own
+     * sanitised message or something read out of the vendor failure.
+     */
+    private static final class RecordingSink implements AdapterErrorSink {
+
+        private String last;
+
+        @Override
+        public void recordAdapterError(String sanitisedFailure) {
+            this.last = sanitisedFailure;
+        }
+
+        String last() {
+            return last;
+        }
+    }
 
     /** Runs one vendor failure through the production read wrapper and asserts the session is retired. */
     private static void assertRetired(String label, ThrowingRead read, String expectedCategory) {

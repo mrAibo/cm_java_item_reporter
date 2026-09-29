@@ -149,7 +149,22 @@ public final class SelfCheck {
                 peak.accumulateAndGet(now, Math::max);
                 return live::decrementAndGet;
             }
-        };        try (BoundedPool<AutoCloseable> pool = new BoundedPool<>("self-check", 2, Duration.ofMillis(250), factory)) {
+
+            /**
+             * This fixture's resource is a bare live-counter lambda with no state beyond existence, so
+             * "healthy" has no finer answer than true and no vendor call would be reachable here.
+             *
+             * <p>Stated explicitly rather than inherited: a constant is only honest when the resource
+             * genuinely has no stronger local state, and an inherited "non-null means healthy" default
+             * was removed for exactly this reason. The rotation and retirement paths that a real health
+             * probe drives are exercised by the suites that own a resource with a real health flag.
+             */
+            @Override
+            public boolean isHealthy(AutoCloseable resource) {
+                return resource != null;
+            }
+        };
+        try (BoundedPool<AutoCloseable> pool = new BoundedPool<>("self-check", 2, Duration.ofMillis(250), factory)) {
             pool.initialize();
             try (var first = pool.borrow(); var second = pool.borrow()) {
                 check("both resources are leased", first.value() != null && second.value() != null);
@@ -187,6 +202,12 @@ public final class SelfCheck {
             public AutoCloseable create() {
                 live.incrementAndGet();
                 return live::decrementAndGet;
+            }
+
+            /** Same reasoning as {@link #poolNeverOvershoots()}: existence is this resource's only state. */
+            @Override
+            public boolean isHealthy(AutoCloseable resource) {
+                return resource != null;
             }
         };
     }

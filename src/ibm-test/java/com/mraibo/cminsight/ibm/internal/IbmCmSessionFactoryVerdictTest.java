@@ -9,6 +9,7 @@ import com.mraibo.cminsight.core.CmSessionFactory;
 
 import java.time.Duration;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.mraibo.cminsight.ibm.internal.Assert.assertEquals;
 import static com.mraibo.cminsight.ibm.internal.Assert.assertFalse;
@@ -195,6 +196,93 @@ public final class IbmCmSessionFactoryVerdictTest {
             assertTrue(lease.value().isHealthy(), "C: a connected session is healthy");
         }
         pool.close();
+    }
+
+    /**
+     * Goal 02B section A, the OPPOSITE CONTROL: an UNKNOWN failure whose physical outcome is genuinely
+     * unknown - thrown AFTER the allocation boundary - must still QUARANTINE.
+     *
+     * <h2>Why this control exists beside the credential-loss regression</h2>
+     *
+     * <p>Section A moves profile/credential failures that provably happen before any datastore exists onto
+     * the explicit {@code PROVEN_CLEAN} path, so a credential that disappears after activation cannot burn a
+     * pool slot. That is only correct because THOSE failures know no physical resource was allocated. The
+     * danger the fix must not introduce is a blanket relabel: catching everything and calling it clean would
+     * free the slot of an attempt that may have left a live session behind, which is a bound breach rather
+     * than a capacity-tuning mistake. The credential-loss regression (owned by the section A work itself)
+     * proves the known-clean direction; this test proves the OTHER direction, on the same production seam -
+     * the real {@link IbmCmSessionFactory} inside a real {@code BoundedPool}.
+     *
+     * <h2>What "unknown after the allocation boundary" means here</h2>
+     *
+     * <p>A {@link IbmCmConnectionFactory} allocates its datastore and then throws a plain
+     * {@link IllegalStateException}: no typed verdict, no cleanup evidence at all. The production factory
+     * builds its handle BEFORE calling {@code connect()}, so this is exactly the shape in which the
+     * datastore exists while the caller knows nothing about it. The adapter must not invent a verdict from
+     * it, and the pool must not free the reserved slot - the factory's own diagnostics must say the attempt
+     * may have left resources behind.
+     */
+    public void anUnknownFailureAfterTheAllocationBoundaryStillQuarantinesTheSlot() throws Exception {
+        AtomicInteger connectAttempts = new AtomicInteger();
+        IbmFakes.FakeReadDatastore allocated = new IbmFakes.FakeReadDatastore();
+        IbmCmConnectionFactory allocatesThenFailsUnknown = new IbmCmConnectionFactory() {
+            @Override
+            public IcmDatastore connect(String ssid, String user, String password) {
+                connectAttempts.incrementAndGet();
+                // The datastore physically exists - this fake holds it, exactly as the production factory
+                // holds its handle - and the failure that follows carries no information about whether it was
+                // cleaned up. Nothing below pretends otherwise: no destroy/disconnect is attempted, which is
+                // why the attempt cannot be reported as clean.
+                return failAfterAllocation(allocated);
+            }
+        };
+        IbmCmSessionFactory sessions = IbmFakes.factory("control", allocatesThenFailsUnknown);
+        BoundedPool<CmSession> pool = new BoundedPool<>("cm", 1, PATIENT,
+                IbmFakes.resourceFactory(IbmFakes.profile("control"), sessions));
+
+        PoolException surfaced = assertThrows(PoolException.class, pool::borrow,
+                "the borrow must surface the pool's own failure type for an unknown creation outcome");
+        assertTrue(surfaced.getCause() instanceof IllegalStateException,
+                "A: the untyped failure reaches the caller unchanged - a factory that relabelled it as a"
+                        + " verdict would hide that nothing about the physical outcome is known: "
+                        + surfaced.getCause());
+        assertFalse(surfaced.getCause() instanceof CreationFailure,
+                "A: and it must NOT become a CreationFailure at all, because the only relabelling available"
+                        + " here would be PROVEN_CLEAN - which would authorise a replacement session beside"
+                        + " one that may still be alive. Got: " + surfaced.getCause());
+
+        assertEquals(0, allocated.destroyCalls(),
+                "A: no cleanup was evidenced for the allocated datastore - the failure says nothing about it,"
+                        + " so 'nothing is left behind' is not a claim this attempt can make");
+        assertEquals(1, pool.metrics().quarantined(),
+                "A: an UNKNOWN post-allocation failure must still quarantine the reserved slot");
+        assertEquals(1L, pool.metrics().createQuarantineFailures(),
+                "A: and the lost slot must be visible as a creation quarantine in diagnostics");
+        assertEquals(1, pool.metrics().capacityInUse(), "A: the quarantined slot still consumes capacity");
+        assertEquals(0, pool.metrics().creating(), "A: the reservation is resolved, not left in flight");
+        assertTrue(pool.metrics().degraded(), "A: the pool reports the capacity it could not prove released");
+        assertTrue(sessions.lastAttemptLeftResources(),
+                "A: the attempt must be recorded as possibly having left resources behind - an unknown"
+                        + " outcome is the conservative/unproven reading, never 'left nothing'");
+
+        int attemptsBefore = connectAttempts.get();
+        assertThrows(TimeoutException.class, pool::borrow,
+                "A: the quarantined slot must not authorise a replacement physical connection");
+        assertEquals(attemptsBefore, connectAttempts.get(),
+                "A: and no further connect was attempted on top of the unknown outcome");
+        pool.close();
+    }
+
+    /**
+     * Allocates the datastore and then fails with a plain, untyped exception - the shape that carries no
+     * cleanup evidence and therefore cannot be reported as clean.
+     *
+     * <p>Never returns: the {@code IcmDatastore} return type exists only so the fake satisfies the
+     * interface's own signature.
+     */
+    private static IcmDatastore failAfterAllocation(IcmDatastore allocated) {
+        throw new IllegalStateException("simulated untyped failure after the allocation boundary: "
+                + allocated.getClass().getSimpleName() + " exists and nothing cleaned it up");
     }
 
     /** A successful creation must return a live session bound to its repository, with nothing left behind. */

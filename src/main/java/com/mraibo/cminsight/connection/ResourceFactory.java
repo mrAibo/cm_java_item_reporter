@@ -41,6 +41,15 @@ package com.mraibo.cminsight.connection;
  * configuration) should now say {@code PROVEN_CLEAN} instead of throwing a plain failure, otherwise it
  * costs the pool one capacity slot for good. Being wrong in the conservative direction only degrades the
  * pool; being wrong in the other direction breaches the physical bound.
+ *
+ * <h2>The health question is explicit for the same reason</h2>
+ *
+ * <p>{@link #isHealthy} used to carry a permissive default ("non-null means healthy"), which was the same
+ * fail-open shape on the retirement path: a composition root that forgot to override it reported an
+ * already-unusable resource as healthy and the pool kept handing it out. Since Goal 02B the method is
+ * abstract, so every implementation must state what "healthy" means for its own resource type - see its
+ * contract for what such a check may and may not do. Both obligations therefore live in this type instead
+ * of in the memory of whoever wired the pool.
  */
 public interface ResourceFactory<T extends AutoCloseable> {
 
@@ -57,21 +66,42 @@ public interface ResourceFactory<T extends AutoCloseable> {
     T create() throws Exception;
 
     /**
-     * Cheap liveness check performed when a resource is taken from the idle set and when it is
-     * returned. Returning {@code false} retires the resource without ever exceeding the configured
-     * capacity.
+     * Cheap liveness check performed when a resource is taken from the idle set, when it is returned and
+     * during a rotation sweep. Returning {@code false} retires the resource without ever exceeding the
+     * configured capacity.
      *
-     * <p>Contract: this runs while {@link BoundedPool} holds its internal lock on the borrow path, on the
-     * return path and during a rotation sweep, so it must be fast and must never block on I/O, sleeping
-     * or acquiring another lock. A slow probe stalls every concurrent borrow, every {@code metrics()}
-     * call AND - because {@link BoundedPool#closeState()} takes the same lock - the shutdown state a
-     * repository switch reads before it decides whether to open new connections. This one method cannot
-     * tell a borrow from a return, so keep it cheap and do any real round-trip validation in a separate
-     * maintenance task rather than here.
+     * <h2>Stating a health policy is mandatory - this method has no default</h2>
+     *
+     * <p>Until Goal 02B this was a {@code default} method answering {@code resource != null}. That made
+     * safe retirement depend on every composition root remembering to override it, and the omission was
+     * silent: a factory that forgot reported every non-null resource - including one already marked
+     * unusable - as healthy, so the pool kept handing out a dead session until some later call failed on
+     * it. There is no truthful generic answer here; only the resource type knows whether it has a local
+     * health state at all. The method is therefore <strong>abstract on purpose</strong>, which is a
+     * compile-breaking change for every implementation: an omission is now a compile error instead of a
+     * runtime correctness bug. No convenience overload, no "always healthy" policy object and no other
+     * inheritable default replaces it - reintroducing one would restore exactly the defect.
+     *
+     * <h2>What a health check must be</h2>
+     *
+     * <p>This runs while {@link BoundedPool} holds its internal lock on the borrow path, on the return path
+     * and during a rotation sweep, so it must be <strong>cheap, local and non-blocking</strong>: a volatile
+     * or atomically-read flag, or an equivalent in-memory state test. It must never perform network or
+     * vendor I/O, never sleep, never acquire another lock and never open a round trip. A slow probe stalls
+     * every concurrent borrow, every {@code metrics()} call AND - because {@link BoundedPool#closeState()}
+     * takes the same lock - the shutdown state a repository switch reads before it decides whether to open
+     * new connections. Any real round-trip validation belongs in a separate maintenance task, never here.
+     *
+     * <p>Each implementation must either make that local check, or state a constant
+     * <em>deliberately</em> - with a comment saying why this resource type has no stronger local health
+     * state - so the choice is visible in the code rather than inherited by accident. A {@code null}
+     * resource is never passed by {@link BoundedPool} (a null creation is rejected outright), but defensive
+     * handling is still allowed.
+     *
+     * @param resource the live resource the pool is about to hand out or keep; never {@code null}
+     * @return {@code false} to retire the resource at the next safe point, {@code true} to keep it
      */
-    default boolean isHealthy(T resource) {
-        return resource != null;
-    }
+    boolean isHealthy(T resource);
 
     /** Short label used in pool diagnostics. */
     default String describe() {

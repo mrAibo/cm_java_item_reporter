@@ -1,5 +1,6 @@
 package com.mraibo.cminsight.ibmtest;
 
+import com.mraibo.cminsight.ibm.internal.IbmCmPreAllocationCleanTest;
 import com.mraibo.cminsight.ibm.internal.IbmCmSessionFactoryVerdictTest;
 import com.mraibo.cminsight.ibm.internal.IbmClassificationProvenanceTest;
 import com.mraibo.cminsight.ibm.internal.IbmCleanupVerdictTest;
@@ -10,10 +11,7 @@ import com.mraibo.cminsight.ibm.internal.IbmSessionPoisoningTest;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -32,12 +30,31 @@ import java.util.List;
  * <ul>
  *   <li>every class in {@link #TEST_CLASSES} is instantiated through its public no-argument constructor and
  *       every public no-argument {@code void} method is run as a test;</li>
+ *   <li>a runnable suite compiled into {@code com.mraibo.cminsight.ibm.internal} that
+ *       {@link #TEST_CLASSES} does not list FAILS the run instead of silently not running - see
+ *       {@link IbmSuiteRegistration} and {@code unregisteredSuites} below;</li>
  *   <li>one {@code PASS}/{@code FAIL} line per test, and the final line is {@code Tests run: N, failures: M};</li>
  *   <li>the exit code is 0 only when at least one test ran and none failed, so a silently empty suite can
  *       never look like a pass;</li>
  *   <li>each test runs on a daemon worker with a 30-second wall clock timeout, so a hung test fails the
  *       build instead of hanging it.</li>
  * </ul>
+ *
+ * <h2>Why the list stays explicit, and how its omission became loud</h2>
+ *
+ * <p>The list is kept rather than replaced by discovery, because the run ORDER is part of this runner's
+ * contract (successive runs print identical output) and because the list is the human-auditable inventory of
+ * what the IBM evidence consists of. The defect Goal 02A found was never the existence of a list - it was
+ * that forgetting one entry was indistinguishable from having nothing to forget: the suite simply did not
+ * run and the build stayed green.
+ *
+ * <p>{@link IbmSuiteRegistration} closes that hole. It reads the COMPILED IBM test tree - not a second
+ * hand-written source list, which could drift from this one - and fails the run for every runnable suite
+ * ({@code public}, concrete, public no-argument constructor, at least one public no-argument {@code void}
+ * method, which is exactly what {@link IbmSuiteRegistration#discoverTests(Class)} accepts) that
+ * {@link #TEST_CLASSES} omits. It also fails when it cannot read a root at all, so "the guard could not
+ * check" can never be mistaken for "checked and clean". Adding a suite is therefore still a deliberate act -
+ * and forgetting it is a red build, not a missing assertion.
  *
  * <p>The test classes themselves live in {@code com.mraibo.cminsight.ibm.internal} because that is where the
  * package-private seams they must drive live: {@code IbmCmConnectionFactory} and {@code IcmDatastore} are
@@ -67,7 +84,8 @@ public final class IbmAdapterTest {
             IbmConnectCleanupRuleTest.class,
             IbmSessionPoisoningTest.class,
             IbmClassificationProvenanceTest.class,
-            IbmMappingRulesTest.class);
+            IbmMappingRulesTest.class,
+            IbmCmPreAllocationCleanTest.class);
 
     private IbmAdapterTest() {
     }
@@ -77,8 +95,31 @@ public final class IbmAdapterTest {
         int run = 0;
         int failures = 0;
 
+        // Before anything runs: refuse to report a pass while a runnable suite in the IBM suite package is
+        // not in the list above. A test class that exists but is never registered does not run, does not
+        // fail, and does not change any count - the suite simply reports success without it. That happened
+        // for real in this project on the CORE runner: four committed suites, including the Java half of the
+        // read-only guarantee, sat unregistered for a whole goal and had never executed an assertion while
+        // the build reported green. Evidence that does not run is not evidence, so the omission is an error
+        // here too rather than a silent absence.
+        IbmSuiteRegistration.Check registration = IbmSuiteRegistration.check(TEST_CLASSES);
+        for (String name : registration.unregisteredSuites()) {
+            System.out.println("FAIL  " + name + ".<registration>: the class is compiled into "
+                    + IbmSuiteRegistration.SUITE_PACKAGE + " but is not in IbmAdapterTest.TEST_CLASSES, so it"
+                    + " would never run");
+            failures++;
+        }
+        // A root the guard could not read is a FAILURE, not a warning: registration was not verified there,
+        // and an unchecked tree may hold exactly the suite this guard exists to find.
+        for (String unreadable : registration.unreadableRoots()) {
+            System.out.println("FAIL  " + IbmSuiteRegistration.SUITE_PACKAGE + ".<registration>: the suite"
+                    + " registration could not be verified against " + unreadable + "; refusing to report a"
+                    + " pass while an unlisted IBM suite could be hiding there");
+            failures++;
+        }
+
         for (Class<?> testClass : TEST_CLASSES) {
-            List<Method> tests = discover(testClass);
+            List<Method> tests = IbmSuiteRegistration.discoverTests(testClass);
             if (tests.isEmpty()) {
                 System.out.println("FAIL  " + testClass.getSimpleName() + ".<suite>: no test methods were found");
                 failures++;
@@ -104,28 +145,6 @@ public final class IbmAdapterTest {
         System.out.println("Tests run: " + run + ", failures: " + failures);
         System.out.flush();
         System.exit(run > 0 && failures == 0 ? 0 : 1);
-    }
-
-    /** Public no-argument {@code void} methods declared by the test class, in stable name order. */
-    private static List<Method> discover(Class<?> testClass) {
-        List<Method> tests = new ArrayList<>();
-        for (Method method : testClass.getMethods()) {
-            if (method.getDeclaringClass() == Object.class) {
-                continue;
-            }
-            if (method.isSynthetic() || method.isBridge()) {
-                continue;
-            }
-            if (!Modifier.isPublic(method.getModifiers()) || Modifier.isStatic(method.getModifiers())) {
-                continue;
-            }
-            if (method.getParameterCount() != 0 || method.getReturnType() != void.class) {
-                continue;
-            }
-            tests.add(method);
-        }
-        tests.sort(Comparator.comparing(Method::getName));
-        return tests;
     }
 
     /** Runs one test on a bounded daemon worker; returns the failure, or {@code null} when it passed. */

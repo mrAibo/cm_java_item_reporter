@@ -771,6 +771,16 @@ public class BoundedPoolHardeningTest {
             }
 
             @Override
+            public boolean isHealthy(FakeResource resource) {
+                // Goal 02B: stated CONSTANT on purpose, not an inherited "non-null means healthy". This
+                // fixture's create() always throws before it allocates anything, so it never hands a resource
+                // to the pool and this probe is unreachable; the fake resource type's finer health state
+                // belongs to the OTHER factories in this suite, which delegate to it. What is under test here
+                // is the wait metric of a failed attempt, so a health read would prove nothing about it.
+                return true;
+            }
+
+            @Override
             public String describe() {
                 return "slow-failure";
             }
