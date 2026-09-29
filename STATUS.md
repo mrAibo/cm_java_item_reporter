@@ -12,10 +12,91 @@
 - Goal 02 implementation checkpoint recorded by the execution handoff: `818cdcf45ffff02383915958424e5403ae653e00`
 - Goal 02A reviewed checkpoint (the review that required this goal): `67d058c1d26d706ce75b73011e959f23c00c5868`
 - Goal 02A implementation commit (the commit this section describes): `4b810b361c3c34b0b9118ddcbc560ee47d21560b`
-- Stage: **Goal 02A EXECUTED, PUSHED and GREEN on both Actions events; awaiting architecture review**
-- Current approved goal: `harness/GOAL_02A_IBM_ADAPTER_SEMANTICS_HARDENING.md` (executed)
+- Goal 02A final reviewed remote HEAD: `ff4b2aa32617a6037b541143b008947ed095cfdc`
+- Stage: **Goal 02A REVIEWED; Goal 02B resource-contract closure APPROVED**
+- Current approved goal: `harness/GOAL_02B_RESOURCE_CONTRACT_CLOSURE.md`
 - Goals 03-05: PROVISIONAL; do not execute
-- Next goal: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+- Next goal after Goal 02B: **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+
+## Goal 02A external architecture review
+
+Reviewed remote SHA:
+
+`ff4b2aa32617a6037b541143b008947ed095cfdc`
+
+Formal evidence verified from GitHub:
+
+- branch HEAD exactly matched `ff4b2aa32617a6037b541143b008947ed095cfdc`;
+- push Actions run `36527954727`: **success**, exact same head SHA;
+- pull_request Actions run `36527957601`: **success**, exact same head SHA;
+- PR #1 remained open, draft and unmerged;
+- no JAR/vendor binary is tracked.
+
+### Review verdict
+
+**The five Goal 02A corrections are substantively accepted. One resource-contract regression and three
+small structural traps must be closed before Goal 03 may introduce a JDBC resource factory.**
+
+Accepted after source review:
+
+- generic failed creation is now fail-safe: only explicit `PROVEN_CLEAN` releases a reservation;
+- IBM teardown uses one documented isConnected -> conditional disconnect -> always destroy rule, with
+  successful destroy as cleanup proof and destroy failure as quarantine;
+- provider-installed and runtime-ready are separated, and an SDK-free packaged runtime is activation
+  unavailable before RepositoryManager/pool creation;
+- ClassificationRules now come from the actual core-loaded configuration and the IBM source set does not
+  reopen application configuration;
+- vendor read failures are conservatively retired, including RuntimeException/Error/wrong vendor types,
+  while DKNotExist remains benign;
+- unmapped retention enum codes are rendered as JSON null rather than the old numeric sentinel;
+- the previously unregistered core suites now really run, and the real-SDK test fake incompatibility was
+  corrected.
+
+### Blocking regression found by review
+
+`IbmCmSessionFactory.create()` performs `validateProfile()` and `resolveCredentials()` **before** the
+try/catch that translates a clean IBM creation failure to `CreationFailure(PROVEN_CLEAN)`.
+
+This became a real defect only after Goal 02A correctly hardened `BoundedPool`: a plain failure is now
+quarantined.
+
+The runtime intentionally re-resolves CM credentials for every new/replacement session. Therefore:
+
+1. the repository can activate successfully;
+2. later a CM secret/env source can disappear;
+3. a stale/unhealthy session is retired and the pool tries to create its replacement;
+4. credential resolution fails **before any DKDatastoreICM is allocated**;
+5. the plain `IbmCmFailure` escapes;
+6. `BoundedPool` correctly reads the untyped failure as unknown and permanently quarantines an empty slot.
+
+Repeated pre-allocation credential failures can therefore degrade the pool to zero capacity without a
+single physical leak. The factory knows this outcome is clean and must say `PROVEN_CLEAN` explicitly.
+
+The same rule applies to any other known-clean pre-allocation validation path. Unknown failures after a
+physical allocation boundary must remain conservative.
+
+### Additional contract closure required in the same pass
+
+1. `ResourceFactory.isHealthy()` still has the permissive default `resource != null`. This reintroduces
+   "the composition root must remember" as a safety dependency. Make health validation explicit/mandatory
+   before JDBC reuses this abstraction.
+2. `IbmCmApi.vendorCall()` rethrows an already-translated `IbmCmFailure` without reasserting
+   `backendUnusable => markUnusable`. Current production construction sites are safe, but the invariant is
+   still convention-dependent. Make the rethrow path idempotently enforce it.
+3. The core runner now detects unregistered suites, but `IbmAdapterTest` still has only a manual suite
+   list. Close the same silent-test gap in the IBM suite before more adapter/JDBC tests are added.
+4. `RetentionPolicyInfo` currently normalises every negative numeric enum code to null based on an
+   undocumented "CM enum codes are never negative" premise. Absence should be represented by null directly;
+   do not silently discard a future explicitly established negative value unless IBM documentation proves
+   it invalid.
+
+These are intentionally one small Goal 02B, not a reopening of Goal 02A.
+
+### Goal state after review
+
+- Goal 02A: completed/reviewed; its main corrections are accepted.
+- Goal 02B: **APPROVED / EXECUTE**.
+- Goal 03: **PROVISIONAL / DO NOT EXECUTE** until 02B review passes.
 
 ## Goal 02A execution record
 

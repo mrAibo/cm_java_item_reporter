@@ -1,6 +1,6 @@
 # Goal 02A - IBM adapter semantics hardening
 
-**Status: COMPLETED / PUSHED / GREEN - AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
+**Status: COMPLETED / ARCHITECTURE REVIEWED — CORE CORRECTIONS ACCEPTED, CONTRACT-CLOSURE CHANGES REQUIRED. DO NOT RE-EXECUTE.**
 
 Implementation commit: `4b810b361c3c34b0b9118ddcbc560ee47d21560b`.
 Both exact-SHA GitHub Actions runs are green for it: push `36527200713`, pull_request `36527204017`.
