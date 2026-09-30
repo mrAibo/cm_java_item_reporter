@@ -33,6 +33,8 @@
 - Goal 03B: COMPLETED / REVIEWED / ACCEPTED
 - Goal 04: **APPROVED / EXECUTE**
 - Goal 05: PROVISIONAL / DO NOT EXECUTE
+- Cross-session continuation: `CM_INSIGHT_HANDOFF_2026-09-30_GOAL04.md`
+- DeepSeek Harness starter: `harness/GOAL_04_DEEPSEEK_HARNESS_PROMPT.md`
 
 ## Goal 03B architecture review record
 
