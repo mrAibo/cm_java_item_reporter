@@ -323,6 +323,135 @@ public class ScanGateLatchTest {
         }
     }
 
+    /** Builds the package-private lifecycle-hook constructor without widening the production API. */
+    private static ScanCoordinator coordinatorWithSupervisorHook(StatisticsSettings settings,
+                                                                 String repository,
+                                                                 java.util.function.Supplier<List<ItemTypeSummary>> source,
+                                                                 StatisticsEngine engine,
+                                                                 Runnable hook) throws Exception {
+        java.lang.reflect.Constructor<ScanCoordinator> constructor = ScanCoordinator.class
+                .getDeclaredConstructor(StatisticsSettings.class, String.class,
+                        java.util.function.Supplier.class, StatisticsEngine.class, Runnable.class);
+        constructor.setAccessible(true);
+        return constructor.newInstance(settings, repository, source, engine, hook);
+    }
+
+    /**
+     * Goal 03B: terminal status is NOT physical supervisor death.
+     *
+     * <p>The hook parks at the supervisor's last action before Java-thread return. While parked, every
+     * logical fact is final, but Thread.isAlive() is still true; the gate must therefore remain latched and
+     * generation N+1 must be refused. This is the exact interleaving the self-deregister fix has to survive.
+     */
+    public void supervisorMustPhysicallyDieBeforeTheNextGenerationCanStart() throws Exception {
+        CountDownLatch finalActionEntered = new CountDownLatch(1);
+        CountDownLatch allowReturn = new CountDownLatch(1);
+        AtomicInteger swallowed = new AtomicInteger();
+        Runnable finalAction = () -> {
+            finalActionEntered.countDown();
+            awaitIgnoringInterrupts(allowReturn, swallowed);
+        };
+
+        HostileEngine engine = new HostileEngine(LocalDate.of(2024, 6, 15));
+        ScanCoordinator coordinator = coordinatorWithSupervisorHook(
+                settings(1, Duration.ofSeconds(30)), REPOSITORY, () -> itemTypes(1), engine, finalAction);
+        try {
+            Assert.assertEquals(ScanStartResult.STARTED, coordinator.requestScan(), "generation N starts");
+            Assert.assertTrue(finalActionEntered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS),
+                    "the supervisor must reach its final pre-return barrier");
+            Assert.assertEquals(ScanStatus.Phase.COMPLETED, coordinator.progress().phase(),
+                    "the result is already logically final while the supervisor is still alive");
+            Assert.assertTrue(awaitCondition(() -> !threadsNamed("-supervisor").isEmpty(), WAIT),
+                    "the old supervisor Java thread must still be physically alive");
+            Assert.assertTrue(coordinator.isScanInFlight(),
+                    "logical completion must not release the gate while that supervisor is alive");
+            Assert.assertEquals(ScanStartResult.ALREADY_RUNNING, coordinator.requestScan(),
+                    "generation N+1 is refused until the old supervisor actually returns");
+            Assert.assertEquals(1, engine.anchorReads(),
+                    "the refused request cannot start another generation or read another anchor");
+
+            allowReturn.countDown();
+            Assert.assertTrue(coordinator.awaitScanCompletion(WAIT),
+                    "the generation reaper releases only after the supervisor physically dies");
+            Assert.assertTrue(awaitCondition(() -> threadsNamed("-supervisor").isEmpty(), WAIT),
+                    "the old supervisor is now observably dead");
+            Assert.assertFalse(coordinator.isScanInFlight(), "the gate is open only after that death");
+
+            Assert.assertEquals(ScanStartResult.STARTED, coordinator.requestScan(),
+                    "only now may generation N+1 start");
+            Assert.assertTrue(coordinator.awaitScanCompletion(WAIT), "generation N+1 completes");
+            Assert.assertEquals(2, engine.anchorReads(),
+                    "each generation reads exactly one anchor; old cleanup did not start or disturb N+1");
+        } finally {
+            allowReturn.countDown();
+            coordinator.close();
+        }
+    }
+
+    /** The reaper's own remaining lifetime is still coordinator-owned during context close. */
+    public void closeRemainsClosingUntilTheHeldSupervisorAndItsReaperAreActuallyGone() throws Exception {
+        CountDownLatch finalActionEntered = new CountDownLatch(1);
+        CountDownLatch allowReturn = new CountDownLatch(1);
+        AtomicInteger swallowed = new AtomicInteger();
+        Runnable finalAction = () -> {
+            finalActionEntered.countDown();
+            awaitIgnoringInterrupts(allowReturn, swallowed);
+        };
+
+        HostileEngine engine = new HostileEngine(LocalDate.of(2024, 6, 15));
+        ScanCoordinator coordinator = coordinatorWithSupervisorHook(
+                settings(1, Duration.ofSeconds(1)), REPOSITORY, () -> itemTypes(1), engine, finalAction);
+        try {
+            Assert.assertEquals(ScanStartResult.STARTED, coordinator.requestScan(), "the scan starts");
+            Assert.assertTrue(finalActionEntered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS),
+                    "the supervisor reaches the final pre-return barrier");
+            coordinator.close(); // bounded: the hostile hook ignores the close interrupt
+            Assert.assertEquals(CloseState.CLOSING, coordinator.closeState(),
+                    "a physically alive old-generation supervisor/reaper keeps repository shutdown pending");
+            Assert.assertTrue(coordinator.isScanInFlight(),
+                    "close returning is not evidence that the scan generation physically ended");
+
+            allowReturn.countDown();
+            Assert.assertTrue(coordinator.awaitScanCompletion(WAIT), "the physical generation drains");
+            Assert.assertTrue(awaitCondition(() -> coordinator.closeState() == CloseState.CLOSED_CLEAN, WAIT),
+                    "CLOSED_CLEAN is reported only after all coordinator-owned old-generation threads die");
+        } finally {
+            allowReturn.countDown();
+            coordinator.close();
+        }
+    }
+
+    /** Opposite control for the Goal 03B defect: self-removal before return demonstrably opens too early. */
+    public void selfDeregisterBeforeThreadDeathWouldBeDetectedByTheNewAssertions() throws Exception {
+        CountDownLatch removedSelf = new CountDownLatch(1);
+        CountDownLatch allowDeath = new CountDownLatch(1);
+        AtomicBoolean mutantGate = new AtomicBoolean(true);
+        List<Thread> mutantTracked = new CopyOnWriteArrayList<>();
+
+        Thread mutant = new Thread(() -> {
+            mutantTracked.remove(Thread.currentThread());
+            mutantGate.set(false); // the bad rule: logical cleanup authorises the next generation
+            removedSelf.countDown();
+            awaitIgnoringInterrupts(allowDeath, new AtomicInteger());
+        }, ScanCoordinator.THREAD_NAME_PREFIX + REPOSITORY + "-mutant-supervisor");
+        mutant.setDaemon(true);
+        mutantTracked.add(mutant);
+        mutant.start();
+        try {
+            Assert.assertTrue(removedSelf.await(WAIT.toMillis(), TimeUnit.MILLISECONDS),
+                    "the mutant must reach its self-deregister-before-return window");
+            Assert.assertTrue(mutant.isAlive(), "the mutant supervisor is physically alive");
+            Assert.assertFalse(mutantGate.get(),
+                    "yet its bad self-deregister rule has already opened the gate");
+            Assert.assertTrue(mutantTracked.isEmpty(),
+                    "and it has already erased the live thread reference: precisely the reviewed defect");
+        } finally {
+            allowDeath.countDown();
+            mutant.join(WAIT.toMillis());
+        }
+        Assert.assertFalse(mutant.isAlive(), "the opposite control leaves no thread behind");
+    }
+
     // ================================================================== facts 1-7 (deadline path)
 
     /**

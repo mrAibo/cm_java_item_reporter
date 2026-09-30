@@ -46,19 +46,16 @@ import java.util.function.Supplier;
  *
  * <p>A deadline or a cancellation decides the scan's PUBLICATION and its terminal
  * {@link ScanStatus.Phase}; it does not prove that physical execution ended. So the gate is NOT released on
- * a terminal outcome. It is released by the last thread of the scan to actually exit, through one shared
- * owner ({@code gateReleased}) and one cleared-in-the-same-moment thread set:
+ * a terminal outcome. Every scan generation therefore owns an explicit, immutable set of tagged threads
+ * ({@code REAPER}, {@code WATCHDOG}, {@code SUPERVISOR}, {@code WORKER}). One dedicated reaper observes that
+ * exact generation from the outside and is the only normal-path owner of gate release. It waits until the
+ * generation is sealed and every other owned Java thread reports {@link Thread#isAlive()} == false. No
+ * worker, supervisor or watchdog may infer its own physical death from reaching a {@code finally} block,
+ * remove its own reference, or open the gate before its {@code Thread.run()} has actually returned.
  *
- * <ul>
- *   <li>threads exit before the deadline - whichever of the last worker and the supervisor exits last
- *       releases it, from that thread's {@code finally};</li>
- *   <li>a worker lingers past {@link #DRAIN_GRACE} because the driver ignored both the abort action and the
- *       interrupt - ONE per-scan observer thread waits for the tracked set to empty and releases it (see
- *       {@link #startLingeringWatcher});</li>
- *   <li>the supervisor is interrupted or dies of an {@link Error} - its own {@code finally} still runs, and
- *       a worker that outlives it finds the release path on its own exit, so the gate cannot be left latched
- *       forever.</li>
- * </ul>
+ * <p>The generation identity is also the cancellation boundary: scan N only interrupts threads tagged with
+ * scan N. Once its reaper opens the gate, it performs no mutation of active-scan state, so cleanup belonging
+ * to scan N cannot clear, interrupt or otherwise act on scan N+1.
  *
  * <p>While the gate is latched, {@link #isScanInFlight()} is true even when the terminal phase is already
  * {@code TIMED_OUT} or {@code CANCELLED}, {@link #isDraining()} names that fact explicitly, and
@@ -146,7 +143,7 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
      * stops waiting for them.
      *
      * <p>It is a WAIT bound, never a release: when it expires the scan stays draining with its gate latched
-     * until the lingering worker really exits. See {@link #startLingeringWatcher}.
+     * until the generation reaper observes the lingering worker's real Java-thread termination.
      */
     private static final Duration DRAIN_GRACE = Duration.ofSeconds(10);
 
@@ -155,9 +152,6 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
 
     /** Suffix of the per-scan deadline watchdog thread; see {@link #watchdogLoop}. */
     private static final String WATCHDOG_SUFFIX = "-watchdog";
-
-    /** Suffix of the per-scan lingering-worker watcher thread; see {@link #startLingeringWatcher}. */
-    private static final String LINGERING_SUFFIX = "-lingering";
 
     /**
      * Ceiling on how long a watchdog parks before re-reading its conditions.
@@ -183,19 +177,18 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
     private final Condition scanFinished = stateLock.newCondition();
     private final Condition scanProgressed = stateLock.newCondition();
 
-    /** Guards {@link #threads} and {@link #lingeringWatcher}. */
-    private final Object threadsLock = new Object();
-    private final List<Thread> threads = new ArrayList<>();
-    private Thread lingeringWatcher;
-
     /**
-     * How many worker batches are currently being started, under {@link #threadsLock}.
+     * Every coordinator-owned thread, tagged with the scan generation it belongs to.
      *
-     * <p>While one is open, "no tracked thread is alive" is not proof that the scan is over: the next worker
-     * does not exist yet but is about to. {@link #releaseGateIfDrained()} refuses for that whole window, so
-     * the gate cannot open between two worker registrations.</p>
+     * <p>Entries are never repurposed for a later scan. Dead entries are pruned only after their Java thread
+     * is observably dead, so an old generation cannot disappear from lifecycle accounting by removing its
+     * own reference before return.
      */
-    private int workerBatchesOpen;
+    private final Object threadsLock = new Object();
+    private final List<OwnedThread> ownedThreads = new ArrayList<>();
+
+    /** Test-only barrier run as the supervisor's final action before its Java thread returns. */
+    private final Runnable beforeSupervisorReturn;
 
     /**
      * Guards the four progress counters as ONE consistent tuple.
@@ -236,10 +229,20 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
                            String repositoryId,
                            Supplier<List<ItemTypeSummary>> itemTypeSource,
                            StatisticsEngine engine) {
+        this(settings, repositoryId, itemTypeSource, engine, () -> { });
+    }
+
+    /** Package-private lifecycle hook used only by deterministic generation-ownership tests. */
+    ScanCoordinator(StatisticsSettings settings,
+                    String repositoryId,
+                    Supplier<List<ItemTypeSummary>> itemTypeSource,
+                    StatisticsEngine engine,
+                    Runnable beforeSupervisorReturn) {
         this.settings = Objects.requireNonNull(settings, "settings");
         this.repositoryId = repositoryId == null ? "" : repositoryId.trim();
         this.itemTypeSource = Objects.requireNonNull(itemTypeSource, "itemTypeSource");
         this.engine = Objects.requireNonNull(engine, "engine");
+        this.beforeSupervisorReturn = Objects.requireNonNull(beforeSupervisorReturn, "beforeSupervisorReturn");
     }
 
     public StatisticsSettings settings() {
@@ -328,15 +331,19 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
     /**
      * How many coordinator threads that belong to a scan are still alive: workers plus the supervisor.
      *
-     * <p>The two bookkeeping threads are deliberately excluded. The per-scan watchdog is the deadline
-     * enforcer, not scan work; the lingering watcher is the thing that WAITS for scan work, and counting it
-     * would make this number - and the draining fact built on it - report a lingering scan forever. Neither
-     * change when the real work is over, so neither may be allowed to define it.</p>
+     * <p>The bookkeeping threads are deliberately excluded. The watchdog enforces the deadline and the
+     * reaper observes physical thread death; neither performs ItemType/supervisor work, so neither may make
+     * the draining count non-zero after the real scan work has ended.</p>
      */
     public int lingeringScanThreadCount() {
+        ActiveScan scan = active.get();
+        if (scan == null) {
+            return 0;
+        }
         int alive = 0;
-        for (Thread thread : threadsSnapshot()) {
-            if (isScanWorkThread(thread) && thread.isAlive()) {
+        for (OwnedThread owned : generationThreadsSnapshot(scan)) {
+            if ((owned.role() == ThreadRole.SUPERVISOR || owned.role() == ThreadRole.WORKER)
+                    && owned.thread().isAlive()) {
                 alive++;
             }
         }
@@ -377,12 +384,18 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
         if (!closed.get()) {
             return CloseState.NOT_CLOSED;
         }
-        if (!scanInFlight.get()) {
-            // The gate is released exactly when the last tracked scan thread exited and the references were
-            // cleared in the same critical section, so a released gate IS the proof that nothing is left.
-            return CloseState.CLOSED_CLEAN;
+        if (scanInFlight.get()) {
+            return CloseState.CLOSING;
         }
-        return CloseState.CLOSING;
+        for (OwnedThread owned : allOwnedThreadsSnapshot()) {
+            if (owned.thread().isAlive()) {
+                // The reaper may release the scan gate only after it has proved every worker/supervisor/
+                // watchdog dead, but it still has to return from its own run method. Its remaining lifetime
+                // is coordinator-owned and therefore keeps context shutdown visibly pending.
+                return CloseState.CLOSING;
+            }
+        }
+        return CloseState.CLOSED_CLEAN;
     }
 
     @Override
@@ -421,42 +434,50 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             partialCount = 0;
         }
         active.set(scan);
-        // The gate was released - and only dead references left behind - by the drain that preceded this
-        // call, so nothing tracked here can be alive. Clearing the remainder is bookkeeping, not a release:
-        // see releaseGateIfDrained(), which is the one place allowed to open the gate.
-        synchronized (threadsLock) {
-            threads.clear();
-            lingeringWatcher = null;
-        }
+        pruneDeadOwnedThreads();
         boolean started = false;
-        Thread supervisor = null;
         try {
+            // The reaper is the ONLY thread allowed to open this generation's gate after normal startup.
+            // It never proves its own death; it observes the supervisor/workers/watchdog from outside and
+            // waits until Thread.isAlive() is false for every one of them.
+            Thread reaper = new Thread(() -> reaperLoop(scan),
+                    THREAD_NAME_PREFIX + repositoryId + "-" + scanId + "-reaper");
+            reaper.setDaemon(true);
+            registerThread(scan, ThreadRole.REAPER, reaper);
+            scan.reaper = reaper;
+            reaper.start();
+
             Thread watchdog = new Thread(() -> watchdogLoop(scan),
-                    THREAD_NAME_PREFIX + repositoryId + WATCHDOG_SUFFIX + "-" + scanId);
+                    THREAD_NAME_PREFIX + repositoryId + "-" + scanId + WATCHDOG_SUFFIX);
             watchdog.setDaemon(true);
-            registerThread(watchdog);
+            registerThread(scan, ThreadRole.WATCHDOG, watchdog);
             scan.watchdog = watchdog;
             // The watchdog is started BEFORE the supervisor so the absolute deadline governs the anchor
             // read, which runs on the supervisor thread before any worker exists.
             watchdog.start();
-            supervisor = new Thread(() -> runScan(scan),
-                    THREAD_NAME_PREFIX + repositoryId + SUPERVISOR_SUFFIX);
+
+            Thread supervisor = new Thread(() -> runScan(scan),
+                    THREAD_NAME_PREFIX + repositoryId + "-" + scanId + SUPERVISOR_SUFFIX);
             supervisor.setDaemon(true);
-            registerThread(supervisor);
+            registerThread(scan, ThreadRole.SUPERVISOR, supervisor);
+            scan.supervisor = supervisor;
             supervisor.start();
             started = true;
         } catch (Throwable failure) {
-            // A thread that cannot start must not leave the coordinator wedged in "one scan in flight".
-            // Whatever was registered is deregistered first, so the gate can then be released by the
-            // ordinary path instead of being held by a thread reference that will never run.
-            deregisterThread(supervisor);
-            deregisterThread(scan.watchdog);
-            scan.complete = true;
-            // No supervisor is running, so nothing will ever start a worker for this scan: sealing here is
-            // what lets the gate be released instead of being held by a thread reference that never runs.
-            scan.sealed = true;
+            // An unstarted Thread is physically not alive, so it may stay recorded. Seal the generation and
+            // wake its reaper; if even the reaper itself could not start, this caller is an external observer
+            // and may prove the all-dead state directly.
             finishScan(scan, null, startNanos, failure);
-            releaseGateIfDrained();
+            scan.complete = true;
+            scan.sealed = true;
+            if (scan.watchdog != null) {
+                scan.watchdog.interrupt();
+            }
+            signalGenerationChanged(scan);
+            Thread reaper = scan.reaper;
+            if (reaper == null || !reaper.isAlive()) {
+                releaseGateAfterPhysicalDeath(scan, Thread.currentThread());
+            }
         }
         if (!started) {
             return ScanStartResult.UNAVAILABLE;
@@ -523,7 +544,8 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             cancelInternal(scan);
         }
         long deadline = System.nanoTime() + settings.scanTimeout().toNanos();
-        for (Thread thread : threadsSnapshot()) {
+        for (OwnedThread owned : allOwnedThreadsSnapshot()) {
+            Thread thread = owned.thread();
             if (thread == Thread.currentThread()) {
                 continue;
             }
@@ -538,13 +560,9 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
                 break;
             }
         }
-        // A stubborn worker may still be alive. From here the lingering watcher owns the release, because
-        // this thread must not perform it: the gate is released by the last scan thread to actually exit.
-        startLingeringWatcher();
-        // Bounded by the same deadline, and the watchdog exits on its own because `closed` is set and the
-        // scan is terminal: this join is only here so a healthy scan's close() leaves no thread behind.
-        joinWatched(scan == null ? null : scan.watchdog, deadline);
-        releaseGateIfDrained();
+        // A stubborn worker can outlive this bounded close. Its generation reaper remains alive and owns the
+        // eventual gate release; closeState() scans every coordinator-owned generation, so neither the worker
+        // nor the reaper can disappear from repository shutdown accounting before physical termination.
     }
 
     // ------------------------------------------------------------------ the scan
@@ -572,25 +590,15 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
                     cancelInternal(scan);
                 }
                 // A BOUNDED WAIT, not a release: if a worker is still alive when this expires, the scan
-                // stays draining with its gate latched and the lingering watcher below releases it on that
-                // worker's real exit. The return value is no longer discarded - it decides whether anyone
-                // else must wait for a thread this supervisor can no longer join.
+                // stays draining with its gate latched; the generation reaper opens it only after that
+                // worker's Java thread has actually terminated.
                 joinWorkers(workers, System.nanoTime() + DRAIN_GRACE.toNanos());
             }
             finishScan(scan, results, scan.startNanos, null);
         } finally {
-            // Runs on EVERY exit - normal return, each early `return null` of visitFrozenItemTypes (a
-            // cancelled scan, a closed context, a failed frozen list, a failed or null anchor read) and an
-            // Error - and the ORDER below is what makes the gate's release correct:
-            //
-            //   1. this thread stops being tracked, so it is one thread fewer that must be dead;
-            //   2. `complete` stops the watchdog, and `sealed` records that no worker can ever be started
-            //      for this scan again, which is what turns "no tracked thread is alive" into a proof;
-            //   3. only then is the release attempted, so a supervisor that is the LAST thread of its scan
-            //      releases the gate itself. Attempting it before sealing is precisely how the gate was left
-            //      latched forever on the ordinary fast paths.
-            deregisterThread(Thread.currentThread());
-            signalScanProgressed();
+            // A scan thread may declare itself logically complete, but it may NEVER prove its own physical
+            // death. Its OwnedThread entry therefore stays registered until an outside observer sees
+            // Thread.isAlive()==false. This closes the Goal 03A self-deregister-before-return race.
             if (scan.watchdog != null) {
                 scan.watchdog.interrupt();
             }
@@ -603,10 +611,13 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             }
             scan.complete = true;
             scan.sealed = true;
-            releaseGateIfDrained();
-            // Only a worker that is STILL alive needs watching; when there is none, this releases the gate
-            // (a no-op if the call above already did) and spawns no thread at all.
-            startLingeringWatcher();
+            signalScanProgressed();
+            signalGenerationChanged(scan);
+
+            // Test-only deterministic barrier: this is deliberately the supervisor's LAST action. While it
+            // is blocked here the Java thread is still physically alive, so the generation reaper MUST keep
+            // the gate latched even though the terminal phase and sealed flag are already final.
+            beforeSupervisorReturn.run();
         }
     }
 
@@ -665,13 +676,9 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             Thread.currentThread().interrupt();
         } finally {
             stateLock.unlock();
-            // This thread is tracked like every other thread of the scan, so it must take part in the
-            // release exactly like every other one: it is frequently the LAST thread left, because the
-            // supervisor's exit can precede it by one tick. Deregistering and then attempting the release -
-            // the same two steps the workers and the supervisor take - is what lets the gate open in that
-            // case instead of staying latched with nothing alive to justify it.
-            deregisterThread(Thread.currentThread());
-            releaseGateIfDrained();
+            // Keep this generation-owned reference intact until the Java thread is physically dead. The
+            // reaper is the observer that decides that fact; this thread cannot decide it about itself.
+            signalGenerationChanged(scan);
         }
         // The deadline is decided from the CLOCK, not from how this thread was woken and not from the
         // cancellation signal. Testing the signal here is how the deadline became unobservable: the
@@ -764,7 +771,7 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             for (int i = 0; i < workerCount; i++) {
                 Thread worker = new Thread(
                         () -> workerLoop(scan, frozen, windows, slots, index),
-                        THREAD_NAME_PREFIX + repositoryId + "-" + i);
+                        THREAD_NAME_PREFIX + repositoryId + "-" + scan.scanId + "-worker-" + i);
                 worker.setDaemon(true);
                 // Tracked by the batch, which registers each worker BEFORE it is started and refuses to
                 // register one at all once the scan is sealed: see WorkerBatch for why both halves matter.
@@ -818,17 +825,11 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
         try {
             workLoop(scan, frozen, windows, slots, index);
         } finally {
-            // This thread stops being a worker of this scan here. It is ONE of the threads that may release
-            // the gate, and using the same method every other exit path uses is what makes "released exactly
-            // once" structural: the release is a compare-and-set plus an emptiness check, so when several
-            // threads exit at once exactly one of them acts and none of them can act twice.
-            //
-            // This is the path that matters for a supervisor that was interrupted or died: a worker that
-            // outlives it still releases the gate when it finally exits, so the coordinator cannot be left
-            // latched forever with no thread left to unlatch it.
-            deregisterThread(Thread.currentThread());
+            // Do not self-deregister: the worker is still Thread.isAlive()==true until this method actually
+            // returns. Its generation reaper observes that physical death from outside before opening the
+            // one-scan gate.
             signalScanProgressed();
-            releaseGateIfDrained();
+            signalGenerationChanged(scan);
         }
     }
 
@@ -887,10 +888,9 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
     /**
      * Decides the outcome and, in exactly one case, publishes ONE new immutable snapshot.
      *
-     * <p>It deliberately does NOT release the one-scan gate and does NOT clear the tracked threads: a
-     * terminal outcome decides publication and status, and proves nothing about whether the scan's threads
-     * have stopped. Both of those happen in {@link #releaseGateIfDrained()}, when the last thread of this
-     * scan has actually exited.</p>
+     * <p>It deliberately does NOT release the one-scan gate and does NOT clear tracked ownership: a
+     * terminal outcome decides publication and status, and proves nothing about physical thread death. The
+     * generation reaper opens the gate only after every worker/supervisor/watchdog of this scan is dead.</p>
      *
      * @param crash an exception the coordinator itself threw, or {@code null}
      */
@@ -957,155 +957,110 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
     }
 
     /**
-     * Releases the one-scan gate when - and only when - this scan has no tracked thread left alive.
+     * One observer per scan generation. It is the only normal-path owner of gate release.
      *
-     * <p>The structural owner of "exactly once": {@link AtomicBoolean#compareAndSet} lets exactly one caller
-     * past, and that caller is the one that also clears the tracked references, holding {@link #threadsLock}
-     * so the emptiness check and the clear are one critical section. The tracked references are therefore
-     * never cleared while any tracked scan thread is alive, and the gate is never released twice.</p>
-     *
-     * <p>It is called by every scan thread on its way out (a worker's {@code finally}, the supervisor's
-     * {@code finally}) and by the lingering watcher while a worker that ignored cancellation stays alive. It
-     * is cheap when there is nothing to do.</p>
-     *
-     * @return true when this call released the gate
+     * <p>The observer never treats logical completion or self-deregistration as physical death. It waits
+     * until the generation is sealed, no worker batch is mid-registration, and every other thread belonging
+     * to this exact generation reports {@link Thread#isAlive()} == false. Because it never consults a later
+     * generation's thread collection, old cleanup cannot watch, interrupt or clear a new scan.</p>
      */
-    private boolean releaseGateIfDrained() {
-        synchronized (threadsLock) {
-            ActiveScan scan = active.get();
-            if (scan != null && !scan.sealed) {
-                // Something of this scan - the supervisor running the anchor read above all - may yet start
-                // a worker, so an empty tracked set is not proof that this scan is over. The supervisor sets
-                // the fact from its own finally on EVERY exit path and calls this again there.
-                return false;
+    private void reaperLoop(ActiveScan scan) {
+        Thread self = Thread.currentThread();
+        while (true) {
+            if (releaseGateAfterPhysicalDeath(scan, self)) {
+                return; // no shared-state action after release; a later generation may start immediately
             }
-            if (workerBatchesOpen > 0) {
-                // A worker batch is being started right now. The worker that will exist in a moment is not
-                // in the tracked set yet, so neither is its absent liveness evidence.
-                return false;
-            }
-            for (Thread thread : threads) {
-                if (thread.isAlive()) {
-                    // Something of this scan is still running, so the gate stays latched and every tracked
-                    // reference stays exactly where it is. A new scan cannot start.
-                    return false;
+            synchronized (scan.threadLock) {
+                try {
+                    scan.threadLock.wait(WATCHDOG_TICK_MILLIS);
+                } catch (InterruptedException interrupted) {
+                    // Closing/cancellation must not kill the observer before it proves physical death.
+                    // Clear the interrupt and keep observing this generation.
+                    Thread.interrupted();
                 }
             }
-            if (!scanInFlight.compareAndSet(true, false)) {
-                // Already released, or no scan ever ran: idempotent by construction, so a release can
-                // never happen twice even when several threads call this at once.
-                return false;
-            }
-            // Only DEAD references are dropped. Nothing can be alive here - that is what the check above
-            // proved - so this cannot clear a live scan thread's reference, and the invariant "never clear a
-            // tracked reference while its thread is alive" holds by construction rather than by review.
-            threads.removeIf(thread -> !thread.isAlive());
-            lingeringWatcher = null;
-            stateLock.lock();
-            try {
-                scanFinished.signalAll();
-            } finally {
-                stateLock.unlock();
-            }
-            return true;
         }
     }
 
     /**
-     * Ensures a watcher exists while a scan thread that ignored cancellation and interruption stays alive,
-     * so the gate is released by that thread's real exit rather than by a bound.
-     *
-     * <p>At most ONE per scan and none when nothing is lingering, which keeps the peak at one extra daemon
-     * thread. Its lifetime is exactly the lingering window: it returns as soon as the gate is released or
-     * the coordinator is closed. It is never the thing that decides a phase or publishes anything - it only
-     * waits, and calls the same idempotent release path every other thread calls.</p>
+     * Releases this scan generation's gate only after an OUTSIDE observer proves every non-observer thread
+     * of that generation is physically dead.
      */
-    private void startLingeringWatcher() {
-        synchronized (threadsLock) {
-            if (lingeringWatcher != null) {
-                return;
+    private boolean releaseGateAfterPhysicalDeath(ActiveScan scan, Thread observer) {
+        synchronized (scan.threadLock) {
+            if (!scan.sealed || scan.workerBatchesOpen > 0) {
+                return false;
             }
-            threads.removeIf(thread -> !thread.isAlive());
-            // Only SCAN WORK justifies a watcher. The watchdog is the deadline enforcer and exits on its own
-            // within one tick once the scan is complete, so treating it as "something is lingering" would
-            // spawn a watcher for every ordinary scan - a thread whose only job would be to wait for a thread
-            // that is already on its way out.
-            if (threads.stream().noneMatch(ScanCoordinator::isScanWorkThread)) {
-                // Nothing to watch: if the gate is somehow still latched, release it here rather than
-                // spawn a thread that would exit immediately.
-                releaseGateIfDrained();
-                return;
+            for (OwnedThread owned : scan.threads) {
+                Thread thread = owned.thread();
+                if (thread == observer) {
+                    continue;
+                }
+                if (thread.isAlive()) {
+                    return false;
+                }
             }
-            Thread watcher = new Thread(this::awaitLingeringThreads,
-                    THREAD_NAME_PREFIX + repositoryId + LINGERING_SUFFIX);
-            watcher.setDaemon(true);
-            lingeringWatcher = watcher;
-            threads.add(watcher);
-            watcher.start();
+            if (active.get() != scan || !scanInFlight.get()) {
+                return scan.gateReleased.get();
+            }
+            if (!scan.gateReleased.compareAndSet(false, true)) {
+                return true;
+            }
+            if (!scanInFlight.compareAndSet(true, false)) {
+                throw new IllegalStateException("scan generation gate ownership changed before release");
+            }
         }
-    }
 
-    /** The lingering watcher's body: wait for every OTHER tracked scan thread to die, then release. */
-    private void awaitLingeringThreads() {
-        Thread self = Thread.currentThread();
+        // From this point a later generation may start. Do not mutate active scan state, progress,
+        // cancellation or any generation-global collection: only wake callers waiting on the gate.
+        stateLock.lock();
         try {
-            while (true) {
-                if (!scanInFlight.get() || closed.get()) {
-                    // The gate is already released, or the coordinator is going away: either way there is
-                    // nothing left to wait for, and this thread must not outlive its scan.
-                    return;
-                }
-                boolean anyAlive = false;
-                synchronized (threadsLock) {
-                    for (Thread thread : threads) {
-                        // SELF IS SKIPPED. This thread is tracked like any other, so counting itself as
-                        // live scan work would make the loop wait for its own termination and never
-                        // release the gate - the "released never" failure mode, reached through the
-                        // normal hostile-worker path.
-                        if (thread != self && thread.isAlive()) {
-                            anyAlive = true;
-                            break;
-                        }
-                    }
-                    if (!anyAlive) {
-                        // No thread of this scan is left alive, so the gate can be released. The release
-                        // is the same idempotent compare-and-set every other exit path uses.
-                        break;
-                    }
-                    waitQuietly(threadsLock, WATCHDOG_TICK_MILLIS);
-                }
-            }
+            scanFinished.signalAll();
         } finally {
-            // Both the break and the early return land here: deregistering this thread BEFORE releasing is
-            // what lets the release see a genuinely empty tracked set, and doing it in a finally means no
-            // exit path can skip it.
-            deregisterThread(self);
-            releaseGateIfDrained();
+            stateLock.unlock();
+        }
+        return true;
+    }
+
+    /** Wakes the generation reaper after registration state or a thread's logical state changed. */
+    private static void signalGenerationChanged(ActiveScan scan) {
+        synchronized (scan.threadLock) {
+            scan.threadLock.notifyAll();
         }
     }
 
-    /** Bounded, interrupt-tolerant wait on a monitor: never blocks a caller that needs the monitor. */
-    private static void waitQuietly(Object monitor, long millis) {
-        try {
-            monitor.wait(Math.max(1L, millis));
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
+    /** Threads belonging to exactly one scan generation. */
+    private static List<OwnedThread> generationThreadsSnapshot(ActiveScan scan) {
+        synchronized (scan.threadLock) {
+            return List.copyOf(scan.threads);
         }
     }
 
-    /** Holds a bounded join of one coordinator thread, or returns immediately when it is absent or dead. */
-    private static void joinWatched(Thread thread, long deadlineNanos) {
-        if (thread == null || thread == Thread.currentThread() || !thread.isAlive()) {
+    /** Every coordinator-owned thread across generations, used only for context close accounting. */
+    private List<OwnedThread> allOwnedThreadsSnapshot() {
+        synchronized (threadsLock) {
+            return List.copyOf(ownedThreads);
+        }
+    }
+
+    /** Register before start, under both the generation identity and the coordinator lifetime identity. */
+    private void registerThread(ActiveScan scan, ThreadRole role, Thread thread) {
+        if (thread == null) {
             return;
         }
-        long remaining = deadlineNanos - System.nanoTime();
-        if (remaining <= 0L) {
-            return;
+        OwnedThread owned = new OwnedThread(scan.scanId, role, thread);
+        synchronized (scan.threadLock) {
+            scan.threads.add(owned);
         }
-        try {
-            thread.join(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining)));
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
+        synchronized (threadsLock) {
+            ownedThreads.add(owned);
+        }
+    }
+
+    /** Prunes only references whose Java thread is already observably dead. */
+    private void pruneDeadOwnedThreads() {
+        synchronized (threadsLock) {
+            ownedThreads.removeIf(owned -> !owned.thread().isAlive());
         }
     }
 
@@ -1117,18 +1072,6 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
         } finally {
             stateLock.unlock();
         }
-    }
-
-    /**
-     * True for a thread that performs the scan's work: its supervisor or one of its workers.
-     *
-     * <p>The watchdog and the lingering watcher are the coordinator's own bookkeeping threads; they are
-     * tracked so that {@code close()} can join them and so that the gate's emptiness check waits for them to
-     * finish, but they are not the scan's work and must never be reported as such.</p>
-     */
-    private static boolean isScanWorkThread(Thread thread) {
-        String name = thread.getName();
-        return !name.contains(WATCHDOG_SUFFIX) && !name.contains(LINGERING_SUFFIX);
     }
 
     private void recordCompletion(ItemTypeStatistics result) {
@@ -1153,11 +1096,16 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
     private void cancelInternal(ActiveScan scan) {
         scan.cancellation.cancel();
         Thread current = Thread.currentThread();
-        for (Thread thread : threadsSnapshot()) {
+        for (OwnedThread owned : generationThreadsSnapshot(scan)) {
+            if (owned.role() == ThreadRole.REAPER) {
+                continue; // the physical-death observer must survive cancellation and close
+            }
+            Thread thread = owned.thread();
             if (thread != current) {
                 thread.interrupt();
             }
         }
+        signalGenerationChanged(scan);
     }
 
     /** Joins every worker, up to the given absolute deadline. Returns true when one is still alive. */
@@ -1181,31 +1129,12 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
         return alive;
     }
 
-    private void registerThread(Thread thread) {
-        synchronized (threadsLock) {
-            threads.add(thread);
-        }
-    }
-
     /**
-     * Tracks and starts one batch of scan workers, holding a guard that makes the "no worker can appear after
-     * the gate could open" invariant CHECKED rather than merely intended.
+     * Tracks and starts one generation's worker batch without opening a registration gap.
      *
-     * <p>Two things have to be true together, and they are the two halves of the same window:</p>
-     *
-     * <ul>
-     *   <li>each worker is registered BEFORE it is started, so it is already tracked as work of this scan
-     *       during the instant between the two. Leaving that instant untracked would let the gate open while
-     *       a worker was about to run;</li>
-     *   <li>the guard is held for the whole batch, and {@link #releaseGateIfDrained()} refuses while any
-     *       such guard is open. Without it the gate could be released between two registrations - when every
-     *       registered thread happened to have exited and the next one did not exist yet - which is the same
-     *       overlap reached one worker earlier.</li>
-     * </ul>
-     *
-     * <p>Registering after the scan is sealed throws: at that point an empty tracked set is what releases the
-     * gate, so a worker registered afterwards could be dispatched while a new scan was already starting. A
-     * future edit that adds such a registration should break loudly rather than reintroduce the overlap.</p>
+     * <p>The batch counter and the generation thread list live on {@link ActiveScan}; neither can be
+     * overwritten by a later scan. Every worker is recorded as {@link ThreadRole#WORKER} before start, and
+     * the reaper refuses gate release while a batch is open.</p>
      */
     private final class WorkerBatch implements AutoCloseable {
 
@@ -1216,22 +1145,22 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
         private WorkerBatch(ActiveScan scan, List<Thread> published) {
             this.scan = scan;
             this.published = published;
-            synchronized (threadsLock) {
+            synchronized (scan.threadLock) {
                 if (scan.sealed) {
                     throw new IllegalStateException("a worker batch was opened after the scan was sealed: the"
                             + " one-scan gate could have been released while a worker was starting");
                 }
-                workerBatchesOpen++;
+                scan.workerBatchesOpen++;
             }
         }
 
         private void start(Thread worker) {
-            synchronized (threadsLock) {
+            synchronized (scan.threadLock) {
                 if (scan.sealed) {
                     throw new IllegalStateException("a scan worker was registered after the scan was sealed:"
                             + " the one-scan gate could have been released while this worker was starting");
                 }
-                threads.add(worker);
+                registerThread(scan, ThreadRole.WORKER, worker);
                 started.add(worker);
             }
             worker.start();
@@ -1239,26 +1168,11 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
 
         @Override
         public void close() {
-            synchronized (threadsLock) {
-                workerBatchesOpen--;
+            synchronized (scan.threadLock) {
+                scan.workerBatchesOpen--;
                 published.addAll(started);
+                scan.threadLock.notifyAll();
             }
-        }
-    }
-
-    private void deregisterThread(Thread thread) {
-        if (thread == null) {
-            return;
-        }
-        synchronized (threadsLock) {
-            threads.remove(thread);
-            threadsLock.notifyAll();
-        }
-    }
-
-    private List<Thread> threadsSnapshot() {
-        synchronized (threadsLock) {
-            return List.copyOf(threads);
         }
     }
 
@@ -1291,11 +1205,28 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
         return "ScanCoordinator[repository=" + repositoryId + ", " + progress() + "]";
     }
 
-    /** The mutable state of one scan, visible only to that scan's threads. */
+    /** Role is explicit so generation-local cancellation and physical-death proof never rely on names. */
+    private enum ThreadRole {
+        REAPER,
+        WATCHDOG,
+        SUPERVISOR,
+        WORKER
+    }
+
+    /** One immutable ownership record: a Java thread can belong to exactly one scan generation and role. */
+    private record OwnedThread(long scanId, ThreadRole role, Thread thread) {
+    }
+
+    /** The mutable state of one scan, visible only to that scan's threads and its reaper. */
     private static final class ActiveScan {
 
         private final long scanId;
         private final ScanCancellationImpl cancellation = new ScanCancellationImpl();
+        /** Generation-local ownership. No later scan ever reuses or clears this collection. */
+        private final Object threadLock = new Object();
+        private final List<OwnedThread> threads = new ArrayList<>();
+        private final AtomicBoolean gateReleased = new AtomicBoolean();
+        private int workerBatchesOpen;
         /** When this scan started, from the monitor's clock; the snapshot's duration is measured from it. */
         private final long startNanos;
         /** THE absolute deadline of this scan, from the monitor's clock. Owned here, enforced once. */
@@ -1322,11 +1253,14 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
          * context, a failed frozen list, a failed or null anchor read) and an {@link Error}. That is
          * deliberate: a per-path marker would release the gate on today's paths and latch it forever on the
          * first new one, and "released never" bricks repository switching just as badly as "released too
-         * early" overlaps two scans. Note that sealing does NOT release the gate by itself - the gate still
-         * opens only when the tracked-thread set is empty, and the supervisor deregisters itself in the same
-         * {@code finally} before sealing.</p>
+         * early" overlaps two scans. Sealing does NOT release the gate by itself: the generation reaper must
+         * still observe every non-reaper Java thread as physically dead.</p>
          */
         private volatile boolean sealed;
+        /** The dedicated observer that proves this generation's other threads physically dead. */
+        private volatile Thread reaper;
+        /** The supervisor is retained as generation identity until its Java thread really terminates. */
+        private volatile Thread supervisor;
         /** The deadline watchdog of this scan; registered with the scan's threads and tracked for close(). */
         private volatile Thread watchdog;
         /** True once the outcome has been decided; also the watchdog's reason to stop. */

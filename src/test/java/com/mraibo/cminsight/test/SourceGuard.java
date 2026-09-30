@@ -81,9 +81,6 @@ final class SourceGuard {
     static final String ANALYTICS_LITERAL_EXEMPT_RELATIVE =
             "src/main/java/com/mraibo/cminsight/db/SqlAdmission.java";
 
-    /** The basename form of the exemption, which is what a scan compares against. */
-    static final String ANALYTICS_LITERAL_EXEMPT_FILENAME = "SqlAdmission.java";
-
     /** The one file allowed to mention a {@code com.ibm} type under {@code src/main/java}. */
     static final String ISOLATION_ALLOWED_RELATIVE =
             "src/main/java/com/mraibo/cminsight/connection/CmSession.java";
@@ -232,16 +229,24 @@ final class SourceGuard {
                     + "|EXEC|EXECUTE|SAVEPOINT|FINAL|OLD|NEW";
 
     /**
-     * True when this file is the one file exempt from the analytics STATEMENT-LITERAL rules, by basename so
-     * a scan of a copied tree sees the same answer.
+     * True only when {@code file} is the exact repository-relative path exempt from the analytics
+     * STATEMENT-LITERAL rules.
      *
-     * <p>The exemption covers the literal rules and NOTHING ELSE: the JDBC call rules still apply to this
-     * file, which is what stops the exemption from being a hole. The control
-     * {@link AnalyticsSourceReadOnlyGuardTest#aPlantCombiningTheExemptVocabularyWithARealWriteIsStillRefused}
-     * plants a call into a copy of the exempt file and requires the scanner to report it.
+     * <p>The path comparison is deliberate: comparing only the basename would also exempt a later
+     * {@code statistics/review/SqlAdmission.java} (or any other same-named sibling), silently widening the
+     * rule. The exemption covers the literal rules and NOTHING ELSE; JDBC call rules still scan this file.
      */
-    static boolean isAnalyticsLiteralExempt(Path file) {
-        return file != null && ANALYTICS_LITERAL_EXEMPT_FILENAME.equals(file.getFileName().toString());
+    static boolean isAnalyticsLiteralExempt(Path root, Path file) {
+        if (root == null || file == null) {
+            return false;
+        }
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        Path normalizedFile = file.toAbsolutePath().normalize();
+        if (!normalizedFile.startsWith(normalizedRoot)) {
+            return false;
+        }
+        String relative = normalizedRoot.relativize(normalizedFile).toString().replace('\\', '/');
+        return ANALYTICS_LITERAL_EXEMPT_RELATIVE.equals(relative);
     }
 
     /**

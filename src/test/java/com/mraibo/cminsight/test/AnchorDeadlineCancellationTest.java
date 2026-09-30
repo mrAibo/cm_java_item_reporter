@@ -244,6 +244,157 @@ public class AnchorDeadlineCancellationTest {
         }
     }
 
+    /**
+     * Real production anchor path: JdbcStatisticsEngine -> hard-bounded pool -> JdbcSession ->
+     * PreparedStatement.executeQuery(). Only the DB current-date statement is executed because the frozen
+     * ItemType list in these tests is empty.
+     */
+    private static ProductionAnchor productionAnchor(FakeJdbc fake, int queryTimeoutSeconds) {
+        String id = "anchorprod";
+        com.mraibo.cminsight.config.RepositoryProfile profile = TestSupport.profile(id);
+        String envId = id.toUpperCase(java.util.Locale.ROOT);
+        com.mraibo.cminsight.config.SecretResolver secrets =
+                new com.mraibo.cminsight.config.SecretResolver(java.util.Map.of(
+                        "JDBC_" + envId + "_USER", "jdbc-user",
+                        "JDBC_" + envId + "_PASSWORD", "jdbc-password"), null);
+        com.mraibo.cminsight.db.JdbcSessionFactory factory =
+                new com.mraibo.cminsight.db.JdbcSessionFactory(profile, secrets, queryTimeoutSeconds);
+        com.mraibo.cminsight.connection.BoundedPool<com.mraibo.cminsight.db.JdbcSession> pool =
+                factory.lazyPool("anchor-production", 1, Duration.ofSeconds(5), null, 0);
+        com.mraibo.cminsight.statistics.JdbcStatisticsEngine engine =
+                new com.mraibo.cminsight.statistics.JdbcStatisticsEngine(
+                        new com.mraibo.cminsight.db.Db2Dialect(), "ICMADMIN", pool, factory);
+        return new ProductionAnchor(pool, engine);
+    }
+
+    private record ProductionAnchor(
+            com.mraibo.cminsight.connection.BoundedPool<com.mraibo.cminsight.db.JdbcSession> pool,
+            com.mraibo.cminsight.statistics.JdbcStatisticsEngine engine) implements AutoCloseable {
+        @Override
+        public void close() {
+            pool.close();
+        }
+    }
+
+    private static long currentDateExecutions(FakeJdbc fake) {
+        return fake.executedSql().stream()
+                .filter(sql -> sql != null && sql.contains("SYSIBM.SYSDUMMY1"))
+                .count();
+    }
+
+    /** The real JdbcStatisticsEngine anchor registration is cancelled by the overall scan deadline. */
+    public void productionJdbcAnchorDeadlineInvokesThatPreparedStatementsCancelExactlyOnce() throws Exception {
+        FakeJdbc.loadVendorDriverClass(FakeJdbc.DB2_DRIVER_CLASS);
+        try (FakeJdbc fake = FakeJdbc.register("jdbc:db2:")) {
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            fake.answersSqlContaining("SYSIBM.SYSDUMMY1",
+                    FakeResultTable.oneRow(List.of("D"), LocalDate.of(2024, 6, 15)));
+            fake.gateQueries(entered, release);
+
+            try (ProductionAnchor production = productionAnchor(fake, 60)) {
+                StatisticsSettings realSettings =
+                        new StatisticsSettings(true, 1, Duration.ofSeconds(60), Duration.ofSeconds(1));
+                ScanCoordinator coordinator = new ScanCoordinator(realSettings, REPOSITORY, List::of,
+                        production.engine());
+                try {
+                    Assert.assertEquals(ScanStartResult.STARTED, coordinator.requestScan(), "the scan starts");
+                    Assert.assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS),
+                            "the real DB-current-date PreparedStatement must be executing");
+                    Assert.assertEquals(1L, currentDateExecutions(fake), "one and only one anchor was issued");
+                    Assert.assertEquals(List.of(60), fake.queryTimeouts(),
+                            "the statement cap is 60s while the overall scan deadline is only 1s");
+
+                    Assert.assertTrue(awaitCondition(() -> fake.cancelCalls() == 1, WAIT),
+                            "the overall deadline must invoke Statement.cancel() on that exact prepared anchor");
+                    Assert.assertTrue(awaitCondition(
+                                    () -> coordinator.progress().phase() == ScanStatus.Phase.TIMED_OUT, WAIT),
+                            "the scan policy reports TIMED_OUT, not a per-query timeout or cancellation");
+                    Assert.assertTrue(coordinator.snapshot().isEmpty(),
+                            "a timed-out anchor scan cannot publish a snapshot");
+
+                    release.countDown();
+                    Assert.assertTrue(coordinator.awaitScanCompletion(WAIT), "physical anchor work drains");
+                    Assert.assertEquals(1, fake.cancelCalls(), "Statement.cancel() is invoked exactly once");
+                    Assert.assertEquals(1L, currentDateExecutions(fake),
+                            "there is no second anchor retry, fallback query or JVM-date substitute");
+                } finally {
+                    release.countDown();
+                    coordinator.close();
+                }
+            }
+        }
+    }
+
+    /** Explicit user cancellation reaches the same real JdbcStatisticsEngine anchor statement. */
+    public void productionJdbcAnchorExplicitCancelInvokesTheSameStatementsCancel() throws Exception {
+        FakeJdbc.loadVendorDriverClass(FakeJdbc.DB2_DRIVER_CLASS);
+        try (FakeJdbc fake = FakeJdbc.register("jdbc:db2:")) {
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            fake.answersSqlContaining("SYSIBM.SYSDUMMY1",
+                    FakeResultTable.oneRow(List.of("D"), LocalDate.of(2024, 6, 15)));
+            fake.gateQueries(entered, release);
+
+            try (ProductionAnchor production = productionAnchor(fake, 60)) {
+                ScanCoordinator coordinator = new ScanCoordinator(
+                        new StatisticsSettings(true, 1, Duration.ofSeconds(60), Duration.ofSeconds(30)),
+                        REPOSITORY, List::of, production.engine());
+                try {
+                    Assert.assertEquals(ScanStartResult.STARTED, coordinator.requestScan(), "the scan starts");
+                    Assert.assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS),
+                            "the real anchor statement is executing before cancellation");
+                    Assert.assertTrue(coordinator.cancelScan(), "explicit cancellation is accepted");
+                    Assert.assertTrue(awaitCondition(() -> fake.cancelCalls() == 1, WAIT),
+                            "explicit cancellation invokes that prepared statement's cancel()");
+                    release.countDown();
+                    Assert.assertTrue(coordinator.awaitScanCompletion(WAIT), "the cancelled anchor drains");
+                    Assert.assertEquals(ScanStatus.Phase.CANCELLED, coordinator.progress().phase(),
+                            "explicit cancellation remains CANCELLED, never TIMED_OUT");
+                    Assert.assertEquals(1L, currentDateExecutions(fake), "the anchor was executed exactly once");
+                    Assert.assertTrue(coordinator.snapshot().isEmpty(), "a cancelled anchor publishes nothing");
+                } finally {
+                    release.countDown();
+                    coordinator.close();
+                }
+            }
+        }
+    }
+
+    /** Repository/context close reaches the same real prepared anchor statement before returning. */
+    public void productionJdbcAnchorContextCloseInvokesTheSameStatementsCancel() throws Exception {
+        FakeJdbc.loadVendorDriverClass(FakeJdbc.DB2_DRIVER_CLASS);
+        try (FakeJdbc fake = FakeJdbc.register("jdbc:db2:")) {
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            fake.answersSqlContaining("SYSIBM.SYSDUMMY1",
+                    FakeResultTable.oneRow(List.of("D"), LocalDate.of(2024, 6, 15)));
+            fake.gateQueries(entered, release);
+
+            try (ProductionAnchor production = productionAnchor(fake, 60)) {
+                ScanCoordinator coordinator = new ScanCoordinator(
+                        new StatisticsSettings(true, 1, Duration.ofSeconds(60), Duration.ofSeconds(30)),
+                        REPOSITORY, List::of, production.engine());
+                try {
+                    Assert.assertEquals(ScanStartResult.STARTED, coordinator.requestScan(), "the scan starts");
+                    Assert.assertTrue(entered.await(WAIT.toMillis(), TimeUnit.MILLISECONDS),
+                            "the real anchor statement is executing before context close");
+                    coordinator.close();
+                    Assert.assertEquals(1, fake.cancelCalls(),
+                            "context close invokes Statement.cancel() through the same anchor registration");
+                    Assert.assertTrue(coordinator.awaitScanCompletion(WAIT), "close drains the anchor generation");
+                    Assert.assertEquals(ScanStatus.Phase.CANCELLED, coordinator.progress().phase(),
+                            "context close is a cancellation, not a timeout");
+                    Assert.assertEquals(1L, currentDateExecutions(fake), "the anchor was executed exactly once");
+                    Assert.assertTrue(coordinator.snapshot().isEmpty(), "context close publishes nothing");
+                } finally {
+                    release.countDown();
+                    coordinator.close();
+                }
+            }
+        }
+    }
+
     // ================================================================== the deadline path
 
     /**

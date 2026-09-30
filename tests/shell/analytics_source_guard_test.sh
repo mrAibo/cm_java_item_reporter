@@ -178,6 +178,17 @@ new_mirror() {
     'final class Probe {' \
     '  String currentDate() { return "SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1"; }' \
     '}' > "$(db_file "${dir}")"
+  # Every mirror carries the ONE canonical literal-exempt path. The guard now treats a missing target as
+  # a stale exemption and fails closed, so mutation cases that are about another rule must not accidentally
+  # fail merely because their scratch repository omitted this contract file.
+  printf '%s\n' \
+    'package com.mraibo.cminsight.db;' \
+    '' \
+    '/** Scratch fixture: canonical literal-vocabulary exemption; call rules still scan this file. */' \
+    'final class SqlAdmission {' \
+    '  private SqlAdmission() { }' \
+    '}' > "${dir}/${PRIMARY_REL}/SqlAdmission.java"
+
   printf '%s\n' \
     'package com.mraibo.cminsight.statistics;' \
     '' \
@@ -519,6 +530,54 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Case 2b: the literal exemption is EXACT-PATH and LITERAL-ONLY.
+# ---------------------------------------------------------------------------
+for sibling_rel in \
+  "${SECONDARY_REL}/review/SqlAdmission.java" \
+  "${PRIMARY_REL}/review/SqlAdmission.java"; do
+  new_mirror
+  T2B="${MIRROR}"
+  mkdir -p "$(dirname -- "${T2B}/${sibling_rel}")"
+  printf '%s\n' \
+    'package review;' \
+    'final class SqlAdmission {' \
+    '  String sql() { return "DELETE FROM ICMUT00001001"; }' \
+    '}' > "${T2B}/${sibling_rel}"
+  TREE="${T2B}"
+  run_guard
+  assert_refused "same-basename sibling gets NO literal exemption (${sibling_rel})" nonzero \
+    "${T2B}/${sibling_rel}" 'Goal 03 analytics read-only violation'
+done
+
+# The canonical file may skip its own vocabulary literals, but JDBC call rules still scan it.
+new_mirror
+T2C="${MIRROR}"
+canonical_rel="${PRIMARY_REL}/SqlAdmission.java"
+plant "${T2C}" "${canonical_rel}" \
+  'void write(java.sql.Statement statement) throws Exception { statement.executeUpdate("DELETE FROM X"); }'
+TREE="${T2C}"
+run_guard
+assert_refused "canonical exempt path still refuses a real JDBC write call" nonzero \
+  "${T2C}/${canonical_rel}" 'Goal 03 analytics read-only violation'
+
+# Conversely, the canonical path really is exempt from the literal-vocabulary sub-rule.
+new_mirror
+T2D="${MIRROR}"
+plant "${T2D}" "${canonical_rel}" 'String vocabulary() { return "DELETE FROM X"; }'
+TREE="${T2D}"
+run_guard
+assert_accepted "canonical exact path alone may carry the forbidden vocabulary it defines"
+
+# A rename/removal makes the exemption stale and is a failure, never an implicit pass.
+new_mirror
+T2E="${MIRROR}"
+rm -f "${T2E}/${canonical_rel}"
+TREE="${T2E}"
+run_guard
+assert_refused "removing the canonical literal-exempt path fails closed" nonzero \
+  "${canonical_rel}" 'stale analytics literal exemption'
+
+# ---------------------------------------------------------------------------
 # Case 3: a missing analytics tree is a LAYOUT failure, never a clean result.
 # ---------------------------------------------------------------------------
 new_mirror
@@ -533,7 +592,7 @@ assert_refused "a missing ${PRIMARY_REL}" nonzero "${T3}/${PRIMARY_REL}" 'nothin
 # ---------------------------------------------------------------------------
 new_mirror
 T4="${MIRROR}"
-rm -f "$(db_file "${T4}")"
+find "${T4}/${PRIMARY_REL}" -type f -name '*.java' -delete
 TREE="${T4}"
 run_guard
 assert_refused "an empty ${PRIMARY_REL}" nonzero "${T4}/${PRIMARY_REL}" 'contains no .java file'

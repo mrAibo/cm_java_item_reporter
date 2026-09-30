@@ -147,12 +147,11 @@ PRIMARY_REL='src/main/java/com/mraibo/cminsight/db'
 # call added there is exactly as fatal as one added in db/.
 SECONDARY_RELS=('src/main/java/com/mraibo/cminsight/statistics')
 
-# The ONE exempt file, named by path rather than by a loosened pattern. It is the
-# admission rule itself: its string literals ARE the forbidden vocabulary, so the rule
-# that refuses a literal containing `DELETE` must not fire on the list that defines
-# `DELETE`. Its basenames form is what grep --exclude takes.
+# The ONE exempt file, named by its exact repository-relative path rather than by
+# basename or pattern. It is the admission rule itself: its string literals ARE the
+# forbidden vocabulary, so only the statement-literal sub-rule may skip this exact file.
+# JDBC call rules NEVER use this exemption.
 EXEMPT_RELS=('src/main/java/com/mraibo/cminsight/db/SqlAdmission.java')
-EXEMPT_BASENAMES=('SqlAdmission.java')
 
 # ---------------------------------------------------------------------------
 # The forbidden JDBC write/control calls.
@@ -270,19 +269,51 @@ PRIMARY_DIR="${ROOT}/${PRIMARY_REL}"
 violations=0
 scanned_files=0
 
+# Validate the exemption contract globally, once. A missing canonical target is a stale
+# exemption and therefore a guard failure; it must never degrade into "nothing matched".
+for exempt_rel in "${EXEMPT_RELS[@]}"; do
+  if [ ! -f "${ROOT}/${exempt_rel}" ]; then
+    printf 'ERROR: stale analytics literal exemption: expected exact path %s\n' "${exempt_rel}" >&2
+    violations=$((violations + 1))
+  else
+    printf 'OK: %s is the exact literal-vocabulary exemption; JDBC call rules still scan it\n' "${exempt_rel}"
+  fi
+done
+
 report_violations() {
   # report_violations <label> <pattern> <directory>
+  # Call/control rules scan EVERY file, including the canonical SqlAdmission.java.
   local label="$1" pattern="$2" directory="$3" line
-  local -a excludes=()
-  local basename_exempt
-  for basename_exempt in "${EXEMPT_BASENAMES[@]}"; do
-    excludes+=(--exclude="${basename_exempt}")
-  done
   while IFS= read -r line; do
     [ -n "${line}" ] || continue
     printf 'ERROR: %s: %s\n' "${label}" "${line}" >&2
     violations=$((violations + 1))
-  done < <(grep -REn --include='*.java' "${excludes[@]}" "(${pattern})" "${directory}" 2>/dev/null || true)
+  done < <(grep -REn --include='*.java' "(${pattern})" "${directory}" 2>/dev/null || true)
+}
+
+is_literal_exempt() {
+  # is_literal_exempt <absolute-file>
+  local file="$1" relative="${file#"${ROOT}/"}" exempt_rel
+  for exempt_rel in "${EXEMPT_RELS[@]}"; do
+    [ "${relative}" = "${exempt_rel}" ] && return 0
+  done
+  return 1
+}
+
+report_literal_violations() {
+  # report_literal_violations <label> <pattern> <directory>
+  # The literal-vocabulary exemption is exact-path-only; same-basename siblings are scanned.
+  local label="$1" pattern="$2" directory="$3" file line
+  while IFS= read -r -d '' file; do
+    if is_literal_exempt "${file}"; then
+      continue
+    fi
+    while IFS= read -r line; do
+      [ -n "${line}" ] || continue
+      printf 'ERROR: %s: %s:%s\n' "${label}" "${file}" "${line}" >&2
+      violations=$((violations + 1))
+    done < <(grep -En "(${pattern})" "${file}" 2>/dev/null || true)
+  done < <(find "${directory}" -type f -name '*.java' -print0 2>/dev/null)
 }
 
 scan_tree() {
@@ -307,39 +338,23 @@ scan_tree() {
   fi
   scanned_files=$((scanned_files + count))
 
-  # The named exemptions, checked one by one. A path, never a pattern: the exempt file
-  # is the vocabulary table itself (see the header), and the committed test asserts that
-  # it exists and that the same rule still bites in every other file. A missing exempt
-  # file is reported rather than ignored: a stale exemption must not be able to hide it.
-  local exempt_rel exempt_file found_exempt=0
-  for exempt_rel in "${EXEMPT_RELS[@]}"; do
-    exempt_file="${ROOT}/${exempt_rel}"
-    if [ -f "${exempt_file}" ]; then
-      found_exempt=1
-      printf 'OK: %s is exempt (it declares the forbidden vocabulary itself, so refusing its own literals would be a false positive)\n' "${exempt_rel}"
-    else
-      printf 'note: the exempt file %s is absent; the exemption is stale\n' "${exempt_rel}"
-    fi
-  done
-  [ "${found_exempt}" -gt 0 ] || printf 'note: %s holds no exempt file\n' "${rel}"
-
   local pattern
   for pattern in "${FORBIDDEN_CALL_PATTERNS[@]}"; do
     report_violations "forbidden JDBC write/control call under ${rel}" "${pattern}" "${directory}"
   done
-  report_violations "statement literal carries a write/control keyword after a quote under ${rel}" \
+  report_literal_violations "statement literal carries a write/control keyword after a quote under ${rel}" \
     "${SQL_VERB_AFTER_QUOTE_PATTERN}" "${directory}"
-  report_violations "statement literal carries a write/control keyword inside parentheses under ${rel}" \
+  report_literal_violations "statement literal carries a write/control keyword inside parentheses under ${rel}" \
     "${SQL_VERB_IN_PARENS_PATTERN}" "${directory}"
-  report_violations "statement literal carries a write/control keyword after a separator under ${rel}" \
+  report_literal_violations "statement literal carries a write/control keyword after a separator under ${rel}" \
     "${SQL_VERB_AFTER_SEPARATOR_PATTERN}" "${directory}"
-  report_violations "statement literal carries a statement separator followed by another statement under ${rel}" \
+  report_literal_violations "statement literal carries a statement separator followed by another statement under ${rel}" \
     "${SEPARATOR_PATTERN}" "${directory}"
-  report_violations "statement literal carries an SQL comment form under ${rel}" \
+  report_literal_violations "statement literal carries an SQL comment form under ${rel}" \
     "${COMMENT_PATTERN}" "${directory}"
-  report_violations "text block begins with a write/control SQL keyword under ${rel}" \
+  report_literal_violations "text block begins with a write/control SQL keyword under ${rel}" \
     "${TEXT_BLOCK_KEYWORD_PATTERN}" "${directory}"
-  report_violations "stored-procedure CALL escape under ${rel}" \
+  report_literal_violations "stored-procedure CALL escape under ${rel}" \
     "${JDBC_CALL_ESCAPE_PATTERN}" "${directory}"
   return 0
 }

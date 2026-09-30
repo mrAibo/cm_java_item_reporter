@@ -211,9 +211,9 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         + " refuses: the source guard and the runtime rule have drifted apart");
 
         // And the exemption is declared on the shell side exactly as it is on this side, in both directions.
-        Assert.assertTrue(text.contains(SourceGuard.ANALYTICS_LITERAL_EXEMPT_FILENAME),
-                "the committed guard must declare the same single literal exemption this suite applies ("
-                        + SourceGuard.ANALYTICS_LITERAL_EXEMPT_FILENAME + "), or the two guards disagree about"
+        Assert.assertTrue(text.contains(SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE),
+                "the committed guard must declare the same exact-path literal exemption this suite applies ("
+                        + SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE + "), or the two guards disagree about"
                         + " which file the keyword-literal rule covers");
     }
 
@@ -450,11 +450,15 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         + " not exist: the exemption is stale, or the file moved and the exemption now covers"
                         + " nothing while the guard reports a clean tree");
 
-        // And the exemption is applied by NAME, so a copied tree answers the same question.
-        Assert.assertTrue(SourceGuard.isAnalyticsLiteralExempt(exempt),
-                "the exemption must recognise the path it names");
-        Assert.assertFalse(SourceGuard.isAnalyticsLiteralExempt(exempt.resolveSibling("SqlIdentifiers.java")),
+        Path root = repositoryRoot();
+        Assert.assertTrue(SourceGuard.isAnalyticsLiteralExempt(root, exempt),
+                "the exemption must recognise the exact repository-relative path it names");
+        Assert.assertFalse(SourceGuard.isAnalyticsLiteralExempt(root,
+                        exempt.resolveSibling("SqlIdentifiers.java")),
                 "and must not recognise any other file in the same package");
+        Assert.assertFalse(SourceGuard.isAnalyticsLiteralExempt(root,
+                        root.resolve("src/main/java/com/mraibo/cminsight/statistics/review/SqlAdmission.java")),
+                "and a same-basename sibling in another analytics package must not inherit the exemption");
     }
 
     /**
@@ -491,6 +495,42 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         + " the admission layer could acquire a write path");
         Assert.assertTrue(violations.stream().anyMatch(entry -> entry.contains("SqlAdmission.java")),
                 "and the refusal must name the exempt file, so the finding is actionable. Found: " + violations);
+    }
+
+    /**
+     * Same-basename siblings receive NO exemption: only the canonical repository-relative path is exempt.
+     */
+    public void sameBasenameSiblingsAreNotExemptFromLiteralRules() throws IOException {
+        for (String relative : List.of(
+                "src/main/java/com/mraibo/cminsight/statistics/review/SqlAdmission.java",
+                "src/main/java/com/mraibo/cminsight/db/review/SqlAdmission.java")) {
+            Path copy = copyAnalyticsTree();
+            Path planted = copy.resolve(relative);
+            Files.createDirectories(planted.getParent());
+            Files.writeString(planted, """
+                    package review;
+                    final class SqlAdmission {
+                        String statement() { return "DELETE FROM ICMUT00001001"; }
+                    }
+                    """, StandardCharsets.UTF_8);
+
+            List<String> violations = findForbiddenWrites(copy);
+            Assert.assertTrue(violations.stream().anyMatch(entry -> entry.replace('\\', '/').contains(relative)),
+                    "a same-basename sibling must not inherit the canonical literal exemption: " + relative
+                            + "; found " + violations);
+        }
+    }
+
+    /** A missing canonical exempt path is a stale contract and must fail the Java guard loudly. */
+    public void removingTheCanonicalLiteralExemptPathFailsTheGuard() throws IOException {
+        Path copy = copyAnalyticsTree();
+        Path exempt = copy.resolve(SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE);
+        Assert.assertTrue(Files.deleteIfExists(exempt), "the copied canonical exempt file must exist");
+        AssertionError failure = Assert.assertThrows(AssertionError.class,
+                () -> findForbiddenWrites(copy),
+                "a stale exact-path exemption must fail instead of silently covering nothing");
+        Assert.assertTrue(failure.getMessage().contains(SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE),
+                "the stale-exemption failure must name the exact path: " + failure.getMessage());
     }
 
     /**
@@ -680,7 +720,8 @@ public class AnalyticsSourceReadOnlyGuardTest {
      * exemption the rule forbids its own enforcement mechanism and the guard could not pass at all.
      *
      * <p>The exemption deliberately does NOT skip the JDBC call rules for that file, and it is keyed on the
-     * file's NAME so a copied tree gets the same answer. So a file that carries both the exempt vocabulary
+     * exact repository-relative PATH so a copied tree gets the same answer without exempting same-named
+     * siblings. So a file that carries both the exempt vocabulary
      * and a real offending construct is still refused - which is the control
      * {@link #aPlantCombiningTheExemptVocabularyWithARealWriteIsStillRefused} proves, because an exemption
      * implemented by skipping the whole file would pass a weaker test and hide a real hole.
@@ -688,6 +729,11 @@ public class AnalyticsSourceReadOnlyGuardTest {
      * @param root the tree to scan, which may be a temporary copy
      */
     private static List<String> findForbiddenWrites(Path root) {
+        Path exempt = root.resolve(SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE);
+        Assert.assertTrue(Files.isRegularFile(exempt),
+                "the analytics literal exemption is stale: expected the exact path "
+                        + SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE + " under " + root
+                        + "; a missing exempt target is a guard failure, not a clean tree");
         Path jdbc = root.resolve(ANALYTICS_JDBC_SOURCE);
         Assert.assertTrue(Files.isDirectory(jdbc),
                 "the analytics read-only guard must scan " + jdbc + ", which does not exist. A missing source"
@@ -732,7 +778,7 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         "the JDBC stored-procedure CALL escape"));
 
                 // The literal rules, which the one documented file is exempt from.
-                if (SourceGuard.isAnalyticsLiteralExempt(file)) {
+                if (SourceGuard.isAnalyticsLiteralExempt(root, file)) {
                     continue;
                 }
                 for (Pattern pattern : FORBIDDEN_LITERAL_PATTERNS) {
