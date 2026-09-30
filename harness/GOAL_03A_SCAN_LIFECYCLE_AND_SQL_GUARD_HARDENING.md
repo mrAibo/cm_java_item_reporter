@@ -1,6 +1,10 @@
 # Goal 03A - Scan lifecycle and SQL read-only hardening
 
-**Status: APPROVED / EXECUTE**
+**Status: COMPLETED / PUSHED - AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
+
+Implementation commit: `7313176fa0b9b97d79516aadaaddada6dbea5a39`.
+Core 367 tests and IBM 51 tests green on the stub path; `--require-ibm` green against the real
+IBM CM 8.7 SDK. NO LIVE DB2/ORACLE SQL VALIDATION WAS PERFORMED - no database is reachable.
 
 This is a focused correction gate after the architecture review of Goal 03.
 

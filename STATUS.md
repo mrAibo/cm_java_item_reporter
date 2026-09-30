@@ -20,10 +20,298 @@
 - Goal 03 implementation commit: `1a52f908741005e82b4bf12eac17aab7373fb489`
 - Goal 03 CI fix commit (the commit this section describes): `dc24dbb31b51619719416cf7da2b51b506cc6cb8`
 - Goal 03 final reviewed remote HEAD: `1dcd8f30b20cf57b2abfb688cc12b1e710e4ef6a`
-- Stage: **Goal 03 REVIEWED; Goal 03A scan-lifecycle/SQL-guard hardening APPROVED**
-- Current approved goal: `harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md`
-- Goal 03: COMPLETED / REVIEWED — CORRECTIONS REQUIRED
-- Goal 03A: APPROVED / EXECUTE
+- Goal 03A reviewed checkpoint (the review that approved this goal): `023b47552169d9ac35058461ae07d7788a9fdafb`
+- Goal 03A implementation commit (the commit this section describes): `7313176fa0b9b97d79516aadaaddada6dbea5a39`
+- Stage: **Goal 03A EXECUTED, PUSHED; Actions verified below**
+- Current approved goal: `harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md` (executed)
+- Goal 03: accepted apart from the four corrections this goal closed
+- Goal 03A: COMPLETED / PENDING ARCHITECTURE REVIEW
+- Goals 04-05: PROVISIONAL; do not execute
+
+## Goal 03A execution record
+
+Date/time: end of the Goal 03A execution session (local time). Branch:
+`bootstrap/cm-insight-architecture`. **PR #1 remains OPEN, draft, unmerged.**
+
+Checkpoint protocol: a commit cannot truthfully record its own SHA, and this file
+changes the tree, so the commit above is the implementation commit this section
+describes. The authoritative head is read from Git, and the handoff report records the
+exact local and verified remote HEAD after this documentation commit has been pushed.
+
+### A. The one-scan gate is latched until every worker is dead
+
+**The defect:** the reviewed code computed a second `joinWorkers` result and
+**discarded it**, then cleared `scanInFlight` and the tracked-thread list
+unconditionally. A worker that ignored cancellation past the drain grace therefore lost
+both the gate and its thread reference, and a later scan could start while it still held
+a JDBC lease. A deadline or a cancel decides **publication and status**; it never proved
+physical execution had ended.
+
+**The fix is structural, not argued:** one `AtomicBoolean` owner plus a CAS on the gate,
+taken only when the scan is **sealed** (no worker can be registered again), no worker
+batch is mid-start, and **every tracked thread is dead** - with the emptiness test and
+the reference clear in one critical section, and only dead references ever pruned. The
+last thread to exit releases the gate, whichever it is: a worker's own `finally`, the
+supervisor's, or the per-scan watchdog. The no-close lingering case is covered, which is
+the case that was broken.
+
+**Three defects surfaced while hardening this**, each found by a deterministic probe
+rather than by reading the diff, and the deepest was a **regression of the ordinary
+path**:
+
+1. The lingering watcher counted **itself** as live scan work, so it could never observe
+   an empty set. A monitor must not be a member of the set it monitors. This wedged the
+   coordinator for **any** scan whose worker lingered.
+2. The supervisor attempted release **before sealing itself**, so when it was the last
+   thread its only attempt was refused and the gate latched for ever.
+3. The watchdog read its own deadline-triggered cancel as an **external** stop, so it
+   never recorded `TIMED_OUT` at all - which is why abort actions ran while the phase
+   stayed `RUNNING`.
+
+The combined result was a coordinator that could never let go: `requestScan()` refused
+permanently and `close()` reported `CLOSING` permanently, which `RepositoryManager` maps
+to a permanent `Refusal.PENDING` - **repository switching bricked until JVM restart**.
+That is strictly worse than the defect being fixed, so it is recorded plainly: section
+A's cure briefly became more dangerous than its disease. It also regressed nine
+previously-green Goal 03 assertions, so it was a happy-path regression and not an edge
+case.
+
+**Draining is a separate readable fact:** `isDraining()` and `lingeringScanThreadCount()`
+beside `isScanInFlight()`, with **no new Phase value** and no new `ScanStartResult` value,
+so existing exhaustive switches still compile and a reader can distinguish "the result is
+final" from "physical work is still running" - the distinction the phase-only model could
+not express.
+
+**Coordinator close state:** it implements `CloseStateAware` - `NOT_CLOSED` before close,
+`CLOSING` while a scan thread lives, `CLOSED_CLEAN` only once all are dead, and
+deliberately **never** `CLOSED_UNCERTAIN` for a merely slow thread. That last point is
+load-bearing rather than pedantic: `CLOSED_UNCERTAIN` is permanent and would brick
+switching, while `CLOSING` is recoverable `Refusal.PENDING`. No new registration path was
+needed; the coordinator is already registered after the pool, and reverse close order
+already closes it first.
+
+### B. The overall scan deadline now governs the anchor query
+
+**The defect:** `databaseCurrentDate()` took no cancellation input at all and ran before
+any worker existed, so neither the overall deadline nor an explicit cancel could reach its
+`Statement.cancel()`.
+
+**The fix:** `databaseCurrentDate(ScanCancellation)` registers its abort action through the
+**same** `ScanCancellation` as an ItemType query, so the deadline, an explicit cancel and a
+context close all reach it. One **absolute** deadline from `statistics.scan.timeout.seconds`
+is enforced by **one bounded daemon watchdog per active scan** - no executor, no queue -
+which exits on the first of deadline, cancel/close, or supervisor-complete, the last
+signalled from a `finally` so it cannot outlive its scan even on an `Error` path. **No path
+reads `statistics.query.timeout.seconds`**; that remains only the JDBC layer's
+per-statement cap. The goal's required configuration - per-query cap **larger** than the
+scan deadline - is verified to still let the scan deadline win. The anchor is still read
+**exactly once**, from the database, with no JVM date and no invented boundary. If the
+driver ignores cancellation, section A applies: the scan stays draining and blocks a new
+scan rather than pretending it finished.
+
+### C. `currentSchema()` health verdict
+
+**The defect:** it rethrew `SQLException` without marking anything, so the lease return
+handed the poisoned physical connection to the next query.
+
+**The rule now:** exactly **one** benign case - `SQLFeatureNotSupportedException`, or the
+documented feature-not-supported SQLState `0A000` - meaning the driver cannot report
+schema, where the operation is refused and the connection **may** stay reusable. **Any
+other** `SQLException` or unexpected runtime driver failure marks the session unusable
+**before** the sanitized failure propagates. The sanitized shape keeps the operation label
+plus SQLState and vendor code and never the raw message:
+`JDBC operation 'read current schema' failed (SQLState=08006, vendorCode=1234)`. The old
+javadoc was **narrowed rather than deleted**, so the capability reasoning survives for the
+case it is true of and the next reader cannot merge the two catches back into one.
+
+**The assertion that actually discriminates:** through a real pool, a subsequent borrow
+receives a **different physical connection** (`sameInstance=false`, physical opens 1→2),
+with an opposite control showing the pre-fix class fails that exact test. `isHealthy` was
+not touched and still measures **zero driver calls over 1000 answers**.
+
+### D. Strengthened SQL read-only boundary
+
+**The defect:** `requireSelect` was a prefix test - it `stripLeading()`ed and region-matched
+the first 4-6 characters against `SELECT`/`WITH`, so anything starting that way was
+admitted. That is not a structural proof, because a data-changing construct can be nested
+inside a `SELECT`/`WITH` shape.
+
+**The rule now:** `SqlAdmission` admits only the narrow language this application generates
+- one statement, no comments, no quoted region, begins with `SELECT` or `WITH`, and no
+write/control keyword as a **whole token**. It is token-aware, not substring-based, so
+`UPDATED_AT`, `DELETED_FLAG` and `CREATE_TS` are ordinary identifiers and are admitted -
+and the false-positive controls assert exactly that, because a rule that refused real
+column names would be weakened by whoever hit it.
+
+**Refused:** `SELECT * FROM FINAL TABLE (DELETE FROM ...)`, a DML token inside a CTE,
+`SELECT ...; DELETE ...`, and a comment-obfuscated token, plus `INSERT`, `UPDATE`,
+`DELETE`, `MERGE`, `TRUNCATE`, `CREATE`, `ALTER`, `DROP`, `GRANT`, `REVOKE`, `CALL`,
+`BEGIN`, `EXEC`/`EXECUTE`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and the data-change-table
+vocabulary `FINAL`/`OLD`/`NEW`. **Accepted:** all nine approved production statement
+families, taken from the real dialects rather than hand-copied.
+
+**The generic escape hatch is closed:** production analytics needs no
+`execute(`/`createStatement(` - the only driver path is `prepareStatement` then
+`executeQuery` - verified by grep and now forbidden in the committed guard, with a control
+that each declared pattern still matches a realistic call and is genuinely refused.
+
+**The literal rule was reviewed and found walkable before it shipped**, which is the most
+valuable thing in this section. It recognised only a bare apostrophe opener, so a literal
+introduced by a vendor **prefixed** form (`N'...'`, `X'...'`, `B'...'`, `q'[...]'`) was not
+seen as a literal - and because the tokenizer skips quoted regions, the write verb inside it
+was not seen as a token either. `SELECT 1 AS A FROM T WHERE ID = N'DELETE FROM Y'` would
+have been **admitted**. The rule now refuses **any quote character**, which is the honest
+narrowing rather than a bet that a prefix list is complete: generated analytics SQL contains
+no literal and no quoted identifier, so every form refused is a form this application
+cannot emit.
+
+### Also fixed en route, all found by running rather than reading
+
+- **The analytics read-only guard was not a build-time control.** Goal 03A section F lists
+  it as one, but only the shell suite invoked it, so a tree violating the rule still
+  produced a **green `./build.sh`**. `build.sh` now runs it on the same footing as the IBM
+  guard, before the toolchain is resolved, as a hard failure. Proven with a planted write:
+  **exit 2** naming the file and the rule, and green again once removed.
+- **The shell guard and its Java twin had diverged again** - the second time in this
+  project. The shell guard exempted the file that declares the forbidden vocabulary while
+  the Java twin refused it, so one rule was enforced two ways and only one build failed.
+  The Java twin now carries the **same single path-scoped exemption**, applied to the
+  keyword-literal rules only and **never** the call rules, and its honesty is asserted in
+  both directions: the exempt file must **exist**, and a file combining the exempt
+  vocabulary with a real `.executeUpdate(` is **still refused and named**. The two guards'
+  agreement is now asserted from both sides so changing one cannot silently leave the
+  other behind.
+- **An undefined character class.** The guard used `[^A-Za-z0-9_]`, whose `Z-a` is not an
+  ascending range and therefore has **undefined** meaning in POSIX. It is now the
+  well-defined `[^[:alnum:]_]`. Worth recording that the owner **measured** the causal claim
+  rather than accepting mine: reverting only that class did **not** restore the failures,
+  because what actually fixed them was the rule's shape - so the class change is
+  portability hardening, not the cure, and the test says so. The real lesson is the new
+  per-rule **sensitivity control**: every statement-literal rule now has a known-bad sample
+  it must refuse **and** a known-good sample it must accept, so a pattern that silently
+  matches nothing - indistinguishable from a clean tree - can no longer be declared.
+- **Two latent defects in the guard test** were fixed by its owner: a stale variable in the
+  text-block control, and a method-name extraction that had degenerated into searching for
+  a method called `"("`.
+
+### Frozen semantics preserved
+
+Logical item = **distinct `ItemID`**; per-segment `SELECT DISTINCT` with cross-segment
+dedup; every expected root segment 1..N verified with a **missing middle segment failing
+the ItemType**; creation windows from the immutable `ItemID` date; **one** database anchor
+per scan; total stays `AVAILABLE` when date windows are unrepresentable; **Versions and
+Parts remain `UNAVAILABLE`**; an ItemType failure stays distinguishable from a genuine
+zero; a completed partial-failure scan may publish with coverage while
+timeout/cancel/catastrophic scans publish **nothing** and the previous snapshot stays
+visible; JDBC remains optional to CM activation with no eager `initialize` and no ad-hoc
+connection; and no raw `SQLException`, SQL, JDBC URL or credential leaks.
+
+**Core safety surfaces are untouched.** `BoundedPool`, `CreationFailure`, `ResourceFactory`,
+`RepositoryManager` and `CloseState` are **byte-identical** to the reviewed checkpoint
+`023b475`, so the Goal 01C latch and the Goal 02B create/health contract were not weakened
+to make scan cleanup easier.
+
+### Tests actually executed, with results
+
+**Stub path**, solo runs on a quiet tree (this matters - see the risk below): `./build.sh`
+**exit 0**, core **"Tests run: 367, failures: 0"**, IBM **"Tests run: 51, failures: 0"**, jar
+packaged; `./tests/selftest.sh` **exit 0** with the same counts; `./tests/shell/run.sh`
+**exit 0**, all five suites; `./bin/doctor.sh` **exit 0** (0 failures, 15 warnings);
+`./build.sh --check-ibm-isolation` **exit 0**; `bash tests/shell/analytics_guard.sh`
+**exit 0**; `bash tests/shell/analytics_source_guard_test.sh` **exit 0**, **"checks: 88,
+failures: 0"**.
+
+**Real IBM CM 8.7 SDK, reported separately:** `./build.sh --require-ibm` **exit 0** with the
+real jars staged (4 jars, then removed), compiling **17 adapter and 12 test sources** and
+running the full IBM suite **51/0 on that real-SDK class path**.
+
+**Independent verification of the integrated result: PASS, 13/13 criteria, no product
+defect**, by a verifier that wrote none of it and pinned the revision into a pristine
+`git archive` extract plus its own 123-check adversarial harness. It reproduced the hostile
+worker keeping the gate latched (close state `CLOSING`, explicitly **not**
+`CLOSED_UNCERTAIN`), exactly one release transition to `CLOSED_CLEAN` with zero threads
+leaked, the anchor cancel action **observed invoked** at 1007 ms with a 60 s per-query cap
+against a 1 s scan deadline, `TIMED_OUT` with no new snapshot and `CANCELLED` on explicit
+cancel, the different-physical-connection identity assertion, 36 write/obfuscation shapes
+refused with 11 legitimate reads and all 12 real production statements accepted, and 18/18
+compared core files byte-identical to the checkpoint. Its mutation control is the strongest
+evidence in this goal: neutralising the aliveness test in `releaseGateIfDrained()` makes its
+section A fail 8 checks **and** the authors' `ScanGateLatchTest` fail 2.
+
+### Live DB2/Oracle status - honest
+
+**NO LIVE DB2/ORACLE SQL VALIDATION WAS PERFORMED.** No DB2 or Oracle CM database is
+reachable from the execution host, no comparison against a trusted source was run, and
+nothing here is presented as live SQL evidence. A driver JAR being loadable is not live
+database validation.
+
+### GitHub Actions - both events, same SHA
+
+| Commit | push run | pull_request run |
+| --- | --- | --- |
+| `7313176` (implementation) | `36648124366` | `36648128810` |
+
+Both runs were **in progress** when this record was written, and are reported as such rather
+than assumed either way. The handoff report states their final conclusions, and the previous
+goal's precedent is that a red run is diagnosed and repaired before the goal is called done.
+
+### Unresolved risks
+
+1. **No live DB2/Oracle SQL validation** - still the largest gap, and unchanged by this goal.
+2. **`build.sh` is not concurrency-safe on this host.** `flock` is unavailable in the MSYS
+   shell, so a second `build.sh` deletes and recreates `build/` under a running suite. This
+   produced `NoClassDefFoundError` for nested test classes **and** for main classes in
+   repeated runs during this goal, and cost several cycles before it was recognised as an
+   environment property rather than a defect. **Every count above was measured solo.**
+3. **`SqlAdmission` may be broader than strictly required** - it also refuses every whole
+   token `OLD`/`NEW`/`FINAL` and every quoted region. Verified not to refuse any production
+   statement, but it is a narrowing beyond the literal mandate.
+4. **The `requireSelect` prefix weakness is only fixed for generated SQL.** The admission
+   rule is a lexical refusal layer for one known-good generator, explicitly **not** a DB2 or
+   Oracle parser, so a hand-written statement crafted to pass the lexical rule would not be
+   caught by it - which is why the committed source guard and the SELECT-only account
+   privileges remain part of the defence.
+5. **A driver that ignores `Statement.cancel()` leaves the scan draining.** That is the
+   intended conservative behaviour, but it means one uncooperative driver can refuse new
+   scans until its query returns.
+6. **Concurrent builds remain undetectable on this host** (same root cause as 2), so a
+   verifier must work in a private copy or wait for a quiet tree.
+7. **The IBM SDK needs its own logging configuration** (unchanged from Goal 02B).
+8. **`StatisticsAvailability`'s static `available()` factory is unreferenceable** because the
+   record accessor shadows it - cosmetic, reported by the api member in Goal 03.
+
+### Architecture decisions and goal state
+
+No architecture rule was changed. Goal 03A **made one implicit rule explicit** (release the
+scan gate only when physical work has ended, and publish that fact as draining), **brought
+one operation inside an existing policy** (the anchor query into the scan deadline and
+cancellation domain), **narrowed one permissive path** (`getSchema` now retires except for a
+single documented capability case), **replaced one prefix test with a lexical admission
+rule** for generated SQL, and **promoted one guard to a build-time control**.
+
+**Next goal: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 04 or
+Goal 05. Do not merge PR #1.
+
+### Resume / review instruction
+
+"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
+Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
+DATA_MODEL.md, harness/MASTER_GOAL.md and harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md
+completely. Goals 01 through 01C are accepted; Goal 02 was reviewed with changes required; Goals 02A
+and 02B are accepted; Goal 03 is accepted apart from the four corrections Goal 03A closed; Goal 03A is
+executed and pushed. REVIEW Goal 03A before approving anything further - do not re-execute it and do
+not execute Goal 04 or Goal 05. Preserve the accepted optional-SDK/read-only/API architecture, the
+frozen distinct-ItemID counting semantics, the one-anchor-per-scan rule, the hard-bounded lazy JDBC
+pool with no connection outside its factory, the latched one-scan gate with its separate draining
+fact, and every Goal 01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Carry
+forward four facts: no live IBM CM validation and no live DB2/Oracle SQL validation has been
+performed because neither a CM server nor a database is reachable from the execution host; this
+repository is developed on Windows where git does not record the executable bit, so validate on Linux
+with JDK 17 before trusting a CI-touching change; for the same reason a second build in one working
+tree cannot be detected on that host, so verify in a private copy and treat nested-class
+NoClassDefFoundError as a concurrency artifact to re-run solo; and the real IBM CM 8.7 SDK jars are a
+local prerequisite that must never be committed."
+
 - Goals 04-05: PROVISIONAL; do not execute
 
 ## Goal 03 external architecture review
@@ -153,7 +441,7 @@ read-only SQL is preferred to an incomplete permissive parser.
 ### Goal state after review
 
 - Goal 03: completed/reviewed; JDBC/SQL architecture accepted, correction required.
-- Goal 03A: **APPROVED / EXECUTE**.
+- Goal 03A: **COMPLETED / PENDING ARCHITECTURE REVIEW** (superseded; see the Goal 03A execution record at the top).
 - Goals 04-05: **PROVISIONAL / DO NOT EXECUTE**.
 
 ## Goal 03 execution record
@@ -1135,25 +1423,26 @@ make the unavailable-code semantics explicit and must not imply -1 came from IBM
 Review first:
 
 1. `harness/MASTER_GOAL.md`
-2. `harness/GOAL_03_FAST_ANALYTICS.md` and the Goal 03 execution record at the top of this file
+2. `harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md` and the Goal 03A execution record at the top of this file
 
 ## Resume instruction
 
 "Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
 Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
-DATA_MODEL.md, harness/MASTER_GOAL.md and harness/GOAL_03_FAST_ANALYTICS.md completely. Goals 01
-through 01C are accepted; Goal 02 was reviewed with changes required; Goals 02A and 02B are accepted;
-Goal 03 is executed, pushed and green on both Actions events for the same SHA. REVIEW Goal 03 before
-approving anything further - do not re-execute it and do not execute Goal 04 or Goal 05. Preserve the
-accepted optional-SDK/read-only/API architecture, the frozen distinct-ItemID counting semantics, the
-one-anchor-per-scan rule, the hard-bounded lazy JDBC pool with no connection outside its factory, and
-every Goal 01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Carry forward four
-facts: no live IBM CM validation and no live DB2/Oracle SQL validation has been performed because
-neither a CM server nor a database is reachable from the execution host; this repository is developed
-on Windows where git does not record the executable bit, so validate on Linux with JDK 17 before
-trusting a CI-touching change; for the same reason a second build in one working tree cannot be
-detected on that host, so verify in a private copy; and the real IBM CM 8.7 SDK jars are a local
-prerequisite that must never be committed."
+DATA_MODEL.md, harness/MASTER_GOAL.md and harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md
+completely. Goals 01 through 01C are accepted; Goal 02 was reviewed with changes required; Goals 02A
+and 02B are accepted; Goal 03 is accepted apart from the four corrections Goal 03A closed; Goal 03A is
+executed and pushed. REVIEW Goal 03A before approving anything further - do not re-execute it and do not
+execute Goal 04 or Goal 05. Preserve the accepted optional-SDK/read-only/API architecture, the frozen
+distinct-ItemID counting semantics, the one-anchor-per-scan rule, the hard-bounded lazy JDBC pool with no
+connection outside its factory, the latched one-scan gate with its separate draining fact, and every Goal
+01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Carry forward four facts: no live
+IBM CM validation and no live DB2/Oracle SQL validation has been performed because neither a CM server
+nor a database is reachable from the execution host; this repository is developed on Windows where git
+does not record the executable bit, so validate on Linux with JDK 17 before trusting a CI-touching change;
+for the same reason a second build in one working tree cannot be detected on that host, so verify in a
+private copy and treat nested-class NoClassDefFoundError as a concurrency artifact to re-run solo; and
+the real IBM CM 8.7 SDK jars are a local prerequisite that must never be committed."
 
 ## Mandatory checkpoint rule
 
