@@ -25,12 +25,80 @@
 - Goal 03A final execution/handoff HEAD: `b7d190a13178de894d44a7536a8e8b29526f19c7`
 - Goal 03B reviewed checkpoint (the review that approved this goal): `155379c38e9a3afdc090c4b9991aeaf7e1bf2059`
 - Goal 03B implementation commit: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`
-- Stage: **Goal 03B EXECUTED / PUSHED / GREEN — PENDING ARCHITECTURE REVIEW**
-- Current approved goal: none; **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
-- Goal 03: accepted analytics core; correction chain closed by Goal 03B implementation, pending review
-- Goal 03A: COMPLETED / REVIEWED — its three review findings are implemented in Goal 03B
-- Goal 03B: COMPLETED / PUSHED / GREEN — PENDING ARCHITECTURE REVIEW
-- Goals 04-05: PROVISIONAL; do not execute
+- Goal 03B final execution/handoff HEAD: `edab82f25e69af2a8170fb3130ec69f7314fb0c8`
+- Stage: **Goal 03B REVIEWED / ACCEPTED — GOAL 04 APPROVED / EXECUTE**
+- Current approved goal: `harness/GOAL_04_CACHE_REPORTS_UI.md`
+- Goal 03: accepted analytics core; its correction chain is closed by accepted Goal 03B
+- Goal 03A: COMPLETED / REVIEWED — corrections closed by accepted Goal 03B
+- Goal 03B: COMPLETED / REVIEWED / ACCEPTED
+- Goal 04: **APPROVED / EXECUTE**
+- Goal 05: PROVISIONAL / DO NOT EXECUTE
+
+## Goal 03B architecture review record
+
+Date: 2026-09-30. Branch: `bootstrap/cm-insight-architecture`.
+Reviewed implementation: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`.
+Reviewed execution/handoff HEAD: `edab82f25e69af2a8170fb3130ec69f7314fb0c8`.
+
+### Verdict
+
+**Goal 03B is ACCEPTED. No blocking product defect was found in the reviewed correction scope.**
+
+The three findings that caused Goal 03B are closed:
+
+1. Scan ownership is generation-scoped and the one-scan gate is released only by an
+   outside observer after every worker/supervisor/watchdog of that generation is
+   physically dead. Old-generation cleanup does not operate on a later generation.
+2. The production database-anchor path is covered by mutation-sensitive tests that drive
+   the real `JdbcStatisticsEngine -> JdbcSession -> PreparedStatement.cancel()` wiring
+   for deadline, explicit cancellation and context close.
+3. The analytics source-guard exemption is the exact repository-relative
+   `db/SqlAdmission.java` path, applies only to literal-vocabulary rules, does not exempt
+   JDBC write calls, and same-basename siblings receive no exemption.
+
+The accepted Goal 03/03A semantics remain unchanged: distinct ItemID, every segment 1..N,
+ItemID-based creation windows, one database anchor, hard-bounded lazy JDBC, no ad-hoc
+connection, Versions/Parts unavailable, atomic full-snapshot publication, and fail-closed
+Goal 01C/02B lifecycle/resource behavior.
+
+### Independent review validation on the final Goal 03B handoff tree
+
+The reviewer re-ran the required validation serially on the actual
+`edab82f25e69af2a8170fb3130ec69f7314fb0c8` working tree under WSL/OpenJDK
+**17.0.20.1**:
+
+- `./build.sh` — exit 0; core **375/0**, IBM stub **51/0**, jar packaged.
+- `./tests/selftest.sh` — exit 0; core **375/0**, IBM stub **51/0**.
+- `./tests/shell/run.sh` — exit 0; all **5** discovered shell suites passed.
+- `./bin/doctor.sh` — exit 0.
+- `./build.sh --check-ibm-isolation` — exit 0.
+- `bash tests/shell/analytics_guard.sh` — exit 0.
+- `bash tests/shell/analytics_source_guard_test.sh` — exit 0,
+  **93 checks / 0 failures**.
+
+The review run itself had no IBM SDK JARs in `lib/ibm`, so its IBM result is the
+committed-stub path. The Goal 03B execution record separately reports
+`./build.sh --require-ibm` green against the real IBM CM 8.7 SDK with IBM **51/0**.
+Those are separate evidence sets and are not conflated.
+
+**No live DB2/Oracle CM database validation was performed.** This remains the largest
+analytics evidence gap. No successful live IBM CM server validation was performed either.
+
+### Goal 04 architecture decision
+
+The old provisional Goal 04 draft was too broad to execute safely without making several
+implicit choices. It has therefore been rewritten into an explicit approved contract.
+
+The approved Goal 04 keeps the existing published full `StatisticsSnapshot` as the
+single in-memory statistics truth; uses the statistics TTL only as a freshness judgement;
+defines persistent aggregate history behind an application-local typed store; makes
+single-ItemType refresh a separate immutable detail result that cannot mutate full-scan
+totals/history; confines report generation to immutable snapshot/history input; specifies
+HTML/CSV/XLSX capability and output-injection/path controls; and preserves the accepted
+Goal 03B operation/lifecycle gate across full and targeted refreshes.
+
+**Next approved goal: `harness/GOAL_04_CACHE_REPORTS_UI.md` — APPROVED / EXECUTE.**
+Goal 05 remains PROVISIONAL / DO NOT EXECUTE. PR #1 must remain open/draft/unmerged.
 
 ## Goal 03B execution record
 

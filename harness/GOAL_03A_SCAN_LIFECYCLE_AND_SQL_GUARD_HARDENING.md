@@ -1,6 +1,6 @@
 # Goal 03A - Scan lifecycle and SQL read-only hardening
 
-**Status: COMPLETED / REVIEWED — CHANGES REQUIRED. DO NOT RE-EXECUTE; execute Goal 03B only.**
+**Status: COMPLETED / REVIEWED — CORRECTIONS CLOSED BY ACCEPTED GOAL 03B. DO NOT RE-EXECUTE.**
 
 Implementation commit: `7313176fa0b9b97d79516aadaaddada6dbea5a39`.
 Core 367 tests and IBM 51 tests green on the stub path; `--require-ibm` green against the real

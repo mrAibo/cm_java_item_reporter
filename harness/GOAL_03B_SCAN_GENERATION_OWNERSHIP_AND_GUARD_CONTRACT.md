@@ -1,11 +1,13 @@
 # Goal 03B - Scan generation ownership and guard-contract closure
 
-**Status: COMPLETED / PUSHED / GREEN — AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
+**Status: COMPLETED / REVIEWED / ACCEPTED. DO NOT RE-EXECUTE.**
 
 Implementation commit: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`.
 Implementation Actions: push `36711455135` success; pull_request `36711461832` success.
 Core 375 tests and IBM 51 tests are green on the stub path; the real IBM CM 8.7 SDK path is also green.
 NO LIVE DB2/ORACLE SQL VALIDATION WAS PERFORMED.
+
+Architecture review accepted Goal 03B against final execution/handoff HEAD `edab82f25e69af2a8170fb3130ec69f7314fb0c8`. The three review gaps are closed: generation-scoped physical-death gating, mutation-sensitive production anchor cancellation, and exact-path/literal-only analytics-guard exemption. Goal 04 is separately revised and approved; this goal must not be re-executed.
 
 This is a narrow correction gate after the architecture review of Goal 03A.
 
@@ -17,7 +19,8 @@ Reviewed Goal 03A implementation/final handoff:
 - pull_request Action `36648411573`: success
 
 Do NOT re-execute Goal 03 or Goal 03A wholesale.
-Do NOT execute Goal 04 or Goal 05.
+Goal 04 is now separately approved by the post-03B architecture review; do not execute it as part of Goal 03B.
+Do NOT execute Goal 05.
 Do NOT merge PR #1.
 
 Preserve the accepted Goal 03A corrections for:
