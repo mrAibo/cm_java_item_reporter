@@ -30,14 +30,26 @@
 #                         "MERGE INTO ...", "TRUNCATE TABLE ...", "DROP TABLE ..."
 #                         and "GRANT SELECT ..." literals are each refused, and
 #                         the JDBC `{call ...}` escape is refused too
+#   6b. the SELECT-WRAPPED WRITE (Goal 03A section D). A literal whose write token is NOT
+#                         the first word must be refused as well, because a prefix test
+#                         on SELECT/WITH is not a structural read-only proof. Planted, one
+#                         per fresh mirror: DB2's `SELECT * FROM FINAL TABLE (DELETE ...)`
+#                         data-change table reference; a CTE carrying DELETE, UPDATE and
+#                         INSERT tokens; a multi-statement `SELECT ...; DELETE ...`; a
+#                         line comment and a block comment hiding a token; and the
+#                         generic write-capable JDBC entry points `statement.execute(...)`,
+#                         `ps.execute()`, `createStatement()`, which production analytics
+#                         never needs and which the guard therefore forbids explicitly
 #   7. no false positives O ordinary java.util / wrapper operations, a getter whose
 #                         name merely RESEMBLES a forbidden call (updateCount,
 #                         commitCount, rollbackCount), an English sentence that
-#                         mentions commit, and ordinary SELECT literals are NOT
-#                         refused. This is the assertion that stops the next
-#                         person from "fixing" a false positive by deleting the
-#                         guard - and it is also what keeps the SQL-keyword rule
-#                         anchored on the opening quote
+#                         mentions commit, ordinary SELECT literals, and - the
+#                         assertion that proves the rule is TOKEN-aware rather than a
+#                         substring scan - UPDATED_AT / DELETED_FLAG / CREATE_TS, a
+#                         two-literal concatenation, and a `"a/b*c and 1--2"` string
+#                         that is not a SQL comment. This is the assertion that stops
+#                         the next person from "fixing" a false positive by deleting the
+#                         guard
 #   8. every pattern bites every call pattern the guard still DECLARES must still
 #                         be refused, read from the guard's own --list output, so
 #                         adding a pattern to the guard registers it here
@@ -259,8 +271,231 @@ while IFS= read -r pattern; do
 done < <(printf '%s\n' "${LIST_OUT}" \
          | awk '/^forbidden JDBC write\/control calls/ { inlist=1; next } /^forbidden statement literals/ { inlist=0 } inlist' \
          | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-         | grep -E '^[A-Za-z]' | LC_ALL=C sort -u)
+         | grep -E '^[^[:space:]#]' | LC_ALL=C sort -u)
 printf 'declared call patterns: %s\n' "${DECLARED_CALL_PATTERNS[*]}"
+
+# The declared STATEMENT-LITERAL patterns, read the same way. Case 1b below gives each of the
+# seven literal rules a known-bad and a known-good sample, and this count is the tripwire for
+# a NEW literal rule: adding one to the guard changes this number, so the control cannot stay
+# silent about a rule it does not cover.
+DECLARED_LITERAL_PATTERNS=()
+while IFS= read -r pattern; do
+  [ -n "${pattern}" ] || continue
+  DECLARED_LITERAL_PATTERNS+=("${pattern}")
+done < <(printf '%s\n' "${LIST_OUT}" \
+         | awk '/^forbidden statement literals/ { inlist=1; next } /^exempt files/ { inlist=0 } inlist' \
+         | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+         | grep -E '^[^[:space:]#]' | LC_ALL=C sort -u)
+printf 'declared literal patterns: %s\n' "${DECLARED_LITERAL_PATTERNS[*]}"
+if [ "${#DECLARED_LITERAL_PATTERNS[@]}" -eq 7 ]; then
+  pass "the guard declares ${#DECLARED_LITERAL_PATTERNS[@]} statement-literal patterns, each of which case 1b controls"
+else
+  bad "the guard declares ${#DECLARED_LITERAL_PATTERNS[@]} statement-literal pattern(s); case 1b controls exactly 7 (after a rule was added or removed, give the new rule a bad/good sample pair and update this count)"
+fi
+
+# The realistic call for each declared rule, keyed by the rule's own text so the pairing is
+# independent of the declaration ORDER (the guard's table is emitted sorted). Each entry is
+# `pattern@@realistic call line`, and the assertions in case 8 are made in both directions:
+# the pattern must match its line, and the guard must refuse and name that line.
+DECLARED_CALL_SAMPLES=(
+  'executeUpdate[[:space:]]*\(@@statement.executeUpdate("DELETE FROM ICMUT00001001");'
+  'executeLargeUpdate[[:space:]]*\(@@statement.executeLargeUpdate("DELETE FROM ICMUT00001001");'
+  'addBatch[[:space:]]*\(@@statement.addBatch("DELETE FROM ICMUT00001001");'
+  'executeBatch[[:space:]]*\(@@statement.executeBatch();'
+  'executeLargeBatch[[:space:]]*\(@@statement.executeLargeBatch();'
+  'commit[[:space:]]*\(@@connection.commit();'
+  'rollback[[:space:]]*\(@@connection.rollback();'
+  'setSavepoint[[:space:]]*\(@@connection.setSavepoint();'
+  'releaseSavepoint[[:space:]]*\(@@connection.releaseSavepoint();'
+  'prepareCall[[:space:]]*\(@@connection.prepareCall("{call DO_SOMETHING()}");'
+  '[^[:alnum:]_]execute[[:space:]]*\(@@statement.execute("SELECT 1 FROM ICMUT00001001");'
+  'createStatement[[:space:]]*\(@@connection.createStatement();'
+)
+# The write/control VOCABULARY the guard declares, read from the guard's own --list
+# output. Goal 03A section D requires the committed text guard and the runtime admission
+# rule to name the same vocabulary, so this test asserts the guard really declares the
+# whole set rather than merely that the file mentions one keyword. A keyword that vanished
+# from every pattern would vanish from this list and fail here.
+DECLARED_KEYWORDS="$(
+  printf '%s\n' "${LIST_OUT}" \
+    | awk '/^forbidden statement literals/ { inlist=1; next } /^exempt files/ { inlist=0 } inlist' \
+    | grep -oE '[A-Z]{3,}' | LC_ALL=C sort -u | tr '\n' ' '
+)"
+printf 'declared keyword vocabulary: %s\n' "${DECLARED_KEYWORDS}"
+for keyword in INSERT UPDATE DELETE MERGE TRUNCATE CREATE ALTER DROP GRANT REVOKE \
+               CALL BEGIN COMMIT ROLLBACK EXEC EXECUTE SAVEPOINT FINAL OLD NEW; do
+  case " ${DECLARED_KEYWORDS} " in
+    *" ${keyword} "*) : ;;
+    *) bad "the guard no longer declares ${keyword} in its statement-literal rules; the runtime admission rule and this guard would then disagree" ;;
+  esac
+done
+pass "the guard declares every write/control keyword the runtime admission rule names"
+
+# The same vocabulary read out of the RUNTIME rule's own source. Only literals that are a
+# bare upper-case word are taken, so prose and assertion text around the list cannot be
+# mistaken for vocabulary, and this comparison is what stops the two rules drifting apart
+# in the direction that matters: a runtime rule wider than the source guard.
+ADMISSION_KEYWORDS="$(
+  grep -oE '"[A-Z]{3,}"' "${ROOT}/src/main/java/com/mraibo/cminsight/db/SqlAdmission.java" \
+    | tr -d '"' | LC_ALL=C sort -u | tr '\n' ' '
+)"
+printf 'runtime admission vocabulary: %s\n' "${ADMISSION_KEYWORDS}"
+for keyword in ${ADMISSION_KEYWORDS}; do
+  case " ${DECLARED_KEYWORDS} " in
+    *" ${keyword} "*) : ;;
+    *) bad "SqlAdmission refuses ${keyword} but the committed guard does not name it; the runtime admission rule and the source guard have drifted apart" ;;
+  esac
+done
+pass "every keyword the runtime admission rule refuses is also a keyword this guard refuses"
+
+# The named exemption: a path, and one that exists. An exemption for a file that is not
+# there would be a hole a later rename could hide in.
+if printf '%s\n' "${LIST_OUT}" | grep -q -F 'exempt files'; then
+  pass "the guard declares its exempt files rather than leaving the exemption implicit"
+else
+  bad "the guard does not declare which file is exempt from its literal rules"
+fi
+if printf '%s\n' "${LIST_OUT}" | grep -q -F 'SqlAdmission.java'; then
+  pass "the declared exemption is the admission vocabulary table itself"
+else
+  bad "the guard's exempt list does not name SqlAdmission.java, so its own vocabulary literals would be refused"
+fi
+if [ -f "${ROOT}/src/main/java/com/mraibo/cminsight/db/SqlAdmission.java" ]; then
+  pass "the exempt file exists in the committed tree"
+else
+  bad "the exempt file src/main/java/com/mraibo/cminsight/db/SqlAdmission.java does not exist: the exemption is stale"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 1b: the STATEMENT-LITERAL patterns are SENSITIVE - each one matches a known-bad
+# sample, and none of them matches a known-good one.
+#
+# Why this case exists at all: a pattern that silently matches nothing is indistinguishable
+# from a clean tree, which is the one outcome a guard must never produce. That is not
+# hypothetical here. During Goal 03A's SQL hardening the statement-literal plants in cases
+# 6/6b failed six times in a row against a guard that still exited 0 on the committed tree,
+# and the literal rules had to be re-derived before they bit again. One contributing defect
+# was a negated class written with the explicit ASCII range: that class contains the
+# NON-ASCENDING range `Z-a`, whose meaning POSIX leaves undefined, so whether it matches a
+# separator character is a property of the grep build rather than of this repository. The
+# whole file now writes that class in its POSIX form, `[^[:alnum:]_]`, which has no range to
+# misread. Measured honestly: reverting only that class in a COPY of the guard did NOT make
+# the six plants pass again, so the class is recorded as a robustness fix rather than claimed
+# as the cure - a rule whose meaning depends on the host tool is still the class of defect this
+# project has paid for several times, and the sensitivity control below is what makes the next
+# one visible instead of silent.
+#
+# Each rule below is given BOTH a known-bad sample (the guard must refuse the file containing
+# it) and a known-good sample (the guard must accept that file). The bad half catches a rule
+# that matches nothing; the good half catches a rule loosened until it matches everything.
+# Both halves run against the guard itself, not a copy of its regex, and the table is keyed by
+# the rule's DECLARATION NAME so the control survives the pattern text being reworded. A rule
+# that loses its bad/good pair is reported rather than silently dropped, and the
+# declared-pattern count asserted above trips when a NEW literal rule is added without one.
+#
+# The sample table: one known-bad and one known-good sample per declaration NAME in the guard.
+# Keying on the name and resolving the name to the pattern the guard itself declares is what
+# keeps this control independent of the regex text: a pattern that is reworded keeps its
+# samples, and a sample stops being paired with its rule only if the DECLARATION disappears,
+# which is reported rather than ignored.
+#
+# Every declared literal pattern must appear here. A pattern added to the guard without a
+# sample WRONG-GUARDS this control, which is the safe direction: it fails loudly instead of
+# going unchecked.
+STATEMENT_RULE_BAD_SAMPLES=(
+  'SQL_VERB_AFTER_QUOTE@@    String sql() { return "DELETE FROM ICMUT00001001"; }'
+  'SQL_VERB_AFTER_QUOTE@@    String sql() { return "SELECT * FROM FINAL TABLE (DELETE FROM ICMUT00001001)"; }'
+  'SQL_VERB_IN_PARENS@@    String sql() { return "WITH D AS (DELETE FROM ICMUT00001001) SELECT COUNT(*) FROM D"; }'
+  'SQL_VERB_AFTER_SEPARATOR@@    String sql() { return "SELECT 1 FROM ICMUT00001001; DELETE FROM ICMUT00001001"; }'
+  'SEPARATOR@@    String sql() { return "SELECT 1 FROM X; DROP TABLE X"; }'
+  'COMMENT@@    String sql() { return "SELECT 1 FROM X -- DELETE FROM X"; }'
+  'COMMENT@@    String sql() { return "SELECT 1 FROM X /* DELETE */ WHERE 1 = 0"; }'
+  'TEXT_BLOCK_KEYWORD@@  String sql() { return """DELETE FROM ICMUT00001001"""; }'
+  'JDBC_CALL_ESCAPE@@void g() throws Exception { connection.prepareCall("{call P()}"); }'
+)
+STATEMENT_RULE_GOOD_SAMPLES=(
+  'SQL_VERB_AFTER_QUOTE@@    String sql() { return "SELECT UPDATED_AT, DELETED_FLAG, CREATE_TS FROM ICMUT00001001"; }'
+  'SQL_VERB_AFTER_QUOTE@@    String sql() { return "SELECT NEW_ITEM_ID, OLD_ITEM_ID, CREATED_TODAY FROM ICMUT00001001"; }'
+  'SQL_VERB_AFTER_QUOTE@@    String sql() { return "DELETE"; }'
+  'SQL_VERB_AFTER_QUOTE@@    String sql() { return "SELECT ItemID FROM ICMUT00001001 UNION SELECT ItemID FROM ICMUT00001002"; }'
+  'SQL_VERB_IN_PARENS@@    String sql() { return "SELECT COUNT(DISTINCT ITEMID) FROM ICMUT00001001"; }'
+  'SQL_VERB_AFTER_SEPARATOR@@    String sql() { return "ItemType 1 has no physical root table; every segment 1..N must be present"; }'
+  'SEPARATOR@@    String sql() { return "WITH LOGICAL_ITEMS AS (SELECT DISTINCT ITEMID FROM ICMUT00001001) SELECT COUNT(DISTINCT ITEMID) AS TOTAL_ITEMS FROM LOGICAL_ITEMS"; }'
+  'COMMENT@@    String sql() { return "a/b*c and 1--2 are not SQL comments"; }'
+  'TEXT_BLOCK_KEYWORD@@  String sql() { return """SELECT ITEMID FROM ICMUT00001001"""; }'
+  'JDBC_CALL_ESCAPE@@    String sql() { return "SELECT 1 FROM ICMUT00001001 WHERE 1 = 0"; }'
+)
+sensitive_rules=0
+insensitive_rules=0
+uncovered_rules=0
+for rule in SQL_VERB_AFTER_QUOTE SQL_VERB_IN_PARENS SQL_VERB_AFTER_SEPARATOR SEPARATOR COMMENT TEXT_BLOCK_KEYWORD JDBC_CALL_ESCAPE; do
+  # The guard must still DECLARE the rule, and declaring it must still produce a pattern the
+  # guard prints in --list. Without this the control could keep passing against a rule that
+  # was renamed away from under it.
+  declared_name="${rule}_PATTERN"
+  if ! grep -q -E "^${declared_name}=" "${GUARD}"; then
+    bad "the guard no longer declares ${declared_name}, so this sensitivity control has lost its subject"
+    continue
+  fi
+
+  bad_samples=()
+  good_samples=()
+  for entry in "${STATEMENT_RULE_BAD_SAMPLES[@]}"; do
+    [ "${entry%%@@*}" = "${rule}" ] && bad_samples+=("${entry#*@@}")
+  done
+  for entry in "${STATEMENT_RULE_GOOD_SAMPLES[@]}"; do
+    [ "${entry%%@@*}" = "${rule}" ] && good_samples+=("${entry#*@@}")
+  done
+  if [ "${#bad_samples[@]}" -eq 0 ] || [ "${#good_samples[@]}" -eq 0 ]; then
+    uncovered_rules=$((uncovered_rules + 1))
+    bad "the guard declares ${declared_name} but this test has no bad/good sample pair for it; add one, or the rule is declared without a control"
+    continue
+  fi
+
+  # The BAD samples must be refused by the guard, and refused by naming the planted file:
+  # that is the rule doing its job on a real input, run through the real scanner.
+  for bad_sample in "${bad_samples[@]}"; do
+    new_mirror
+    TR="${MIRROR}"
+    rel="${PRIMARY_REL}/SensitivityProbe.java"
+    plant "${TR}" "${rel}" "${bad_sample}"
+    TREE="${TR}"
+    run_guard
+    if [ "${RC}" -ne 0 ] && printf '%s\n' "${OUT}" | grep -q -F "${rel}"; then
+      pass "${declared_name} refuses a known-bad sample"
+      sensitive_rules=$((sensitive_rules + 1))
+    else
+      bad "${declared_name} does NOT refuse its known-bad sample, so the rule matches nothing and a clean tree is indistinguishable from a guarded one: ${bad_sample}"
+      insensitive_rules=$((insensitive_rules + 1))
+    fi
+  done
+
+  # The GOOD samples must be accepted. Without this half, a rule loosened until it matches
+  # everything would pass the check above.
+  for good_sample in "${good_samples[@]}"; do
+    new_mirror
+    TG="${MIRROR}"
+    rel="${PRIMARY_REL}/SensitivityProbe.java"
+    plant "${TG}" "${rel}" "${good_sample}"
+    TREE="${TG}"
+    run_guard
+    if [ "${RC}" -eq 0 ]; then
+      pass "${declared_name} admits a known-good sample"
+    else
+      bad "${declared_name} refuses a known-good sample, so the rule is too broad: ${good_sample}"
+      show "$(printf '%s\n' "${OUT}" | grep -F 'ERROR:' | head -n 1)"
+    fi
+  done
+done
+if [ "${insensitive_rules}" -eq 0 ]; then
+  pass "all ${sensitive_rules} statement-literal rule samples proved SENSITIVE (each refused a known-bad sample)"
+else
+  bad "${insensitive_rules} statement-literal rule sample(s) matched nothing; a pattern that matches nothing is a disabled guard"
+fi
+if [ "${uncovered_rules}" -eq 0 ]; then
+  pass "every statement-literal rule this control names is declared by the guard and has a bad/good sample pair"
+fi
+TREE="${ROOT}"
 
 # ---------------------------------------------------------------------------
 # Case 2: acceptance - the guard holds on the committed tree, and it PROVES it
@@ -356,6 +591,19 @@ for entry in "${planted_literals[@]}"; do
   assert_refused "planted statement literal '${entry%%:*}'" nonzero "${T}/${rel}" 'Goal 03 analytics read-only violation'
 done
 
+# The STATEMENT shape of a bare-leading-verb literal, which is what the rule actually bites
+# on: a statement verb is followed by whitespace and then its statement. A literal whose
+# whole content is a bare verb with nothing after it (`"DELETE"`) is NOT refused, because that
+# is an indistinguishable ordinary Java string; case 7 asserts that shape is accepted.
+new_mirror
+T6F="${MIRROR}"
+rel="${PRIMARY_REL}/StatementShape.java"
+plant "${T6F}" "${rel}" 'String sql() { return "COMMIT WORK"; }'
+TREE="${T6F}"
+run_guard
+assert_refused "planted statement-shaped 'COMMIT WORK'" nonzero "${T6F}/${rel}" \
+  'Goal 03 analytics read-only violation'
+
 new_mirror
 T6B="${MIRROR}"
 rel="${PRIMARY_REL}/CallEscape.java"
@@ -373,12 +621,91 @@ TREE="${T6C}"
 run_guard
 assert_refused "planted text block beginning with DELETE" nonzero "${T6C}/${rel}" 'Goal 03 analytics read-only violation'
 
+# ---------------------------------------------------------------------------
+# Case 6b: the SELECT-WRAPPED WRITE, which is the whole point of Goal 03A section D.
+#
+# Every plant below begins with SELECT or WITH or carries its write token somewhere other
+# than the first word, so a prefix test on the leading keyword would call all of them
+# clean. That is the defect: "starts as a read" is not "is a read". Each plant gets its
+# own fresh mirror, and every one of them must be refused AND named.
+#
+# Every plant is written with DOUBLE-quoted literal content, deliberately. A plant carrying
+# a single-quoted SQL region cannot be written here without nesting an apostrophe in a
+# single-quoted bash array entry, and a \u0027 escape survives as literal text through
+# printf - which would plant a string that does not contain the apostrophe the test means
+# to plant. That case is covered where it belongs: SqlAdmission refuses any string literal
+# outright, and the shell guard's quote-anchored rule refuses a verb that follows either
+# quote character, both of which are asserted in the Java twin and in the guard's own
+# fixture for that rule.
+# ---------------------------------------------------------------------------
+planted_wrapped=(
+  'data-change table reference@@String sql() { return "SELECT * FROM FINAL TABLE (DELETE FROM ICMADMIN.ICMUT00001001)"; }'
+  'CTE carrying a DELETE token@@String sql() { return "WITH D AS (DELETE FROM ICMADMIN.ICMUT00001001) SELECT COUNT(*) FROM D"; }'
+  'CTE carrying an UPDATE token@@String sql() { return "WITH U AS (UPDATE ICMADMIN.ICMUT00001001 SET ITEMID = 1) SELECT COUNT(*) FROM U"; }'
+  'CTE carrying an INSERT token@@String sql() { return "WITH I AS (INSERT INTO ICMADMIN.ICMUT00001001 (ITEMID) VALUES (1)) SELECT COUNT(*) FROM I"; }'
+  'multi-statement SELECT ...; DELETE@@String sql() { return "SELECT 1 AS PRESENT FROM ICMADMIN.ICMUT00001001; DELETE FROM ICMADMIN.ICMUT00001001"; }'
+  'multi-statement SELECT ...; DROP@@String sql() { return "SELECT 1 AS PRESENT FROM ICMADMIN.ICMUT00001001; DROP TABLE ICMADMIN.ICMUT00001001"; }'
+  'line comment hiding a DELETE@@String sql() { return "SELECT 1 AS PRESENT FROM ICMADMIN.ICMUT00001001 -- DELETE FROM ICMADMIN.ICMUT00001001"; }'
+  'block comment hiding a DELETE@@String sql() { return "SELECT 1 AS PRESENT /* DELETE */ FROM ICMADMIN.ICMUT00001001 WHERE 1 = 0"; }'
+  'data-change table reference, UPDATE form@@String sql() { return "SELECT * FROM FINAL TABLE (UPDATE ICMADMIN.ICMUT00001001 SET ITEMID = 1)"; }'
+)
+wrapped_index=0
+for entry in "${planted_wrapped[@]}"; do
+  wrapped_index=$((wrapped_index + 1))
+  statement="${entry#*@@}"
+  new_mirror
+  T6D="${MIRROR}"
+  rel="${PRIMARY_REL}/Wrapped${wrapped_index}.java"
+  plant "${T6D}" "${rel}" "${statement}"
+  TREE="${T6D}"
+  run_guard
+  assert_refused "planted SELECT-wrapped write (${entry%%@@*})" nonzero "${T6D}/${rel}" \
+    'Goal 03 analytics read-only violation'
+  # The positive control for the FIRST and mandatory plant - DB2's data-change table
+  # reference - is made here, while this mirror still exists: the refusal above must have
+  # come from a file the guard really scanned, and re-reading it after the trap swept the
+  # mirrors would prove nothing.
+  if [ "${wrapped_index}" -eq 1 ]; then
+    if grep -q -F 'FINAL TABLE (DELETE' "${T6D}/${rel}"; then
+      pass "positive control: the SELECT-wrapped DATA-CHANGE TABLE plant is present in the file the guard scanned"
+    else
+      bad "the SELECT-wrapped plant is missing from ${T6D}/${rel}; its refusal evidence would be meaningless"
+    fi
+  fi
+done
+
+# The generic, write-capable JDBC entry points. Production analytics reaches the driver
+# only through the prepare+executeQuery path, so these are forbidden explicitly rather
+# than left as an escape hatch nobody was supposed to use. `executeQuery(` must NOT be
+# refused - it is the one path the layer does use - which case 7 asserts below.
+planted_generic_calls=(
+  'Statement.execute(String)@@void g() throws Exception { statement.execute("SELECT 1 FROM ICMUT00001001"); }'
+  'PreparedStatement.execute()@@void g() throws Exception { ps.execute(); }'
+  'createStatement()@@void g() throws Exception { connection.createStatement(); }'
+  'executeLargeUpdate()@@void g() throws Exception { statement.executeLargeUpdate("DELETE FROM X"); }'
+  'addBatch()@@void g() throws Exception { statement.addBatch("DELETE FROM X"); }'
+  'executeBatch()@@void g() throws Exception { statement.executeBatch(); }'
+)
+generic_index=0
+for entry in "${planted_generic_calls[@]}"; do
+  generic_index=$((generic_index + 1))
+  statement="${entry#*@@}"
+  new_mirror
+  T6E="${MIRROR}"
+  rel="${PRIMARY_REL}/GenericCall${generic_index}.java"
+  plant "${T6E}" "${rel}" "${statement}"
+  TREE="${T6E}"
+  run_guard
+  assert_refused "planted generic JDBC call (${entry%%@@*})" nonzero "${T6E}/${rel}" \
+    'Goal 03 analytics read-only violation'
+done
+
 # The plant is really in the file the guard scanned, so the refusals above cannot
 # have come from an unscanned tree.
-if grep -q -F 'DELETE FROM ICMUT00001001' "${T6C}/${rel}"; then
-  pass "positive control: the last plant is present in a file the guard scanned"
+if grep -q -F 'DELETE FROM ICMUT00001001' "${T6C}/${PRIMARY_REL}/TextBlock.java"; then
+  pass "positive control: the text-block plant is present in a file the guard scanned"
 else
-  bad "the plant is missing from ${T6C}/${rel}; the refusal evidence would be meaningless"
+  bad "the text-block plant is missing; the refusal evidence would be meaningless"
 fi
 
 # ---------------------------------------------------------------------------
@@ -416,6 +743,45 @@ printf '%s\n' \
   '' \
   '  String unionSql() {' \
   '    return "SELECT ItemID FROM ICMUT00001001 UNION SELECT ItemID FROM ICMUT00001002";' \
+  '  }' \
+  '' \
+  '  // The token-aware controls: these identifiers merely CONTAIN a keyword fragment, and' \
+  '  // a rule that refused them would refuse real column names and then be weakened.' \
+  '  String bareWordLiterals() {' \
+  '    // One-word ordinary strings. "NEW" and "COMMIT" are a state label and a log key, not' \
+  '    // statements, and a guard that refused every one-word literal would refuse this shape' \
+  '    // everywhere in a Java code base and then be deleted by whoever hit it.' \
+  '    return "NEW" + "COMMIT" + "reads";' \
+  '  }' \
+  '' \
+  '  String tokenAware() {' \  '    return "SELECT UPDATED_AT FROM ICMUT00001001 WHERE UPDATED_AT > 1";' \
+  '  }' \
+  '' \
+  '  String tokenAwareToo() {' \
+  '    return "SELECT DELETED_FLAG, CREATE_TS FROM ICMUT00001001";' \
+  '  }' \
+  '' \
+  '  // Concatenated literals: the write keyword is never a token of one statement.' \
+  '  String concatenated() {' \
+  '    return "SELECT " + "COUNT(DISTINCT ITEMID) FROM ICMUT00001001";' \
+  '  }' \
+  '' \
+  '  // Not SQL comments: no quote, space or parenthesis introduces the marker, and the' \
+  '  // text after it is punctuation rather than comment text.' \
+  '  String notAComment() {' \
+  '    return "a/b*c and 1--2 are not SQL comments";' \
+  '  }' \
+  '' \
+  '  String diagnosticProse() {' \
+  '    return "ItemType 1 has no physical root table; every segment 1..N must be present";' \
+  '  }' \
+  '' \
+  '  java.sql.ResultSet theOneQueryPath(java.sql.PreparedStatement ps) throws Exception {' \
+  '    return ps.executeQuery();' \
+  '  }' \
+  '' \
+  '  java.sql.ResultSet theNamedQueryPath() throws Exception {' \
+  '    return statement.executeQuery("SELECT 1 FROM ICMUT00001001 WHERE 1 = 0");' \
   '  }' \
   '' \
   '  void bookkeeping() {' \
@@ -468,9 +834,39 @@ printf '%s\n' \
   '/** Scratch fixture: one call per declared pattern, each on its own line. */' \
   'final class AllDeclaredPatterns {' \
   '  void everyDeclaredPattern() throws Exception {' > "${T8}/${rel}"
+# ONE realistic call per declared rule, looked up by the rule's own text. The assertions
+# below are made in BOTH directions:
+#
+#   * each declared pattern must MATCH its realistic call, so a pattern cannot be declared
+#     in a form that matches nothing (for example a bare `execute` rule that would also fire
+#     on every `executeQuery`);
+#   * the guard must refuse and name that call, so a rule that silently stopped biting is
+#     reported rather than assumed.
+#
+# Reading the method name back out of the pattern was tried and abandoned: a declared
+# pattern is a character class plus an escaped parenthesis, and every attempt to strip the
+# tail with a parameter expansion or a sed anchor either mangled it or matched nothing,
+# which made a correct guard look like it had missed a plant.
+planted_realistic_calls=()
 for pattern in "${DECLARED_CALL_PATTERNS[@]}"; do
-  base="${pattern%%[[]*}"
-  printf '    statement.%s();\n' "${base}" >> "${T8}/${rel}"
+  sample=''
+  for entry in "${DECLARED_CALL_SAMPLES[@]}"; do
+    if [ "${entry%%@@*}" = "${pattern}" ]; then
+      sample="${entry#*@@}"
+      break
+    fi
+  done
+  if [ -z "${sample}" ]; then
+    bad "the guard declares '${pattern}' but this test has no realistic call for it; add one to DECLARED_CALL_SAMPLES"
+    continue
+  fi
+  planted_realistic_calls+=("${sample}")
+  printf '    %s\n' "${sample}" >> "${T8}/${rel}"
+  if printf '%s\n' "${sample}" | grep -q -E "(${pattern})"; then
+    pass "declared pattern '${pattern}' matches its realistic call"
+  else
+    bad "declared pattern '${pattern}' does NOT match '${sample}': it is declared in a form that matches no realistic call"
+  fi
 done
 printf '%s\n' '  }' '}' >> "${T8}/${rel}"
 TREE="${T8}"
@@ -481,22 +877,21 @@ else
   bad "the guard accepted a file calling every declared pattern"
 fi
 missing_patterns=0
-for pattern in "${DECLARED_CALL_PATTERNS[@]}"; do
-  base="${pattern%%[[]*}"
-  if ! printf '%s\n' "${OUT}" | grep -q -F "statement.${base}();"; then
+for call in "${planted_realistic_calls[@]}"; do
+  if ! printf '%s\n' "${OUT}" | grep -q -F "${call}"; then
     missing_patterns=$((missing_patterns + 1))
-    bad "planted 'statement.${base}();' was NOT refused, yet the guard still lists '${pattern}' as forbidden"
+    bad "planted '${call}' was NOT refused by the guard, yet it matches a declared pattern"
   fi
 done
 if [ "${missing_patterns}" -eq 0 ]; then
-  pass "all ${#DECLARED_CALL_PATTERNS[@]} planted patterns were individually refused and named"
+  pass "all ${#planted_realistic_calls[@]} planted calls were individually refused and named"
 fi
 
 # ---------------------------------------------------------------------------
 # Case 9: no side effects.
 # ---------------------------------------------------------------------------
 count="${MIRRORS}"
-[ "${count}" -ge 12 ] || bad "expected the mutation cases to create several mirror trees, saw ${count}"
+[ "${count}" -ge 25 ] || bad "expected the mutation cases to create several mirror trees, saw ${count}"
 cleanup
 leftover=0
 for d in ${TEMPS}; do [ -d "${d}" ] && leftover=$((leftover + 1)); done

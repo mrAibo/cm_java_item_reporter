@@ -182,7 +182,10 @@ public class ScanCoordinatorTest {
         }
 
         @Override
-        public LocalDate databaseCurrentDate() {
+        public LocalDate databaseCurrentDate(ScanCancellation cancellation) {
+            // The signal is accepted and deliberately unused: this fake's anchor is instantaneous, so there
+            // is nothing for a cancellation to reach here. The suite that pins the anchor's abort path is
+            // AnchorDeadlineCancellationTest.
             anchorReads.incrementAndGet();
             return anchor;
         }

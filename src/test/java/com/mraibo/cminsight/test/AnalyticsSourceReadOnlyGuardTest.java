@@ -1,5 +1,7 @@
 package com.mraibo.cminsight.test;
 
+import com.mraibo.cminsight.db.SqlAdmission;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -75,16 +77,47 @@ public class AnalyticsSourceReadOnlyGuardTest {
     private static final String DATABASE_PACKAGE = "src/main/java/com/mraibo/cminsight/db";
 
     /**
-     * A statement literal that begins with a write/control keyword.
+     * The statement-literal rules of the analytics guard: a string literal carrying a write/control SQL
+     * keyword as a WHOLE TOKEN, positioned where a statement can actually start it.
      *
-     * <p>Multi-line and anchored on the opening quote, so it catches a Java text block whose keyword is on
-     * the following line - the case a line-oriented scan cannot see - while leaving ordinary English prose
-     * and the generated SELECT statements alone.
+     * <p>Each is anchored on the boundary a real statement keyword occupies - right after a quote, inside
+     * parentheses, after a statement separator, or inside a Java text block - and each ends with a negated
+     * identifier class so the keyword must be a whole token. That is what admits real identifiers such as
+     * {@code UPDATED_AT}, {@code DELETED_FLAG}, {@code CREATE_TS} and {@code CREATED_TODAY}, which merely
+     * CONTAIN one of these words. The shell guard writes that same class as the POSIX form
+     * {@code [^[:alnum:]_]}, because its grep binds the ASCII-range spelling {@code [^A-Za-z0-9_]}
+     * undefinedly; Java's regex engine needs no such workaround.
+     *
+     * <p>The quote-anchored rule additionally requires whitespace and then statement MATERIAL
+     * ({@code [A-Za-z0-9_(]}) after the keyword. An earlier version also refused a literal whose ENTIRE
+     * content was a verb ({@code "NEW"}, {@code "COMMIT"}), which could not tell a statement from an
+     * ordinary one-word Java string; that rule was a false-positive machine for the most common literal
+     * shape in a Java code base, so it was replaced rather than kept. The replacement is strictly better: it
+     * catches every bare-verb STATEMENT ({@code "DELETE FROM X"}, {@code "COMMIT WORK"}) and admits a bare
+     * verb WORD ({@code "DELETE"}), because a statement verb is always followed by the whitespace and the
+     * token that a one-word string is not.
+     *
+     * <h2>Why this is no longer a prefix test</h2>
+     *
+     * <p>The old rule here - and the old shell rule - was "the literal begins with a write keyword", which is
+     * exactly the mistake Goal 03A section D removes: it calls a SELECT-wrapped mutation clean because the
+     * FIRST word of the literal is not a write verb. These patterns refuse a token wherever it really starts
+     * a statement, so {@code "SELECT * FROM FINAL TABLE (DELETE FROM X)"}, a CTE carrying a DML token,
+     * {@code "SELECT 1; DELETE FROM X"} and a token hidden behind a comment shape are all caught.
+     *
+     * <p>The rules are stated here rather than parsed out of the shell guard because the shell rules are ERE
+     * written for whole lines and for grep, while this scanner reads a WHOLE FILE so it can see a text block
+     * whose keyword is on the next line. The agreement that matters - the VOCABULARY both sides refuse - is
+     * asserted against the shell guard and against {@code SqlAdmission} below, so a keyword removed from one
+     * side fails here instead of drifting.
      */
-    private static final Pattern WRITE_STATEMENT_LITERAL = Pattern.compile(
-            "\"{1,3}[ \t\r\n]*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CREATE|ALTER|DROP|GRANT|REVOKE|CALL)"
-                    + "\\b",
-            Pattern.MULTILINE);
+    private static final List<Pattern> FORBIDDEN_LITERAL_PATTERNS = List.of(
+            Pattern.compile("[\"'][ \t]*(" + SourceGuard.ANALYTICS_VERBS + ")[ \t]+[A-Za-z0-9_(]"),
+            Pattern.compile("[(][ \t]*(" + SourceGuard.ANALYTICS_VERBS + ")[^A-Za-z0-9_]"),
+            Pattern.compile("[;][ \t]*(" + SourceGuard.ANALYTICS_VERBS + ")[^A-Za-z0-9_]"),
+            Pattern.compile("\"\"\"[ \t\r\n]*(" + SourceGuard.ANALYTICS_VERBS + ")"),
+            // A comment form a generated statement never needs, which is the other way a token is hidden.
+            Pattern.compile("[\"'][^\"']*([ \t][ \t]*--[ \t]*[A-Za-z]|/[*][ \t]*[A-Za-z])"));
 
     /** The JDBC stored-procedure escape, which only ever precedes a CALL. */
     private static final Pattern JDBC_CALL_ESCAPE = Pattern.compile("[{][ \t]*[Cc][Aa][Ll][Ll][^A-Za-z0-9_]");
@@ -134,21 +167,54 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         + " the rules were weakened, or the table moved and this guard no longer reads it");
     }
 
-    /** The committed shell guard still carries the rules, so the build step and this suite cannot drift. */
+    /**
+     * The committed shell guard still carries the RULES, so the build step and this suite cannot drift.
+     *
+     * <h2>Pinned to the rule, not to a token name</h2>
+     *
+     * <p>This assertion used to demand the literal name {@code SQL_KEYWORD_PATTERN}. That is a pin on a
+     * variable name rather than on the rule it carries, so it failed when the guard's literal rules were
+     * split into their anchored forms even though every rule survived - a failure for a reason that is not a
+     * defect. What is asserted now is the RULE: the guard must still refuse every keyword of the runtime
+     * admission rule's own vocabulary, and the pattern name is free to change as long as the refusal is
+     * still declared.
+     *
+     * <p>The vocabulary is read from {@code SqlAdmission.forbiddenKeywords()} rather than hardcoded here, so
+     * this is one list with two readers instead of two hand-maintained copies of the same list.
+     */
     public void theCommittedShellGuardStillCarriesTheRules() {
         Path script = repositoryRoot().resolve(SHELL_GUARD);
         Assert.assertTrue(Files.isRegularFile(script), "the committed shell guard " + SHELL_GUARD
                 + " is the authority for these rules, and it is missing at " + script);
         String text = readString(script);
 
+        // Structural rules: the call table, the literal-rule prologue and the fail-fast prologue.
         for (String required : List.of("FORBIDDEN_CALL_PATTERNS=(", "executeUpdate", "prepareCall", "commit",
-                "rollback", "SQL_KEYWORD_PATTERN", "JDBC_CALL_ESCAPE_PATTERN", ANALYTICS_JDBC_SOURCE)) {
+                "rollback", "SQL_VERBS", "JDBC_CALL_ESCAPE_PATTERN", "EXEMPT_RELS", ANALYTICS_JDBC_SOURCE)) {
             Assert.assertTrue(text.contains(required),
                     "the committed guard must keep '" + required + "'; removing it would widen what the"
                             + " analytics layer may do while this suite reported success");
         }
         Assert.assertTrue(text.contains("set -euo pipefail"),
                 "and it must keep its fail-fast prologue, or a failing grep would not stop it");
+
+        // The VOCABULARY, read from the runtime rule rather than copied. Every keyword that rule refuses must
+        // appear in the committed guard's text, or the two have drifted and one of them is now the weaker.
+        List<String> missing = new ArrayList<>();
+        for (String keyword : SqlAdmission.forbiddenKeywords()) {
+            if (!text.contains(keyword)) {
+                missing.add(keyword);
+            }
+        }
+        Assert.assertTrue(missing.isEmpty(),
+                "the committed shell guard no longer names " + missing + ", which the runtime admission rule"
+                        + " refuses: the source guard and the runtime rule have drifted apart");
+
+        // And the exemption is declared on the shell side exactly as it is on this side, in both directions.
+        Assert.assertTrue(text.contains(SourceGuard.ANALYTICS_LITERAL_EXEMPT_FILENAME),
+                "the committed guard must declare the same single literal exemption this suite applies ("
+                        + SourceGuard.ANALYTICS_LITERAL_EXEMPT_FILENAME + "), or the two guards disagree about"
+                        + " which file the keyword-literal rule covers");
     }
 
     // ------------------------------------------------------------------ mutation cases
@@ -204,6 +270,48 @@ public class AnalyticsSourceReadOnlyGuardTest {
         Assert.assertTrue(violations.stream().anyMatch(entry -> entry.contains("PlantedLiteral.java")),
                 "a write-shaped literal - here in a text block whose keyword is on the NEXT line, which a"
                         + " line-oriented scan cannot see - must be refused and named. Found: " + violations);
+    }
+
+    /**
+     * A planted SELECT-WRAPPED write is found in a copied tree, one plant per mandatory shape.
+     *
+     * <p>This is the mutation control for Goal 03A section D. Every plant below starts with {@code SELECT}
+     * or {@code WITH}, or hides its write token behind a comment - so a guard whose rule is "the literal
+     * begins with a write verb" calls all of them clean. They must each be refused and named, which is what
+     * makes the guard pair's structural claim about the real tree mean something.
+     */
+    public void plantedSelectWrappedWritesAreDetectedInACopiedTree() throws IOException {
+        List<String> plants = List.of(
+                "SELECT * FROM FINAL TABLE (DELETE FROM ICMADMIN.ICMUT00001001)",
+                "WITH D AS (DELETE FROM ICMADMIN.ICMUT00001001) SELECT COUNT(*) FROM D",
+                "WITH U AS (UPDATE ICMADMIN.ICMUT00001001 SET ITEMID = 1) SELECT COUNT(*) FROM U",
+                "SELECT 1 AS PRESENT FROM ICMADMIN.ICMUT00001001; DELETE FROM ICMADMIN.ICMUT00001001",
+                "SELECT 1 AS PRESENT FROM ICMADMIN.ICMUT00001001 -- DELETE FROM ICMADMIN.ICMUT00001001",
+                "SELECT 1 AS PRESENT /* DELETE */ FROM ICMADMIN.ICMUT00001001 WHERE 1 = 0");
+
+        int index = 0;
+        for (String plant : plants) {
+            index++;
+            Path copy = copyAnalyticsTree();
+            int plantIndex = index;
+            Path planted = copy.resolve(ANALYTICS_JDBC_SOURCE).resolve("Wrapped" + plantIndex + ".java");
+            Files.writeString(planted, """
+                    package com.mraibo.cminsight.db;
+
+                    /** Planted by AnalyticsSourceReadOnlyGuardTest: a SELECT-wrapped write shape. */
+                    final class Wrapped%d {
+                        String statement() {
+                            return "%s";
+                        }
+                    }
+                    """.formatted(plantIndex, plant), StandardCharsets.UTF_8);
+
+            List<String> violations = findForbiddenWrites(copy);
+            Assert.assertTrue(violations.stream().anyMatch(entry -> entry.contains("Wrapped" + plantIndex
+                            + ".java")),
+                    "the SELECT-wrapped shape <" + plant + "> must be refused and named, because a rule that"
+                            + " only checks the literal's FIRST word calls it clean. Found: " + violations);
+        }
     }
 
     /** The JDBC CALL escape is found in a copied tree. */
@@ -275,6 +383,40 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         return "SELECT COUNT(DISTINCT ITEMID) FROM ICMADMIN.ICMUT00001001";
                     }
 
+                    // The TOKEN-AWARE controls: every one of these is a real column name or a real
+                    // statement that merely CONTAINS a keyword fragment. A rule that refused them would
+                    // refuse real schema and would then be deleted by whoever hit it first.
+                    String tokenAware() {
+                        return "SELECT UPDATED_AT, DELETED_FLAG, CREATE_TS FROM ICMADMIN.ICMUT00001001";
+                    }
+
+                    String moreTokenAware() {
+                        return "SELECT NEW_ITEM_ID, OLD_ITEM_ID, CREATED_TODAY FROM X";
+                    }
+
+                    // One-word ordinary strings. "NEW" is a state label and "COMMIT" is a log key, not a
+                    // statement; a rule that refused every one-word literal would refuse this shape
+                    // everywhere in a Java code base and would then be deleted by whoever hit it first.
+                    String bareWordLiterals() {
+                        return "NEW" + "COMMIT" + "reads";
+                    }
+
+                    String concatenatedLiterals() {
+                        return "SELECT " + "COUNT(DISTINCT ITEMID) FROM ICMADMIN.ICMUT00001001";
+                    }
+
+                    String diagnosticProse() {
+                        return "ItemType 1 has no physical root table; every segment 1..N must be present";
+                    }
+
+                    String notAComment() {
+                        return "a/b*c and 1--2 are not SQL comments";
+                    }
+
+                    java.sql.ResultSet theOneQueryPath(java.sql.PreparedStatement ps) throws Exception {
+                        return ps.executeQuery();
+                    }
+
                     void bookkeeping() {
                         names.add("itemType");
                         names.remove(0);
@@ -288,8 +430,102 @@ public class AnalyticsSourceReadOnlyGuardTest {
 
         List<String> violations = findForbiddenWrites(copy);
         Assert.assertTrue(violations.isEmpty(),
-                "ordinary java.util and wrapper operations, a SELECT-only literal and English prose must not"
+                "ordinary java.util and wrapper operations, a SELECT-only literal, English prose and the"
+                        + " token-aware column names UPDATED_AT/DELETED_FLAG/CREATE_TS/NEW_ITEM_ID must not"
                         + " be refused; a guard that cannot pass gets disabled. Found: " + violations);
+    }
+
+    // ------------------------------------------------------------------ the exemption and its controls
+
+    /**
+     * The exempt file EXISTS, so a stale exemption is reported instead of silently widening the rule.
+     *
+     * <p>An exemption for a path that no longer exists is the quiet failure mode: the rule then covers
+     * everything, every file passes, and nobody learns that the file the exemption was written for moved.
+     */
+    public void theLiteralExemptionNamesAFileThatExists() {
+        Path exempt = repositoryRoot().resolve(SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE);
+        Assert.assertTrue(Files.isRegularFile(exempt),
+                "the literal exemption names " + SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE + ", which does"
+                        + " not exist: the exemption is stale, or the file moved and the exemption now covers"
+                        + " nothing while the guard reports a clean tree");
+
+        // And the exemption is applied by NAME, so a copied tree answers the same question.
+        Assert.assertTrue(SourceGuard.isAnalyticsLiteralExempt(exempt),
+                "the exemption must recognise the path it names");
+        Assert.assertFalse(SourceGuard.isAnalyticsLiteralExempt(exempt.resolveSibling("SqlIdentifiers.java")),
+                "and must not recognise any other file in the same package");
+    }
+
+    /**
+     * CONTROL: a file combining the exempt vocabulary with a REAL offending construct is still refused.
+     *
+     * <p>This is the control that makes the exemption honest. It plants a copy of the exempt file with a
+     * genuine {@code executeUpdate} call appended, so the file carries both the exempt vocabulary and a real
+     * violation. The scanner must still report it - which fails if the exemption is implemented by skipping
+     * the whole file, and is exactly how an exemption becomes a hole.
+     */
+    public void aPlantCombiningTheExemptVocabularyWithARealWriteIsStillRefused() throws IOException {
+        Path copy = copyAnalyticsTree();
+        Path planted = copy.resolve(SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE);
+        Assert.assertTrue(Files.isRegularFile(planted),
+                "the control needs the exempt file to exist in the copied tree, but it is missing at " + planted);
+        String original = Files.readString(planted, StandardCharsets.UTF_8);
+        Assert.assertTrue(original.contains("DELETE") || original.contains("INSERT"),
+                "the control requires the exempt file to really carry the write/control vocabulary, otherwise"
+                        + " it proves nothing about the exemption");
+
+        String plantedText = original
+                + "\n/** Planted by AnalyticsSourceReadOnlyGuardTest: a real write-capable call. */\n"
+                + "final class PlantedWriteIntoTheExemptFile {\n"
+                + "    void writeThrough(java.sql.Statement statement) throws Exception {\n"
+                + "        statement.executeUpdate(\"DELETE FROM ICMUT00001001\");\n"
+                + "    }\n"
+                + "}\n";
+        Files.writeString(planted, plantedText, StandardCharsets.UTF_8);
+
+        List<String> violations = findForbiddenWrites(copy);
+        Assert.assertFalse(violations.isEmpty(),
+                "the exemption covers the KEYWORD-LITERAL rule only; a file that also carries a real"
+                        + " executeUpdate call must still be refused, or the exemption is a hole through which"
+                        + " the admission layer could acquire a write path");
+        Assert.assertTrue(violations.stream().anyMatch(entry -> entry.contains("SqlAdmission.java")),
+                "and the refusal must name the exempt file, so the finding is actionable. Found: " + violations);
+    }
+
+    /**
+     * The committed shell guard and this suite refuse the SAME vocabulary, read from the runtime rule.
+     *
+     * <p>The agreement is asserted rather than maintained by hand, so the next person to change one side
+     * cannot leave the other behind - the reason this class exists beside a shell script at all.
+     */
+    public void theTwoGuardsRefuseTheSameVocabulary() {
+        Set<String> vocabulary = new TreeSet<>(SqlAdmission.forbiddenKeywords());
+        Assert.assertFalse(vocabulary.isEmpty(),
+                "the runtime admission rule must name its vocabulary; an empty list would make this agreement"
+                        + " assertion vacuous");
+
+        String shellText = readString(repositoryRoot().resolve(SHELL_GUARD));
+        List<String> missingFromShell = new ArrayList<>();
+        for (String keyword : vocabulary) {
+            if (!shellText.contains(keyword)) {
+                missingFromShell.add(keyword);
+            }
+        }
+        Assert.assertTrue(missingFromShell.isEmpty(),
+                "the committed shell guard does not name " + missingFromShell + ", which the runtime admission"
+                        + " rule refuses: the text guard and the runtime rule disagree about the vocabulary");
+
+        String javaVerbs = SourceGuard.ANALYTICS_VERBS;
+        List<String> missingFromJava = new ArrayList<>();
+        for (String keyword : vocabulary) {
+            if (!javaVerbs.contains(keyword)) {
+                missingFromJava.add(keyword);
+            }
+        }
+        Assert.assertTrue(missingFromJava.isEmpty(),
+                "this suite's literal rules do not name " + missingFromJava + ", which the runtime admission"
+                        + " rule refuses: the Java twin would be the weaker guard");
     }
 
     /**
@@ -437,6 +673,18 @@ public class AnalyticsSourceReadOnlyGuardTest {
     /**
      * Every forbidden construct under the analytics trees, as {@code path:line: text} entries.
      *
+     * <h2>The one exemption, and why it is a SUB-rule</h2>
+     *
+     * <p>{@code SqlAdmission.java} is exempt from the STATEMENT-LITERAL rules only, because it is the layer
+     * that refuses that vocabulary and a refusal layer must be able to name what it refuses: without the
+     * exemption the rule forbids its own enforcement mechanism and the guard could not pass at all.
+     *
+     * <p>The exemption deliberately does NOT skip the JDBC call rules for that file, and it is keyed on the
+     * file's NAME so a copied tree gets the same answer. So a file that carries both the exempt vocabulary
+     * and a real offending construct is still refused - which is the control
+     * {@link #aPlantCombiningTheExemptVocabularyWithARealWriteIsStillRefused} proves, because an exemption
+     * implemented by skipping the whole file would pass a weaker test and hide a real hole.
+     *
      * @param root the tree to scan, which may be a temporary copy
      */
     private static List<String> findForbiddenWrites(Path root) {
@@ -469,6 +717,8 @@ public class AnalyticsSourceReadOnlyGuardTest {
                 List<String> lines = readLines(file);
                 String text = String.join("\n", lines);
 
+                // The call rules apply to EVERY file, exempt or not: skipping them would turn the exemption
+                // into a hole through which a write-capable call could be added to the admission layer.
                 for (int index = 0; index < lines.size(); index++) {
                     for (Pattern pattern : patterns) {
                         Matcher matcher = pattern.matcher(lines.get(index));
@@ -478,10 +728,17 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         }
                     }
                 }
-                violations.addAll(matchWholeFile(relative, text, WRITE_STATEMENT_LITERAL,
-                        "a statement literal beginning with a write/control SQL keyword"));
                 violations.addAll(matchWholeFile(relative, text, JDBC_CALL_ESCAPE,
                         "the JDBC stored-procedure CALL escape"));
+
+                // The literal rules, which the one documented file is exempt from.
+                if (SourceGuard.isAnalyticsLiteralExempt(file)) {
+                    continue;
+                }
+                for (Pattern pattern : FORBIDDEN_LITERAL_PATTERNS) {
+                    violations.addAll(matchWholeFile(relative, text, pattern,
+                            "a statement literal carrying a write/control SQL keyword as a whole token"));
+                }
             }
         }
         return violations;
@@ -547,14 +804,14 @@ public class AnalyticsSourceReadOnlyGuardTest {
 
     /** What the guard covers, for a failure message: an operator reading it must know which table applied. */
     private static String describePatterns() {
-        Set<String> names = new TreeSet<>();
+        Set<String> described = new TreeSet<>();
         for (String pattern : forbiddenCallPatterns()) {
-            names.add(pattern.replace("[[:space:]]*\\(", "()").replace("\\(", "()"));
+            described.add(pattern.replace("[[:space:]]*\\(", "()").replace("\\(", "()"));
         }
-        Set<String> described = new TreeSet<>(names);
-        described.add("statement literals: INSERT/UPDATE/DELETE/MERGE/TRUNCATE/CREATE/ALTER/DROP/GRANT/REVOKE"
-                + "/CALL");
+        described.add("statement literals: " + SourceGuard.ANALYTICS_VERBS.replace("|", "/"));
+        described.add("SQL comment forms inside a statement literal");
         described.add("the JDBC {call ...} escape");
+        described.add("literal exemption (keyword rule only): " + SourceGuard.ANALYTICS_LITERAL_EXEMPT_RELATIVE);
         return String.join(", ", described);
     }
 

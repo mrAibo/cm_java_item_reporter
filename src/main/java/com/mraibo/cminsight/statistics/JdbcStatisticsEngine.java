@@ -122,14 +122,26 @@ public final class JdbcStatisticsEngine implements StatisticsEngine, StatisticsD
     // ------------------------------------------------------------------ StatisticsEngine
 
     @Override
-    public LocalDate databaseCurrentDate() throws Exception {
+    public LocalDate databaseCurrentDate(ScanCancellation cancellation) throws Exception {
+        Objects.requireNonNull(cancellation, "cancellation");
         try (Lease<JdbcSession> lease = pool.borrow()) {
+            JdbcSession session = lease.value();
+            // The anchor is inside the scan's cancellation domain on exactly the same terms as an
+            // aggregate: registering the session's abort action with the scan's ONE signal is what lets
+            // the overall deadline, an explicit cancel and a context close reach Statement.cancel() while
+            // the read is blocked in the driver. The registration lives exactly as long as this read, so
+            // the signal's action map stays bounded by the in-flight queries and not by the ItemType
+            // count. Written as an explicit try/finally because the handle is deliberately not read.
+            ScanCancellation.Registration registration = cancellation.register(session::cancelInFlight);
             try {
                 // The dialect's own complete statement, executed through the session so it inherits the
-                // query timeout and the SELECT-only refusal. This is the ONE database date of the scan.
-                return lease.value().queryCurrentDate(dialect);
+                // query timeout and the SELECT-only refusal. This is the ONE database date of the scan:
+                // it is read here once and never re-read as a retry or a fallback.
+                return session.queryCurrentDate(dialect);
             } catch (JdbcAccessException failure) {
                 throw translate(failure);
+            } finally {
+                registration.close();
             }
         } catch (TimeoutException exhausted) {
             throw borrowFailed(exhausted);

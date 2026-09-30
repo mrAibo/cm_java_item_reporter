@@ -314,7 +314,7 @@ public class StatisticsPublicationTest {
         String secret = "password=hunter2 jdbc:db2://db.example:50000/ICMADMIN";
         StatisticsEngine leaking = new StatisticsEngine() {
             @Override
-            public LocalDate databaseCurrentDate() {
+            public LocalDate databaseCurrentDate(ScanCancellation cancellation) {
                 return ANCHOR;
             }
 
@@ -345,7 +345,7 @@ public class StatisticsPublicationTest {
         String driverText = "DB2 SQL Error: SQLCODE=-204, table ICMADMIN.ICMUT01234001 has password=hunter2";
         StatisticsEngine failing = new StatisticsEngine() {
             @Override
-            public LocalDate databaseCurrentDate() {
+            public LocalDate databaseCurrentDate(ScanCancellation cancellation) {
                 return ANCHOR;
             }
 
@@ -385,7 +385,8 @@ public class StatisticsPublicationTest {
         AtomicInteger aggregateCalls = new AtomicInteger();
         StatisticsEngine engine = new StatisticsEngine() {
             @Override
-            public LocalDate databaseCurrentDate() throws StatisticsQueryException {
+            public LocalDate databaseCurrentDate(ScanCancellation cancellation)
+                    throws StatisticsQueryException {
                 if (failAnchor.get()) {
                     throw new StatisticsQueryException("database current date", "08003", 0,
                             new IllegalStateException("connection is closed"));
@@ -438,7 +439,7 @@ public class StatisticsPublicationTest {
         CountDownLatch gate = new CountDownLatch(1);
         StatisticsEngine blocking = new StatisticsEngine() {
             @Override
-            public LocalDate databaseCurrentDate() {
+            public LocalDate databaseCurrentDate(ScanCancellation cancellation) {
                 return ANCHOR;
             }
 
@@ -480,7 +481,7 @@ public class StatisticsPublicationTest {
         CountDownLatch gate = new CountDownLatch(1);
         StatisticsEngine blocking = new StatisticsEngine() {
             @Override
-            public LocalDate databaseCurrentDate() {
+            public LocalDate databaseCurrentDate(ScanCancellation cancellation) {
                 return ANCHOR;
             }
 

@@ -25,10 +25,19 @@ import java.time.LocalDate;
  * <h2>Obligations of an implementation</h2>
  *
  * <ol>
- *   <li><strong>{@link #databaseCurrentDate()} is called exactly ONCE per scan</strong>, before any
- *       aggregate call. It must be the DATABASE's current date, not the JVM's, and it must not cache a
- *       stale value across scans: each scan re-reads it so a long-running process does not report windows
- *       anchored on the day it started.</li>
+ *   <li><strong>{@link #databaseCurrentDate(ScanCancellation)} is called exactly ONCE per scan</strong>,
+ *       before any aggregate call. It must be the DATABASE's current date, not the JVM's, and it must not
+ *       cache a stale value across scans: each scan re-reads it so a long-running process does not report
+ *       windows anchored on the day it started.</li>
+ *   <li><strong>The anchor is inside the scan's cancellation domain</strong>, exactly like an aggregate:
+ *       it receives the SAME {@link ScanCancellation} instance and must register the session's abort
+ *       action ({@code JdbcSession::cancelInFlight}) through {@link ScanCancellation#register}, closing
+ *       the registration when the read finishes. The coordinator signals that one signal when the overall
+ *       scan deadline expires, when the scan is explicitly cancelled and when the context is closed, so
+ *       one mechanism reaches the anchor and every ItemType query alike. There is no separate deadline
+ *       parameter and no clock on this interface: the engine is told <em>that</em> it was cancelled, never
+ *       asked to police a time bound itself. A read that ignores the abort action must still return
+ *       exactly once; the engine must not retry it and must not substitute a JVM-local date.</li>
  *   <li><strong>{@link #aggregate} counts DISTINCT ItemIDs</strong>, deduplicated across versions and
  *       across every expected root segment - never {@code COUNT(*)} over one ICMUT root table. A missing
  *       middle segment must FAIL that ItemType (throw), not be skipped: a silently smaller union is a
@@ -61,11 +70,19 @@ import java.time.LocalDate;
 public interface StatisticsEngine {
 
     /**
-     * The database's current date, read once per scan.
+     * The database's current date, read once per scan and inside the scan's cancellation domain.
      *
+     * <p>The abort action registered with {@code cancellation} is what lets the overall scan deadline,
+     * an explicit cancellation and a context close reach the statement of this read: the coordinator
+     * signals the one {@link ScanCancellation} of the scan, and this method's registration is run from
+     * it exactly like an aggregate's. Running the statement on the caller's (supervisor) thread and
+     * registering before the statement executes is what makes that reach possible; the registration must
+     * be closed when the read finishes so the scan's action map stays bounded.
+     *
+     * @param cancellation the scan's cancellation signal; never {@code null}
      * @throws StatisticsQueryException when the database date query fails, or the dialect cannot express it
      */
-    LocalDate databaseCurrentDate() throws Exception;
+    LocalDate databaseCurrentDate(ScanCancellation cancellation) throws Exception;
 
     /**
      * One ItemType's distinct-ItemID aggregate over the scan's anchored windows.

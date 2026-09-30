@@ -6,10 +6,12 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -29,8 +31,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>{@code Connection.setReadOnly(true)} is attempted when the session is created, but the JDBC contract
  * defines it as a <em>hint</em> and many drivers ignore it, so it is defence in depth and explicitly not
  * the safety boundary. The boundary is this class: it only ever prepares a statement and executes a query
- * (never an update, never a batch, never a stored procedure), and {@link #requireSelect} refuses anything
- * that is not a {@code SELECT} or {@code WITH} statement before the driver is touched. There is no
+ * (never an update, never a batch, never a stored procedure, never a generic {@code execute}), and every
+ * statement it prepares is admitted by {@link SqlAdmission} <em>before</em> the driver is touched. That rule
+ * is not a prefix test on {@code SELECT}/{@code WITH}: it requires one single statement, no comment, no
+ * string literal and no write or control keyword <em>anywhere</em> as a whole token, so a mutation nested
+ * inside a read shape - a data-change table reference, a DML token inside a CTE, a second statement after a
+ * separator, a token hidden behind a comment - cannot reach the driver. There is no
  * exception to that rule, not even for the scan's date read: every dialect expresses
  * {@link JdbcDialect#currentDateSql()} as its vendor's documented one-row <em>SELECT</em> form (DB2's
  * {@code SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1}, Oracle's {@code SELECT TRUNC(SYSDATE) FROM DUAL}), so
@@ -133,14 +139,15 @@ public final class JdbcSession implements AutoCloseable {
      *
      * @param query   the SQL text, its bound values and the fixed operation label used in diagnostics
      * @param handler consumes each row; valid only for the duration of this call
-     * @throws JdbcAccessException on a driver failure, on a refused non-SELECT statement, or when the
+     * @throws JdbcAccessException on a driver failure, on a statement outside the admitted read-only
+     *         language, or when the
      *         session is already closed or retired; the message never contains SQL text or driver text
      */
     public void query(AggregateQuery query, JdbcRowHandler handler) throws JdbcAccessException {
         Objects.requireNonNull(query, "query");
         Objects.requireNonNull(handler, "handler");
         requireUsable();
-        requireSelect(query.sql());
+        requireAdmittedStatement(query.sql());
         String operation = query.description();
         try {
             try (PreparedStatement statement = connection.prepareStatement(query.sql())) {
@@ -240,18 +247,50 @@ public final class JdbcSession implements AutoCloseable {
      * the identifier rule and treats a {@code null}, blank or unsupported answer as statistics-unavailable
      * rather than guessing a default schema.
      *
-     * <p>A failure here deliberately does NOT retire the session: an unsupported metadata read is a
-     * statement about the driver's capabilities, not evidence that the connection is damaged. Every query
-     * path, by contrast, is conservative.
+     * <h2>The health verdict: exactly one benign failure</h2>
+     *
+     * <p>An unsupported metadata read is a statement about the driver's capabilities, not evidence that the
+     * connection is damaged. That reasoning is correct for <em>one</em> case, and it is why this method has
+     * a benign case at all: {@link SQLFeatureNotSupportedException}, or the documented
+     * feature-not-supported SQLSTATE {@code 0A000}, means this driver cannot report a schema. The operation
+     * is then refused as unavailable rather than answered, the session stays usable, and the connection
+     * remains eligible for the next lease. {@code JdbcFeatureSupport} in this package is the single, named
+     * classifier of that one case.
+     *
+     * <p>It does <strong>not</strong> apply to any other failure. Every other {@link SQLException} - and an
+     * unexpected runtime driver failure - is read as damage to the connection, exactly like the query path:
+     * {@link #markUnusable()} is called <em>before</em> the sanitized failure propagates, so the returning
+     * lease retires the physical connection instead of handing it to the next query. Applying the
+     * capability reading to a genuine failure is the defect this distinction repairs, so the two cases must
+     * stay separate: do not "simplify" them back into one unconditional catch.
+     *
+     * <p>The failure never reproduces driver text: the message is built by
+     * {@code JdbcSqlErrors.message(operation, failure)} from the fixed operation label
+     * {@code "read current schema"}, and only the SQLSTATE and the vendor code - the two fields the goal
+     * allows - are carried besides it.
+     *
+     * @throws JdbcAccessException when the driver cannot report the schema, or refuses or fails to report
+     *         it, or when this session is already closed or retired
      */
     public String currentSchema() throws JdbcAccessException {
         requireUsable();
         try {
             return connection.getSchema();
         } catch (SQLException failure) {
+            if (!JdbcFeatureSupport.isFeatureNotSupported(failure)) {
+                // A live connection failed a real call: nothing here proves its driver state is reusable,
+                // so retire the session before the sanitized failure propagates, exactly as every query
+                // path does.
+                markUnusable();
+            }
             throw new JdbcAccessException("read current schema",
                     JdbcSqlErrors.message("read current schema", failure),
                     failure.getSQLState(), failure.getErrorCode());
+        } catch (RuntimeException | Error failure) {
+            // An unexpected driver failure is not a capability answer either: retire the session, then
+            // propagate the failure unchanged - the same rule the query path applies.
+            markUnusable();
+            throw failure;
         }
     }
 
@@ -325,19 +364,26 @@ public final class JdbcSession implements AutoCloseable {
     }
 
     /**
-     * Refuses a statement that is not a read-only {@code SELECT} or {@code WITH} query.
+     * Refuses a statement that is not inside the read-only language this application generates.
+     *
+     * <p>A thin adapter over {@link SqlAdmission}, which is the single admission rule of this code base:
+     * {@link #query} calls this before it prepares anything, so no other place may keep a second, weaker
+     * reading of what a read query is. The rule is deliberately not a prefix test on
+     * {@code SELECT}/{@code WITH} - that admitted any statement whose leading text happened to look like a
+     * read, including a data-change table reference, a DML token inside a CTE, a second statement after a
+     * separator and a token hidden behind a comment.
      *
      * <p>Defence in depth under the committed source guard: even if a write, a control statement or a
-     * stored-procedure call reached this class, it would not reach the driver. The SQL text is not
-     * reproduced in the failure message.
+     * stored-procedure call reached this class, it would not reach the driver. The SQL text is never
+     * reproduced in the failure message, and neither is anything derived from it.
      */
-    private static void requireSelect(String sql) throws JdbcAccessException {
-        String leading = sql.stripLeading();
-        if (!leading.regionMatches(true, 0, "SELECT", 0, 6)
-                && !leading.regionMatches(true, 0, "WITH", 0, 4)) {
-            throw new JdbcAccessException("prepare select",
-                    "refused a statement that is not a read-only SELECT or WITH query; this query surface"
-                            + " never prepares a write, a control statement or a stored-procedure call");
+    private static void requireAdmittedStatement(String sql) throws JdbcAccessException {
+        Optional<String> refused = SqlAdmission.refuse(sql);
+        if (refused.isPresent()) {
+            throw new JdbcAccessException("admit read-only statement",
+                    "refused a statement outside the read-only SQL language this query surface generates"
+                            + " (one SELECT or WITH statement, no comment, no literal, no write or control"
+                            + " keyword): " + refused.get());
         }
     }
 

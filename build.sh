@@ -113,6 +113,30 @@ else
   exit 2
 fi
 
+# ---------------------------------------------------------------------------
+# The analytics read-only guard, on the SAME footing as the IBM one.
+#
+# Goal 03A section F lists this guard as a build-time control, and until now only
+# `tests/shell/run.sh` invoked it - so a tree that violated the analytics
+# read-only rule still produced a green ./build.sh. That is precisely the state in
+# which a guard is believed to be enforced while it is not, which this project has
+# already been bitten by twice (four never-registered suites, and the shell/Java
+# guard pair disagreeing). Running it here makes the rule a property of the build.
+#
+# Like the IBM guard it runs BEFORE the toolchain is resolved, so it works with no
+# JDK present, and it is deliberately a hard failure rather than a warning.
+# ---------------------------------------------------------------------------
+ANALYTICS_GUARD="${ROOT}/tests/shell/analytics_guard.sh"
+if [ -f "${ANALYTICS_GUARD}" ]; then
+  bash "${ANALYTICS_GUARD}" || {
+    printf 'ERROR: the Goal 03 analytics read-only guard refused this tree; see the messages above.\n' >&2
+    exit 2
+  }
+else
+  printf 'ERROR: %s is missing; the analytics read-only guarantee cannot be checked.\n' "${ANALYTICS_GUARD}" >&2
+  exit 2
+fi
+
 
 # ---------------------------------------------------------------------------
 # Class path separator.

@@ -48,6 +48,42 @@ final class SourceGuard {
     /** The shell guard whose tables these assertions use. */
     private static final String GUARD_SCRIPT = "tests/shell/ibm_guard.sh";
 
+    /**
+     * The analytics read-only shell guard, whose rules {@link AnalyticsSourceReadOnlyGuardTest} mirrors.
+     *
+     * <p>Two guards, one rule set: the shell guard is what {@code build.sh} runs, and the Java twin is where
+     * the same rules - and the mutation controls that make their silence meaningful - are asserted. Keeping
+     * the paths here, beside the IBM guard's, is what makes the agreement itself assertable.
+     */
+    static final String ANALYTICS_GUARD_SCRIPT = "tests/shell/analytics_guard.sh";
+
+    /**
+     * The ONE file exempt from the analytics guard's STATEMENT-LITERAL rules, mirroring
+     * {@code EXEMPT_RELS} in {@code tests/shell/analytics_guard.sh} exactly: same one path, asserted in both
+     * directions by {@link AnalyticsSourceReadOnlyGuardTest}.
+     *
+     * <h2>Why an exemption is required at all</h2>
+     *
+     * <p>Rule 3 of that guard refuses a string literal that carries a write or control SQL keyword as a whole
+     * token. {@code SqlAdmission} is the layer that REFUSES that vocabulary, and a refusal layer has to be
+     * able to NAME what it refuses - so without an exemption the rule forbids its own enforcement mechanism
+     * and cannot pass. A guard that cannot pass gets deleted by whoever hits it first, which is the worse
+     * outcome by far.
+     *
+     * <h2>Why it is a PATH and only a sub-rule</h2>
+     *
+     * <p>A path, never a pattern: an allow-listed pattern is how an exception silently widens. And the
+     * exemption covers ONLY the keyword-literal rule for that file - never the JDBC call rules. A file that
+     * combines the exempt vocabulary with a real offending construct is therefore still refused, which
+     * {@link AnalyticsSourceReadOnlyGuardTest#aPlantCombiningTheExemptVocabularyWithARealWriteIsStillRefused}
+     * proves by planting exactly that.
+     */
+    static final String ANALYTICS_LITERAL_EXEMPT_RELATIVE =
+            "src/main/java/com/mraibo/cminsight/db/SqlAdmission.java";
+
+    /** The basename form of the exemption, which is what a scan compares against. */
+    static final String ANALYTICS_LITERAL_EXEMPT_FILENAME = "SqlAdmission.java";
+
     /** The one file allowed to mention a {@code com.ibm} type under {@code src/main/java}. */
     static final String ISOLATION_ALLOWED_RELATIVE =
             "src/main/java/com/mraibo/cminsight/connection/CmSession.java";
@@ -140,6 +176,72 @@ final class SourceGuard {
                 "the forbidden call table in " + GUARD_SCRIPT + " parsed to zero patterns; the Java guard would"
                         + " then enforce nothing while reporting success");
         return patterns;
+    }
+
+    // ------------------------------------------------------------------ the analytics read-only guard
+
+    /** The {@code tests/shell/analytics_guard.sh} file, whose rules this suite mirrors. */
+    static Path analyticsShellGuard() {
+        return repositoryRoot().resolve(ANALYTICS_GUARD_SCRIPT);
+    }
+
+    /**
+     * The statement-literal patterns of the analytics guard, as Java regexes equivalent to the shell guard's
+     * own rules.
+     *
+     * <p>They are named here rather than copied from the shell guard's text because the shell rules are ERE
+     * written against whole lines and to be greppable, while a Java twin has to scan a whole file at once (a
+     * Java text block puts a statement's keyword on a line of its own, which a line-oriented scan cannot see).
+     * That is a deliberate, documented difference in MECHANISM, not in rule: each pattern below is the same
+     * anchored rule - a statement verb after a literal boundary, at the start of the literal, inside
+     * parentheses, after a separator, or inside a text block - with the same token-aware character class on
+     * the right of the keyword. The agreement in the direction that matters is asserted from the shell
+     * guard's own vocabulary by {@link AnalyticsSourceReadOnlyGuardTest}, so a keyword that vanished from one
+     * side is caught rather than tolerated.
+     *
+     * <p>Every keyword these patterns refuse is upper-case and every keyword the runtime rule refuses appears
+     * in them: the shell guard's {@code SQL_VERBS} and {@code SqlAdmission.forbiddenKeywords()} name the same
+     * list, and that is asserted rather than assumed.
+     */
+    static List<String> forbiddenLiteralPatterns() {
+        return List.of(
+                // A literal whose whole content is a bare write/control keyword: "DELETE", "TRUNCATE".
+                "[\"'][ \t]*(" + ANALYTICS_VERBS + ")[ \t]*[\"']",
+                // A write/control keyword immediately after a literal boundary. This is the SELECT-wrapped
+                // case: "SELECT * FROM FINAL TABLE (DELETE FROM X)", "WITH D AS (DELETE FROM X) SELECT ...",
+                // and the concatenated form "SELECT " + "DELETE FROM X".
+                "[\"'][ \t]*(" + ANALYTICS_VERBS + ")[^A-Za-z0-9_]",
+                // The same, immediately after an opening parenthesis: "(DELETE FROM X) SELECT ...".
+                "[(][ \t]*(" + ANALYTICS_VERBS + ")[^A-Za-z0-9_]",
+                // A second statement after a real separator inside the literal: "SELECT 1; DELETE FROM X".
+                "[;][ \t]*(" + ANALYTICS_VERBS + ")[^A-Za-z0-9_]",
+                // A statement start inside a text block, which the line-oriented shell guard cannot see.
+                "\"\"\"[ \\t\\r\\n]*(" + ANALYTICS_VERBS + ")");
+    }
+
+    /**
+     * The write/control vocabulary every analytics literal rule is built from.
+     *
+     * <p>This is the same set {@code SqlAdmission.forbiddenKeywords()} returns, including the
+     * data-change-table vocabulary {@code FINAL}/{@code OLD}/{@code NEW}, which is how a SELECT-wrapped
+     * mutation is spelled on DB2. The agreement between this list, {@code SqlAdmission.forbiddenKeywords()}
+     * and the shell guard's declared vocabulary is asserted by the analytics guard test.
+     */
+    static final String ANALYTICS_VERBS =
+            "INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CREATE|ALTER|DROP|GRANT|REVOKE|CALL|BEGIN|COMMIT|ROLLBACK"
+                    + "|EXEC|EXECUTE|SAVEPOINT|FINAL|OLD|NEW";
+
+    /**
+     * True when this file is the one file exempt from the analytics STATEMENT-LITERAL rules, by basename so
+     * a scan of a copied tree sees the same answer.
+     *
+     * <p>The exemption covers the literal rules and NOTHING ELSE: the JDBC call rules still apply to this
+     * file, which is what stops the exemption from being a hole. The control
+     * {@link AnalyticsSourceReadOnlyGuardTest#aPlantCombiningTheExemptVocabularyWithARealWriteIsStillRefused}
+     * plants a call into a copy of the exempt file and requires the scanner to report it.
+     */
+    static boolean isAnalyticsLiteralExempt(Path file) {
+        return file != null && ANALYTICS_LITERAL_EXEMPT_FILENAME.equals(file.getFileName().toString());
     }
 
     /**
