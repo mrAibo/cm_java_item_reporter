@@ -84,7 +84,18 @@ public final class SelfTest {
             ProviderDiscoveryTest.class,
             CoreIbmIsolationTest.class,
             IbmSourceReadOnlyGuardTest.class,
-            ScriptPermissionTest.class);
+            ScriptPermissionTest.class,
+            // Goal 04: cache/history, freshness, targeted refresh, reports and the API/UI security controls.
+            // Every one of these is registered here, because a suite in this package that is not listed makes
+            // the run fail on purpose (see unregisteredSuites below).
+            HistoryPublicationBoundaryTest.class,
+            HistoryPersistenceTest.class,
+            StatisticsFreshnessTest.class,
+            TargetedRefreshConcurrencyTest.class,
+            ReportContentSecurityTest.class,
+            ReportOutputConfinementTest.class,
+            Goal04ApiSecurityTest.class,
+            OperatorUiOfflineAssetTest.class);
 
     private SelfTest() {
     }

@@ -20,15 +20,26 @@ import java.util.Objects;
  */
 public interface ReportRenderer {
 
-    /** The format this renderer produces. */
+    /**
+     * The format this renderer produces.
+     *
+     * @return the format constant, never {@code null}
+     */
     ReportFormat format();
 
-    /** Renders the model. Never writes anything; throws only {@link ReportException}. */
+    /**
+     * Renders the model. Never writes anything; throws only {@link ReportException}.
+     *
+     * @param model the immutable captured input; the renderer reads nothing else
+     * @return the artifact's bytes, encoded for that format
+     */
     byte[] render(ReportModel model);
 
     /**
      * The renderer for one format.
      *
+     * @param format the requested format
+     * @return the renderer for that format, never {@code null}
      * @throws ReportException with {@link ReportException.Reason#FORMAT_UNAVAILABLE} when this build cannot
      *                         produce the format, so a caller cannot be handed a renderer that would fake it
      */
@@ -44,7 +55,11 @@ public interface ReportRenderer {
         };
     }
 
-    /** One renderer per format, in the vocabulary's declaration order. */
+    /**
+     * One renderer per format, in the vocabulary's declaration order.
+     *
+     * @return every renderer this build has, never {@code null}
+     */
     static List<ReportRenderer> all() {
         return List.of(new HtmlReportRenderer(), new CsvReportRenderer(), new XlsxReportRenderer());
     }

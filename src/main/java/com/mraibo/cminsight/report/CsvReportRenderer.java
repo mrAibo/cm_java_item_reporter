@@ -60,6 +60,7 @@ public final class CsvReportRenderer implements ReportRenderer {
             "durationMs",
             "reason");
 
+    /** Stateless and safe to share; a service creates one per render call. */
     public CsvReportRenderer() {
     }
 

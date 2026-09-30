@@ -17,9 +17,13 @@ import com.mraibo.cminsight.core.HistorySettings;
 import com.mraibo.cminsight.core.JdbcPoolSettings;
 import com.mraibo.cminsight.core.StatisticsSettings;
 import com.mraibo.cminsight.db.JdbcDrivers;
+import com.mraibo.cminsight.history.HistoryCapability;
+import com.mraibo.cminsight.history.HistoryStores;
 import com.mraibo.cminsight.ibm.CmAdapterProvider;
 import com.mraibo.cminsight.ibm.CmAdapterSettings;
 import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
+import com.mraibo.cminsight.report.ReportService;
+import com.mraibo.cminsight.web.HistoryApi;
 import com.mraibo.cminsight.repository.ActivationFailedException;
 import com.mraibo.cminsight.repository.ProductionRepositoryContextFactory;
 import com.mraibo.cminsight.repository.RepositoryContext;
@@ -260,46 +264,67 @@ public final class Main {
         FreshnessThreshold freshnessThreshold = FreshnessThreshold.from(config);
         HistorySettings historySettings = HistorySettings.from(config, paths);
 
-        if (printConfig) {
-            printEffectiveConfiguration(config, auth, features, profiles, classifications, secretsDir, bind, port,
-                    allowInsecureHttp, paths, adapters, jdbcPoolSettings, statisticsSettings,
-                    freshnessThreshold, historySettings);
-            printWarnings(warnings);
-            return 0;
-        }
+        // The application-local history capability, opened ONCE for the whole process.
+        //
+        // Deliberately not created per RepositoryContext: a context is replaced on every repository switch,
+        // and persistent history exists precisely so yesterday's snapshots stay reachable across that. It is
+        // also not created lazily on first write, because a scan is not the place to discover that local
+        // storage is unusable - the readiness verdict belongs at startup where an operator can see it.
+        //
+        // Opening it here does NOT make history mandatory: a missing driver, an unwritable directory or a
+        // schema from another build all produce an UNAVAILABLE capability with a fixed reason, and the
+        // repository still activates. That is why this is opened before the activation decision rather than
+        // after it, and why nothing below treats an unavailable store as an error.
+        HistoryCapability history = new HistoryCapability(historySettings, HistoryStores.open(historySettings));
+        try {
+            if (printConfig) {
+                printEffectiveConfiguration(config, auth, features, profiles, classifications, secretsDir, bind,
+                        port, allowInsecureHttp, paths, adapters, jdbcPoolSettings, statisticsSettings,
+                        freshnessThreshold, historySettings, history);
+                printWarnings(warnings);
+                return 0;
+            }
 
-        if (checkRepositoryId != null) {
-            return runRepositoryCheck(profiles, secrets, adapters, adapterSettings, jdbcPoolSettings,
-                    statisticsSettings, freshnessThreshold, checkRepositoryId, System.out, System.err);
-        }
+            if (checkRepositoryId != null) {
+                return runRepositoryCheck(profiles, secrets, adapters, adapterSettings, jdbcPoolSettings,
+                        statisticsSettings, freshnessThreshold, checkRepositoryId, System.out, System.err);
+            }
 
-        // Repository profiles are listed without an adapter; only ACTIVATION needs one. The manager is
-        // therefore built over the production factory, and auto-activation is decided with the same
-        // lookup the doctor uses, so the two cannot disagree about which repository startup activates.
-        RepositoryProfile autoActivated = ConfigCheck.autoActivatedProfile(config, profiles);
-        if (autoActivated != null && adapters.status().refused()) {
-            // Section B: auto-activation with no usable adapter is a startup FAILURE. Publishing an empty
-            // placeholder context instead would report a working console over a repository nobody can read.
-            //
-            // Section C: this is also the path an INSTALLED adapter whose IBM runtime is absent takes, and
-            // the message says which of the two it is - "not installed" and "installed but its runtime is
-            // not ready" need different operator actions. No session, factory or pool has been created.
-            System.err.println("ERROR adapter: " + ConfigCheck.AUTO_ACTIVATE_KEY + "='" + autoActivated.id()
-                    + "' is configured but " + adapters.status().describe()
-                    + "; refusing to start rather than activating a repository that cannot be read.");
-            return EXIT_ADAPTER_UNAVAILABLE;
-        }
+            // Repository profiles are listed without an adapter; only ACTIVATION needs one. The manager is
+            // therefore built over the production factory, and auto-activation is decided with the same
+            // lookup the doctor uses, so the two cannot disagree about which repository startup activates.
+            RepositoryProfile autoActivated = ConfigCheck.autoActivatedProfile(config, profiles);
+            if (autoActivated != null && adapters.status().refused()) {
+                // Section B: auto-activation with no usable adapter is a startup FAILURE. Publishing an empty
+                // placeholder context instead would report a working console over a repository nobody can
+                // read.
+                //
+                // Section C: this is also the path an INSTALLED adapter whose IBM runtime is absent takes,
+                // and the message says which of the two it is - "not installed" and "installed but its
+                // runtime is not ready" need different operator actions. No session, factory or pool has
+                // been created.
+                System.err.println("ERROR adapter: " + ConfigCheck.AUTO_ACTIVATE_KEY + "='" + autoActivated.id()
+                        + "' is configured but " + adapters.status().describe()
+                        + "; refusing to start rather than activating a repository that cannot be read.");
+                return EXIT_ADAPTER_UNAVAILABLE;
+            }
 
-        RepositoryManager repositories =
-                new RepositoryManager(productionFactory(adapters, adapterSettings, secrets, jdbcPoolSettings,
-                        statisticsSettings, freshnessThreshold));
-        if (autoActivated != null) {
-            // An activation failure propagates out of execute(), so startup fails (exit 1) instead of
-            // serving a console whose repository could not be opened.
-            repositories.switchTo(autoActivated);
-        }
+            RepositoryManager repositories =
+                    new RepositoryManager(productionFactory(adapters, adapterSettings, secrets, jdbcPoolSettings,
+                            statisticsSettings, freshnessThreshold, history));
+            if (autoActivated != null) {
+                // An activation failure propagates out of execute(), so startup fails (exit 1) instead of
+                // serving a console whose repository could not be opened.
+                repositories.switchTo(autoActivated);
+            }
 
-        return serve(config, auth, repositories, profiles, adapters, statisticsSettings, warnings);
+            return serve(config, auth, repositories, profiles, adapters, statisticsSettings, freshnessThreshold,
+                    history, paths, warnings);
+        } finally {
+            // Closed after the serving loop has returned. Never throws: a history store problem must not be
+            // able to fail the shutdown that is releasing the repository's real resources.
+            history.close();
+        }
     }
 
     /**
@@ -314,11 +339,12 @@ public final class Main {
                                                               SecretResolver secrets,
                                                               JdbcPoolSettings jdbcPoolSettings,
                                                               StatisticsSettings statisticsSettings,
-                                                              FreshnessThreshold freshnessThreshold) {
+                                                              FreshnessThreshold freshnessThreshold,
+                                                              HistoryCapability history) {
         Optional<CmAdapterProvider> provider = adapters.provider();
         if (provider.isPresent()) {
             return new ProductionRepositoryContextFactory(provider.get(), adapterSettings, secrets,
-                    jdbcPoolSettings, statisticsSettings, freshnessThreshold);
+                    jdbcPoolSettings, statisticsSettings, freshnessThreshold, history);
         }
         // The two cases need different operator actions, so the refusal names which one it is: an adapter
         // that is not installed at all, or one that IS installed but reports its IBM runtime not ready
@@ -572,6 +598,9 @@ public final class Main {
                              List<RepositoryProfile> profiles,
                              IbmCmAdapterRegistry adapters,
                              StatisticsSettings statisticsSettings,
+                             FreshnessThreshold freshnessThreshold,
+                             HistoryCapability history,
+                             AppPaths paths,
                              List<String> warnings) throws Exception {
         Router router = new Router();
         WebServer server = new WebServer(config, auth, router);
@@ -590,7 +619,14 @@ public final class Main {
         // lazy: constructing it opens no connection and loads no driver, and the routes read the active
         // repository's own statistics service when a request arrives.
         AnalyticsApi analytics = new RepositoryAnalyticsApi(repositories, statisticsSettings.enabled());
-        server.installCmApiRoutes(repositories, profiles, adapters, analytics);
+        // The Goal 04 families go in through the SAME call and equally unconditionally. The history port is
+        // built from the process-wide store, so it reports the real capability rather than a placeholder: an
+        // absent local database answers the documented unavailable state, which is an answer, while a 404
+        // would be indistinguishable from a typo in a client's URL. The report service opens nothing - it
+        // resolves reports.dir and creates directories only when a report is actually generated.
+        server.installCmApiRoutes(repositories, profiles, adapters, analytics,
+                HistoryApi.of(history.store(), history.settings().enabled()),
+                new ReportService(paths.reportsDir(config)));
 
         CountDownLatch shutdown = new CountDownLatch(1);
         AtomicBoolean closed = new AtomicBoolean();
@@ -667,7 +703,8 @@ public final class Main {
                                                      JdbcPoolSettings jdbcPoolSettings,
                                                      StatisticsSettings statisticsSettings,
                                                      FreshnessThreshold freshnessThreshold,
-                                                     HistorySettings historySettings) {
+                                                     HistorySettings historySettings,
+                                                     HistoryCapability history) {
         System.out.println("CM Insight " + VERSION + " effective configuration");
         System.out.println("  config file       : " + describePath(config.sourcePath()));
         System.out.println("  web.bind          : " + bind);
@@ -712,6 +749,11 @@ public final class Main {
                 + " (freshness judgement only; stale completed snapshots remain visible)");
         System.out.println("  history           : " + historySettings.describe()
                 + (historySettings.enabled() ? "" : "  (persistent history disabled; live statistics unaffected)"));
+        // The STORE's own verdict, not just the configured intent: "history is enabled" and "history can
+        // actually be used" are different facts, and an operator reading --print-config needs the second.
+        // This is a local readiness answer - the store was opened at startup and reports what it found, so
+        // printing it opens nothing and connects to nothing.
+        System.out.println("  history store     : " + history.describe());
         System.out.println("  reports dir       : " + paths.reportsDir(config));
         for (RepositoryProfile profile : profiles) {
             printJdbcReadiness(profile);

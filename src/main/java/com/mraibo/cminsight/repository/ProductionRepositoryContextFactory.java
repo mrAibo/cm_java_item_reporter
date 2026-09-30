@@ -10,6 +10,7 @@ import com.mraibo.cminsight.core.CmPoolDiagnostics;
 import com.mraibo.cminsight.core.CmPoolSettings;
 import com.mraibo.cminsight.core.CmSessionFactory;
 import com.mraibo.cminsight.core.CloseState;
+import com.mraibo.cminsight.core.HistorySettings;
 import com.mraibo.cminsight.core.JdbcPoolSettings;
 import com.mraibo.cminsight.core.MetadataCache;
 import com.mraibo.cminsight.core.RepositoryServices;
@@ -17,8 +18,11 @@ import com.mraibo.cminsight.core.StatisticsSettings;
 import com.mraibo.cminsight.db.Db2Dialect;
 import com.mraibo.cminsight.db.JdbcDialect;
 import com.mraibo.cminsight.db.OracleDialect;
+import com.mraibo.cminsight.history.HistoryCapability;
+import com.mraibo.cminsight.history.HistoryRecorder;
 import com.mraibo.cminsight.ibm.CmAdapterProvider;
 import com.mraibo.cminsight.ibm.CmAdapterSettings;
+import com.mraibo.cminsight.metadata.ItemTypeSummary;
 import com.mraibo.cminsight.metadata.MetadataRepository;
 import com.mraibo.cminsight.retention.RetentionRepository;
 import com.mraibo.cminsight.statistics.FreshnessThreshold;
@@ -27,9 +31,12 @@ import com.mraibo.cminsight.statistics.StatisticsService;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 /**
  * The production activation path: the one factory that turns a repository profile into a fully initialized
@@ -93,6 +100,9 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
     private final StatisticsSettings statisticsSettings;
     private final FreshnessThreshold freshnessThreshold;
 
+    /** The process-wide history capability; an unavailable store is a real object, never null. */
+    private final HistoryCapability history;
+
     /**
      * @param provider the discovered adapter; the caller refuses to activate when there is none
      * @param settings the validated pool bounds, cache TTL and credential resolver
@@ -127,12 +137,33 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
                                              JdbcPoolSettings jdbcPoolSettings,
                                              StatisticsSettings statisticsSettings,
                                              FreshnessThreshold freshnessThreshold) {
+        this(provider, settings, secrets, jdbcPoolSettings, statisticsSettings, freshnessThreshold,
+                HistoryCapability.unwired(HistorySettings.defaults(java.nio.file.Path.of("data"))));
+    }
+
+    /**
+     * The complete production form: additionally receives the process-wide history capability.
+     *
+     * <p>The store is passed IN rather than created here, because persistent history outlives a
+     * {@code RepositoryContext}: this factory runs once per activation while the store must survive every
+     * repository switch. What is built here is the per-repository {@link HistoryRecorder}, which captures
+     * this repository's identity and its retention-policy names - both of which belong to the activation,
+     * not to the store.
+     */
+    public ProductionRepositoryContextFactory(CmAdapterProvider provider,
+                                             CmAdapterSettings settings,
+                                             SecretResolver secrets,
+                                             JdbcPoolSettings jdbcPoolSettings,
+                                             StatisticsSettings statisticsSettings,
+                                             FreshnessThreshold freshnessThreshold,
+                                             HistoryCapability history) {
         this.provider = Objects.requireNonNull(provider, "provider");
         this.settings = Objects.requireNonNull(settings, "settings");
         this.secrets = Objects.requireNonNull(secrets, "secrets");
         this.jdbcPoolSettings = Objects.requireNonNull(jdbcPoolSettings, "jdbcPoolSettings");
         this.statisticsSettings = Objects.requireNonNull(statisticsSettings, "statisticsSettings");
         this.freshnessThreshold = Objects.requireNonNull(freshnessThreshold, "freshnessThreshold");
+        this.history = Objects.requireNonNull(history, "history");
     }
 
     @Override
@@ -208,15 +239,43 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
         //    The metadata supplier is the CACHE's view, not the adapter's, so a scan reuses the same
         //    per-context ItemType snapshot the read API serves rather than issuing its own CM sessions.
         MetadataRepository statisticsMetadata = cache == null ? adapterMetadata : cache.metadataView();
+        Supplier<List<ItemTypeSummary>> itemTypeSource =
+                statisticsMetadata == null ? List::of : statisticsMetadata::listItemTypes;
+
+        // The per-repository history recorder. It captures THIS repository's identity and, when it can, the
+        // retention-policy name as it was when the scan ran - a stored snapshot must be renderable without a
+        // live read, so a name that was not captured stays empty rather than being re-derived from metadata
+        // that may since have changed.
+        //
+        // Built even when the store is unavailable, because the recorder is what knows how to turn a
+        // published snapshot into a stored shape; an unavailable store simply makes record() answer empty.
+        //
+        // Retention names are read from the metadata CACHE's already-loaded view, never by asking the adapter:
+        // this is activation, and the goal is explicit that nothing here may open a CM session. When the cache
+        // has no snapshot yet the names are absent, which is the honest answer - "not known at capture time".
+        HistoryRecorder recorder = HistoryRecorder.forRepository(history.store(), profile.id(),
+                profile.displayName(), profile.databaseVendor().name());
+        try {
+            MetadataRepository metadataForNames = cache == null ? adapterMetadata : cache.metadataView();
+            if (metadataForNames != null) {
+                recorder = recorder.withRetentionPolicyNames(retentionNamesOf(metadataForNames.listItemTypes()));
+            }
+        } catch (RuntimeException metadataUnavailable) {
+            // A history nicety must never be the reason an activation fails, and it must never be the reason
+            // a CM session is opened. Without the names the report renders them as unknown, which is correct.
+            recorder = recorder.withRetentionPolicyNames(Map.of());
+        }
+
         StatisticsService statistics = StatisticsCapability.activate(
                 profile,
                 secrets,
                 dialectFor(profile),
                 jdbcPoolSettings,
                 statisticsSettings,
-                statisticsMetadata == null ? List::of : statisticsMetadata::listItemTypes,
+                itemTypeSource,
                 resources::add,
-                freshnessThreshold);
+                freshnessThreshold,
+                recorder::record);
 
         RepositoryServices published = new RepositoryServices(
                 cache == null ? null : cache.metadataView(),
@@ -227,6 +286,30 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
         // 8. Publish, only now. A repository whose adapter offers no read service is still a valid
         //    activated repository - its services are reported as unavailable rather than faked.
         return new RepositoryContext(profile, List.copyOf(resources), published);
+    }
+
+    /**
+     * The retention-policy name per ItemType id, from an already-loaded metadata list.
+     *
+     * <p>Pure and tolerant: a missing name, a blank name or a null row is simply omitted, because the stored
+     * shape's contract is "the name when known" and an invented placeholder would be indistinguishable from
+     * a real policy once it reached a report.
+     */
+    private static Map<Integer, String> retentionNamesOf(List<ItemTypeSummary> itemTypes) {
+        if (itemTypes == null || itemTypes.isEmpty()) {
+            return Map.of();
+        }
+        Map<Integer, String> names = new LinkedHashMap<>();
+        for (ItemTypeSummary summary : itemTypes) {
+            if (summary == null) {
+                continue;
+            }
+            String policy = summary.retentionPolicyName();
+            if (policy != null && !policy.isBlank()) {
+                names.put(summary.itemTypeId(), policy);
+            }
+        }
+        return names.isEmpty() ? Map.of() : names;
     }
 
     /**

@@ -154,8 +154,8 @@ public final class HistoryApiRoutes {
         if (limit == null) {
             return;
         }
-        HistoryId before = before(ctx);
-        if (before == null && ctx.query(BEFORE_PARAMETER) != null) {
+        Cursor cursor = cursor(ctx);
+        if (!cursor.valid()) {
             return;
         }
 
@@ -165,11 +165,18 @@ public final class HistoryApiRoutes {
         boolean hasMore = false;
         String nextBefore = "";
         if (view.state() == HistoryApi.State.AVAILABLE) {
-            Page page = page(requestedRepository, before, limit);
+            Page page = page(requestedRepository, cursor.id(), limit);
             if (page == null) {
                 ctx.sendJson(HttpStatus.OK, listJson(
                         new View(HistoryApi.State.UNAVAILABLE, READ_FAILED), requestedRepository,
                         activeId, limit, 0L, new Object[0], false, ""));
+                return;
+            }
+            if (page.unresolvedCursor()) {
+                // A well-formed cursor that names nothing is a client error, and answering the head of the
+                // list instead would silently repeat rows the client already displayed.
+                ctx.sendError(HttpStatus.BAD_REQUEST, "bad_request",
+                        "The '" + BEFORE_PARAMETER + "' cursor does not name a stored snapshot");
                 return;
             }
             entries = page.entries();
@@ -197,10 +204,10 @@ public final class HistoryApiRoutes {
             } else {
                 Optional<HistoryDetail> cursor = history.find(before);
                 if (cursor.isEmpty()) {
-                    // An unknown cursor is a client error, but it is also indistinguishable from "the page
-                    // you were on was pruned"; answering the head of the list would silently repeat rows, so
-                    // the page is empty and the client is told the cursor did not resolve.
-                    return new Page(new Object[0], safeCount(repositoryId), false, "");
+                    // The cursor is well-formed but names nothing: either the client made it up, or the page
+                    // it was on has since been pruned. Both are answered the same way - never by silently
+                    // restarting at the head of the list.
+                    return Page.unresolvedCursor(safeCount(repositoryId));
                 }
                 rows = history.listAfter(repositoryId, cursor.get().summary(), limit + 1);
             }
@@ -214,7 +221,7 @@ public final class HistoryApiRoutes {
                 entries[i] = JsonWriter.raw(summaryJson(rows.get(i)));
             }
             String nextBefore = hasMore && returned > 0 ? rows.get(returned - 1).id().value() : "";
-            return new Page(entries, safeCount(repositoryId), hasMore, nextBefore);
+            return new Page(entries, safeCount(repositoryId), hasMore, nextBefore, false);
         } catch (RuntimeException failure) {
             return null;
         }
@@ -416,15 +423,25 @@ public final class HistoryApiRoutes {
         return RequestPaths.boundedLimit(Integer.parseInt(raw.trim()), DEFAULT_LIMIT, MAX_LIMIT);
     }
 
-    /** The validated cursor, or {@code null} when it is absent or malformed. */
-    private static HistoryId before(RequestContext ctx) {
+    /**
+     * The paging cursor, or an invalid marker after the refusal has been written.
+     *
+     * <p>A malformed cursor is refused with {@code 400} rather than answered with the head of the list:
+     * silently restarting paging would repeat rows the client has already displayed, and a handler that
+     * simply returned here would produce the router's "no response" failure instead of a clean refusal.
+     */
+    private static Cursor cursor(RequestContext ctx) {
         String raw = ctx.query(BEFORE_PARAMETER);
         if (raw == null) {
-            return null;
+            return new Cursor(true, null);
         }
-        // A malformed cursor is refused here rather than answered with the head of the list: silently
-        // restarting paging would repeat rows the client already displayed.
-        return HistoryId.parse(raw).orElse(null);
+        Optional<HistoryId> parsed = HistoryId.parse(raw);
+        if (parsed.isEmpty()) {
+            ctx.sendError(HttpStatus.BAD_REQUEST, "bad_request",
+                    "The '" + BEFORE_PARAMETER + "' cursor must be a valid history id");
+            return new Cursor(false, null);
+        }
+        return new Cursor(true, parsed.get());
     }
 
     private String activeRepositoryId() {
@@ -456,7 +473,17 @@ public final class HistoryApiRoutes {
     }
 
     /** One bounded page, plus the facts a paging client needs. */
-    private record Page(Object[] entries, long stored, boolean hasMore, String nextBefore) {
+    private record Page(Object[] entries, long stored, boolean hasMore, String nextBefore,
+                        boolean unresolvedCursor) {
+
+        /** The page that a well-formed cursor which names nothing produces: no rows, and a refusal. */
+        static Page unresolvedCursor(long stored) {
+            return new Page(new Object[0], stored, false, "", true);
+        }
+    }
+
+    /** A validated paging cursor, or the marker that a malformed one was already refused. */
+    private record Cursor(boolean valid, HistoryId id) {
     }
 
     @Override

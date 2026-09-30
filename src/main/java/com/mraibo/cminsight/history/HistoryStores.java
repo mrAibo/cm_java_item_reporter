@@ -229,6 +229,20 @@ public final class HistoryStores {
     }
 
     /**
+     * Refuses a non-positive page size, exactly as {@link HistoryStore#list(String, int)} requires.
+     *
+     * <p>One implementation for every store: a caller bug is refused identically whether or not local
+     * history happens to be available, so a limit that is accepted in one environment cannot be silently
+     * tolerated in another.
+     */
+    static int requirePositiveLimit(int limit) {
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be positive but was " + limit);
+        }
+        return limit;
+    }
+
+    /**
      * The driver class, when it is loadable and really is a JDBC driver.
      *
      * <p>Loaded WITHOUT initialization and never through {@code DriverManager}: discovery must be a pure

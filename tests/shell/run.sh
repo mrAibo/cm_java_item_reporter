@@ -20,12 +20,23 @@
 # that discovers zero tests FAILS instead of reporting a meaningless success.
 #
 # Environment:
-#   CM_INSIGHT_TEST_TIMEOUT        per-file timeout in seconds (default 300)
-#   CM_INSIGHT_TEST_TOTAL_BUDGET   whole-suite budget in seconds (default 600); tests
+#   CM_INSIGHT_TEST_TIMEOUT        per-file timeout in seconds (default 900)
+#   CM_INSIGHT_TEST_TOTAL_BUDGET   whole-suite budget in seconds (default 1800); tests
 #                                  that cannot start inside it are reported as
 #                                  skipped failures, never as passes
 #   GITHUB_ACTIONS                 when "true", failures also emit ::error:: workflow
 #                                  commands so they show up as check-run annotations
+#
+# WHY THESE DEFAULTS ARE LARGER THAN THEY LOOK: the guard suites are the slow ones, and
+# legitimately so. The analytics read-only guard now proves its rules SENSITIVELY - for
+# every statement-literal rule it plants a known-bad sample that must be refused and a
+# known-good sample that must be accepted, each in its own copy of the source tree - and
+# the IBM guard does comparable work. On this host a copy-heavy guard run costs over three
+# minutes of mostly SYSTEM time, because the working tree sits on a filesystem where
+# copying is far more expensive than in a native Linux checkout. A 300 s cap therefore
+# turned a passing suite into "timed out after 300s", which is the worst kind of red: it
+# blames the code for the environment. The cap exists to catch a HANG, not to race a
+# thorough guard, so it is set well above the observed cost while still being a real bound.
 #
 # Message prefixes: "===" section headers, "ok:"/"FAIL:"/"skip:" per test.
 # Exit codes: 0 all tests passed, 1 at least one failed / none discovered, 2 usage.
@@ -36,8 +47,8 @@ SELF="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${SELF}")" && pwd)" || { printf 'ERROR: cannot locate %s\n' "${SELF}" >&2; exit 2; }
 REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd)" || { printf 'ERROR: cannot resolve the repository root from %s\n' "${SCRIPT_DIR}" >&2; exit 2; }
 
-PER_FILE_TIMEOUT="${CM_INSIGHT_TEST_TIMEOUT:-300}"
-TOTAL_BUDGET="${CM_INSIGHT_TEST_TOTAL_BUDGET:-600}"
+PER_FILE_TIMEOUT="${CM_INSIGHT_TEST_TIMEOUT:-900}"
+TOTAL_BUDGET="${CM_INSIGHT_TEST_TOTAL_BUDGET:-1800}"
 ONLY=""
 LIST_ONLY=false
 

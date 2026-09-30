@@ -197,11 +197,23 @@ public interface HistoryApi {
 
         @Override
         public List<HistorySummary> list(String repositoryId, int limit) {
+            // Bounds-checked HERE, before the store is reached. The store interface requires every
+            // implementation to REFUSE a non-positive limit, and the unavailable implementation now throws
+            // for one; a caller's bad limit must therefore surface as an empty page (or as the caller's own
+            // 400) rather than as an exception that would read like a storage failure. The routes bound
+            // their limits before calling, so this is the port's own guarantee, not a second validation of
+            // the same value on the request path.
+            if (limit <= 0) {
+                return List.of();
+            }
             return store.list(repositoryId, limit);
         }
 
         @Override
         public List<HistorySummary> listAfter(String repositoryId, HistorySummary before, int limit) {
+            if (limit <= 0) {
+                return List.of();
+            }
             return store.listAfter(repositoryId, before, limit);
         }
 

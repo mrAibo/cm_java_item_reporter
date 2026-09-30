@@ -23,6 +23,10 @@ import java.util.Optional;
  * store for the process lifetime therefore cannot be surprised by a later call - which is exactly why the
  * API surface is callable rather than throwing {@code UnsupportedOperationException}.
  *
+ * <p>One thing is deliberately still refused: a non-positive page size. The interface requires every
+ * implementation to reject one, and an invalid argument is a caller bug rather than a storage state, so it
+ * must not be tolerated merely because local history is unavailable in this environment.
+ *
  * <h2>The reason is fixed at construction and carries no value</h2>
  *
  * <p>It is sanitized once (control characters removed, whitespace collapsed, length bounded) so the same
@@ -92,15 +96,23 @@ public final class UnavailableHistoryStore implements HistoryStore {
         return Optional.empty();
     }
 
-    /** Empty, whatever the arguments. */
+    /**
+     * Empty for every VALID argument.
+     *
+     * <p>A non-positive page size is refused exactly as the interface requires, and identically to the local
+     * store: an invalid argument is a caller bug, not a storage state, so it must not be tolerated just
+     * because local history happens to be unavailable in this environment.
+     */
     @Override
     public List<HistorySummary> list(String repositoryId, int limit) {
+        HistoryStores.requirePositiveLimit(limit);
         return List.of();
     }
 
-    /** Empty, whatever the arguments: there is nothing to page through. */
+    /** Empty for every valid argument; a non-positive page size is refused exactly as {@link #list} does. */
     @Override
     public List<HistorySummary> listAfter(String repositoryId, HistorySummary before, int limit) {
+        HistoryStores.requirePositiveLimit(limit);
         return List.of();
     }
 

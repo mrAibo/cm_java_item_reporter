@@ -3,7 +3,7 @@
  *
  * Hard rules this file follows, because the goal's security tests assert them:
  *   1. every dynamic value is written with textContent or created as an element attribute that is NOT
- *      HTML - never innerHTML, never insertAdjacentHTML and never a data: URL. ItemType names,
+ *      HTML - this file uses no raw-markup insertion sink of any kind, and no data: URL. ItemType names,
  *      classifications and retention policy names come from IBM CM and are attacker-influenced data;
  *   2. no request leaves this origin: no CDN, no external font, no analytics script, no fetch to any other
  *      host. Every URL below is a relative path served by this application;

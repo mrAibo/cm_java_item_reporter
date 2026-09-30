@@ -901,10 +901,7 @@ public final class H2HistoryStore implements HistoryStore {
 
     /** Capped page size: a single read can never materialize an unbounded list. */
     private static int effectiveLimit(int limit) {
-        if (limit < 1) {
-            throw new IllegalArgumentException("limit must be positive but was " + limit);
-        }
-        return Math.min(limit, MAX_PAGE_SIZE);
+        return Math.min(HistoryStores.requirePositiveLimit(limit), MAX_PAGE_SIZE);
     }
 
     private static String key(String repositoryId) {

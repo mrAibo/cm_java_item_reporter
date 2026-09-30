@@ -37,12 +37,20 @@ public record GeneratedReport(ReportId id, ReportFormat format, String fileName,
         }
     }
 
-    /** The response content type for this artifact. */
+    /**
+     * The response content type for this artifact.
+     *
+     * @return the format's content type, never {@code null}
+     */
     public String contentType() {
         return format.contentType();
     }
 
-    /** A short, value-free description for diagnostics. */
+    /**
+     * A short, value-free description for diagnostics.
+     *
+     * @return a one-line description carrying no path and no content
+     */
     public String describe() {
         return "report[" + id + ", " + format.token() + ", " + sizeBytes + " byte(s)]";
     }
