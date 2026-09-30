@@ -20,9 +20,11 @@
 - configurable ItemType classifications
 - bounded parallel refresh
 - cached results stay visible while refresh runs
-- persistent historical snapshots
-- HTML / CSV / XLSX report pipeline
-- authenticated offline Web UI
+- persistent historical snapshots — **delivered in Goal 04** (application-local aggregate store; a stale
+  result stays visible and no read can trigger a refresh)
+- HTML / CSV / XLSX report pipeline — **delivered in Goal 04** (one immutable model as the only renderer
+  input, so a report of stored data performs zero database reads; XLSX is a real minimal OOXML workbook)
+- authenticated offline Web UI — **delivered in Goal 04** (all eight views, no runtime Internet dependency)
 - extension point for later ItemID/PID lookup
 
 ### Implemented API contract (Goal 03)

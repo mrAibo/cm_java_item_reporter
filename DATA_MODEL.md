@@ -140,3 +140,71 @@ Do not implement guessed SQL. Record whether resource parts or all parts count, 
 ## Historical snapshots
 
 Persist aggregate statistics only. Never store document content, passwords or unnecessary user metadata.
+
+Goal 04 implements this. The stored shape is three levels - a snapshot header, one row per
+ItemType, and one row per metric - and the guiding rule is that **absence is never zero**.
+
+### Stored shape
+
+`HistorySummary` is the header and the identity a stored snapshot is addressed by:
+repository identity and display name, database vendor, capture and scan times, scan duration,
+anchor date, the scan id as diagnostic metadata, ItemType and partial-failure counts, a
+completion flag, and the logical-item total. `HistoryDetail` adds the per-ItemType rows and a
+single warning string; its constructor **refuses** a row list whose size disagrees with the
+header's declared count, so a stored snapshot cannot claim coverage it does not have.
+
+`HistoryItemType` carries the captured name, classification and retention-policy name as
+**text**, with no versions or parts field at all. That is deliberate: a stored snapshot must
+render without a live read, so a name that was not captured stays empty rather than being
+re-derived from metadata that may since have changed. Re-deriving it would let an old report
+silently disagree with itself.
+
+### The one rule this model exists to enforce
+
+`HistoryMetric` is a **state plus an optional number**: `AVAILABLE` with a value, or
+`UNAVAILABLE`/`ERROR` with a reason. A non-available metric **structurally cannot carry a
+number** - the constructor nulls it - so no renderer can print `0` for something nobody
+measured. A measured zero stays `0`. This is the single most important property of the
+feature: once a fabricated zero reaches a report it is indistinguishable from a measurement,
+and an administrator would reasonably read it as "this ItemType has no items".
+
+### Identity
+
+`HistoryId` is a **store-owned opaque token** - lowercase alphanumeric, bounded length, no path
+separator, dot or percent - because it appears in `GET /api/history/{id}`. The scan's own
+`scanId` is monotonic only **within one repository context**, so using it as a key would let
+yesterday's scan collide with today's. It is carried as diagnostic metadata and never as an
+identity.
+
+### Durability, atomicity and retention
+
+Schema version is explicit (**v1**), written **last** so that a version table with no row means
+"creation did not finish" rather than "this is version 0" - repaired only when the file holds
+no snapshot rows. A version from another build returns the same store object **refused**, with
+both versions named, rather than reinterpreting stored rows.
+
+One connection, autocommit off, one lock per method, and a write that is **one transaction**:
+the snapshot row, every ItemType row, every metric row **and** the retention prune commit
+together, so a reader sees either the previous state or the whole new one and never a partial
+snapshot. The retention bound prunes the **oldest rows of the same repository only**; child rows
+go with their snapshot. Two repositories never prune each other.
+
+### Freshness is a judgement, not a cache
+
+`cache.statistics.ttl.seconds` (default 300, range 0..86400) is a **freshness threshold** over
+the age of the already-published snapshot - never a second cache and never an implicit refresh.
+The published `StatisticsSnapshot` remains the single authoritative in-memory value; nothing
+copies it. Age is always reported, a stale result stays **visible** and is still served, and no
+`GET` can start database work because freshness is a pure function of a timestamp and a
+threshold. A snapshot that has never been captured is reported as **unknown, not stale**: an
+operator who has never scanned should not see a staleness warning about data that does not
+exist.
+
+### Targeted refresh is not a snapshot
+
+A targeted single-ItemType refresh produces separate immutable **detail** data keyed by
+ItemType identity, with its own `capturedAt`, anchor and age. It never mutates the published
+full snapshot, never replaces the dashboard totals and is **never persisted as a full history
+snapshot** - it holds no reference to the snapshot, totals, coordinator or history store, and
+it cannot reach the history publication hook because that hook fires only from the coordinator's
+single full-snapshot publication point.

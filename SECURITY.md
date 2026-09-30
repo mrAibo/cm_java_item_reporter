@@ -76,3 +76,42 @@ Two properties of that wiring are deliberate and worth preserving:
 
 This note previously stated the opposite - that the routes were implemented but not yet registered - which was true of the working tree at the time it was written and became false when the wiring landed. It is corrected here rather than deleted, because a documented security surface that overstates OR understates what is served is equally misleading.
 
+## Implemented controls (Goal 03 and Goal 04)
+
+Same rule as above: recorded so the review can check the implementation against the intent.
+
+### The analytics read-only guarantee, and its one exemption
+
+Goal 03 added a second scanned tree and a genuinely new boundary. `tests/shell/analytics_guard.sh` (run by `build.sh` on every build, before the toolchain is even resolved) refuses, under `src/main/java/com/mraibo/cminsight/db` **and** `.../statistics`, every `executeUpdate`/`addBatch`/`commit`/`rollback`/`prepareCall`-class call and every string literal carrying a write or control SQL keyword as a whole token. It also refuses any JDBC call that is not a plain `execute(`.
+
+Goal 04 persists application-local history, which necessarily issues `CREATE`, `INSERT`, `DELETE` and `commit` and names `java.sql.Connection`. That store must not be able to reach IBM CM or the repository database, but it must also not require weakening the rule for everything else. So `src/main/java/com/mraibo/cminsight/history` is a **named exempt tree**, in both the shell guard and its Java twin (`SourceGuard` + `AnalyticsSourceReadOnlyGuardTest`), never a loosened pattern over all of `src/main/java` - widening the rule for every future file in order to accommodate one package is how a guard becomes decoration.
+
+The exemption is proven in **both directions** and the direction that matters is the negative one: a realistic H2 store **passes** inside the exempt tree; **the same file planted in `statistics/` is refused**, measured at six violations; and a planted driver-handle type outside the exempt trees is still refused, with a committed test asserting it. A further committed test asserts the two guards name the **same** path, that the tree exists and is non-empty, and that a driver handle type planted outside it is still caught - so the boundary cannot silently widen.
+
+### Report output is untrusted-data-safe in both directions
+
+A generated report carries names, classifications and retention-policy names that originate in IBM CM, so a report is an injection surface as much as the UI is. Three independent defences, each with a mutation control that makes the corresponding test fail when it is removed:
+
+- **HTML** escapes every dynamic value (`& < > " '`, control characters and unpaired surrogates), writes no dynamic value into an attribute, style block or script, and emits no `script`, `link`, `img`, `iframe`, `base` or `svg` element, no remote URL and no `@import`, with a `default-src 'none'` policy of its own.
+- **CSV** fences every text value whose first character is `=` `+` `-` `@` TAB or CR with a leading `'` **and** quotes it, because a spreadsheet executes such a cell. Quoting also triggers on the delimiter, quote, CR, LF, TAB and edge spaces, with embedded quotes doubled. Measured metrics stay bare digits so a column is still summable, and an unmeasured metric renders `UNAVAILABLE`/`ERROR` rather than `0`.
+- **XLSX** is a real minimal OOXML workbook written with the JDK zip support, and there is **no code path that writes an `<f>` formula cell at all** - so a hostile value cannot become a formula even by omission. Text is written as `t="inlineStr"`, metrics as numeric `<v>` cells, and the package contains no macro part, no `TargetMode="External"` relationship and no hyperlink.
+
+### Report output confinement
+
+`reports.dir` is resolved through `AppPaths`, and every write is confined by `resolve` -> `normalize` -> containment check against a base computed once in the constructor. **No method accepts a name, suffix, subdirectory or path**, and a file is always `report-<validated id>.<extension from an enum>`, so no request text is ever concatenated into a filename. `find()` additionally refuses symbolic links and re-verifies the real path. The temporary file is created **inside** `reports.dir` so the final move is atomic within one filesystem, and it is deleted on every failure path.
+
+### The new routes
+
+Six routes, all authenticated, all installed by the **same unconditional call** as the CM and analytics routes before the socket opens: `GET /api/history`, `GET /api/history/{id}`, `POST /api/reports`, `GET /api/reports`, `GET /api/reports/{id}/download`, `POST /api/statistics/item/{itemTypeId}/refresh`.
+
+Both state-changing routes carry a **distinct** action header - `report-generate` and `statistics-item-refresh` - checked **before any state is read or changed**, with `application/x-www-form-urlencoded`, `multipart/form-data` and `text/plain` still refused. The committed tests prove the refusal has **zero** side effects with a witness counter rather than by inspection, and a mutation control that neutralises the header check makes those tests fail. List limits are clamped to `[1,100]` with `limit+1` hasMore probing and an **opaque cursor**, so a caller cannot ask for an unbounded read; malformed limits, cursors and identifiers are refused with `400` before reaching the store.
+
+### Two containment decisions worth keeping
+
+- **The history store owns an application-local file and nothing else.** It is created once per process and closed on shutdown, and it reads no repository profile JDBC value and uses no analytics pool connection. Its absence is a normal state: a missing driver, an unwritable directory or a schema from another build all produce a documented `UNAVAILABLE` state with a fixed reason, and repository activation is unaffected.
+- **The operator UI has no runtime Internet dependency.** No CDN, no external font, no analytics script and no remote URL appears in any asset, every asset is served from the flat `/web` namespace behind the same authentication as the API, and the existing CSP (`default-src 'self'`) plus `no-store`/`nosniff`/`no-referrer` headers are unchanged. Every dynamic value reaches the DOM through `textContent` and explicit element creation, never `innerHTML`.
+
+### Doctor and configuration readiness are LOCAL statements
+
+`--validate-config` / `bin/doctor.sh` report history and report readiness by loading a driver **class name** and inspecting the data directory. They open no IBM CM session, no repository-database connection and no local history database, and the output says so in as many words. "Expected ready" is never presented as "the store has been opened", because those are different facts and the second is the one that matters.
+

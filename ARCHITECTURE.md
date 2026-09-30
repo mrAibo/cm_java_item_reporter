@@ -263,7 +263,18 @@ Dynamic third-party JAR plugins are not required. Modularity is package/service 
 - L2 current statistics cache
 - L3 persistent historical snapshots
 
-Web UI displays cached data immediately while a refresh runs.
+L2 stays the **single mutable truth** for current statistics: the published `StatisticsSnapshot` is one
+immutable value, and `cache.statistics.ttl.seconds` is a **freshness judgement** over its age rather than
+a cache with its own eviction or an implicit refresh. Its age is always reported, a stale result stays
+**visible** and is still served, and no `GET` can start database work because freshness is a pure function
+of a timestamp and a threshold. A snapshot that has never been captured is reported as **unknown, not
+stale** - an operator who has never scanned should not see a staleness warning about data that does not
+exist.
+
+L3 is the Goal 04 history store. It never replaces L2: a scan publishes to L2 and the publication hook
+*also* records to L3, and a targeted refresh writes neither.
+
+The web UI displays the cached value immediately and labels its age; it never blocks a route on a refresh.
 
 ## Web
 
@@ -286,7 +297,19 @@ GET  /api/diagnostics/cm            adapter, pool, cache and the last sanitised 
 GET  /api/statistics                analytics availability, scan progress, latest snapshot, coverage
 POST /api/statistics/refresh        starts at most one scan; requires the action header below
 GET  /api/diagnostics/jdbc          database vendor, driver readiness, pool and scan facts
+POST /api/statistics/item/{id}/refresh  targeted refresh of ONE ItemType; action header below
+GET  /api/history                   stored snapshot summaries, bounded and newest first
+GET  /api/history/{id}              one stored snapshot with its per-ItemType rows
+POST /api/reports                   generates a report; requires the action header below
+GET  /api/reports                   generated reports, bounded and newest first
+GET  /api/reports/{id}/download     one generated report as an attachment
 ```
+
+The router has no path-parameter support, so `{name}`, `{id}` and `{itemTypeId}` all use the same house
+pattern: **one prefix registration** at the collection path that also serves the deeper path, branching on
+the trailing segment and refusing a malformed one. A second registration at the same `(method, path)` is a
+startup failure rather than a silent override, which is what keeps that pattern from being replaced by a
+duplicate route.
 
 `POST /api/statistics/refresh` changes local process state, so it uses the same CSRF-resistant custom
 header as repository selection:
@@ -299,6 +322,11 @@ The header is the control because a cross-site HTML form cannot set one; the thr
 types are refused as well. The check runs BEFORE any state is read or changed, so a missing or wrong header
 has zero side effects and can never start a scan. A second refresh while a scan is in flight is a
 deterministic `409 scan_in_progress`, not a duplicate scan.
+
+Goal 04 adds two more guarded actions, each a **distinct** value so one permission cannot be replayed as
+another: `report-generate` for `POST /api/reports` and `statistics-item-refresh` for the targeted refresh.
+Both are checked before any state is read, and the committed tests prove the refusal has zero side effects
+with a witness counter rather than by inspection.
 
 Installed unconditionally: "no JDBC driver is installed" is a normal state, so `GET /api/statistics` and
 `GET /api/diagnostics/jdbc` must answer the documented `UNAVAILABLE` state instead of a `404` that reads
@@ -327,3 +355,68 @@ configuration, and no health endpoint calls a live database. A loadable driver i
 reachable database.
 
 All static assets are local.
+
+## Analytics operations: one gate, two operations
+
+A full scan and a targeted single-ItemType refresh must never overlap inside one repository context, because
+both read through the same bounded JDBC pool and both would publish into a state the other is describing.
+Goal 03B gave the coordinator a generation-owned full-scan latch, but that latch is private to the
+coordinator and the targeted path cannot share it - and a second latch would be two gates that can
+disagree.
+
+So there is **one** `AnalyticsOperationGate` per activation with two operations (`FULL_SCAN`,
+`TARGETED_REFRESH`) and an **owner token**. The coordinator takes it after its own latch and, on conflict,
+**undoes its own latch** rather than leaving it stuck; the targeted service takes it before it reads any
+state, so a refusal is a value rather than a queue. A release from any token other than the holder's is
+**ignored**, so a late release from a replaced context cannot open the gate while the current operation
+still runs.
+
+Release happens on the coordinator's existing exactly-once **drained** path - after the generation is
+proven physically dead - and **not** when the result became final. Released earlier, a targeted refresh
+could start while a worker of a finished scan still held a JDBC lease.
+
+The cardinal rule is that a targeted refresh must not disturb the published full result: it never mutates
+the published `StatisticsSnapshot`, never replaces the dashboard totals, and is never persisted as a full
+history snapshot. It holds no reference to the snapshot, the totals, the coordinator or the history store,
+and it cannot reach the history publication hook because that hook fires only from the coordinator's single
+full-snapshot publication point.
+
+## Persistent history
+
+History is an **application-local aggregate read model** behind a typed `HistoryStore` boundary, with a
+real embedded-H2 implementation and an explicitly unavailable one - so "history is missing" is a state
+rather than a null check. It is created **once per process** and closed on shutdown, deliberately not per
+`RepositoryContext`, because a context is replaced on every repository switch and history exists precisely
+so yesterday's snapshots survive that.
+
+Only a scan that reached **normal terminal completion** reaches history, and that is a property of where
+the hook sits rather than a rule each caller remembers: the recorder is invoked from the coordinator's
+single publication point, after the snapshot is visible, and a listener failure is **contained** so an
+optional local feature can never fail a scan. A timed-out, cancelled or catastrophic scan publishes nothing
+and therefore records nothing.
+
+Absence is never zero: a metric is a state plus an optional number, and a non-available metric structurally
+cannot carry a value. See `DATA_MODEL.md` for the stored shape, the identity rule and the durability
+contract.
+
+## Reports
+
+One immutable model is the only input a renderer can see, so a format cannot reach anything the model does
+not carry. A model built from a **stored** snapshot takes no store, session or clock, so a report of old
+data performs **zero** IBM CM or JDBC reads by construction rather than by discipline.
+
+Three formats: HTML and CSV are mandatory and JDK-only; XLSX is a **real** minimal OOXML workbook written
+with the JDK zip support, never a renamed CSV, with no formula cell, no macro and no external relationship.
+Output is confined below `reports.dir` by resolving, normalising and containment-checking rather than by
+trusting concatenation, the temporary file is created inside the same directory so the final move is
+atomic, and no HTTP parameter ever becomes a filesystem path. `SECURITY.md` records the escaping and
+formula-fence rules and their mutation controls.
+
+## Web UI
+
+The operator console is a set of flat, dependency-free assets served from the authenticated `/web`
+namespace: repository selection, Dashboard, ItemTypes, ItemType Properties, Retention, History, Reports and
+System/Diagnostics. There is no build step, no framework and no runtime Internet dependency - no CDN, no
+external font and no analytics script - and the existing CSP is unchanged. Every dynamic value reaches the
+DOM through `textContent` and explicit element creation, never `innerHTML`, because ItemType names and
+classifications originate in IBM CM.

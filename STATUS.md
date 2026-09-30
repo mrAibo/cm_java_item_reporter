@@ -26,12 +26,290 @@
 - Goal 03B reviewed checkpoint (the review that approved this goal): `155379c38e9a3afdc090c4b9991aeaf7e1bf2059`
 - Goal 03B implementation commit: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`
 - Goal 03B final execution/handoff HEAD: `edab82f25e69af2a8170fb3130ec69f7314fb0c8`
-- Stage: **Goal 03B REVIEWED / ACCEPTED — GOAL 04 APPROVED / EXECUTE**
-- Current approved goal: `harness/GOAL_04_CACHE_REPORTS_UI.md`
+- Goal 04 reviewed checkpoint (the review that approved this goal): `fdb8ecd7be04013cd9ca1f3ed5adebc994a1ca96`
+- Goal 04 implementation commit (the commit this section describes): `c8a871d00e66cd857e2cd5f4148b0df76b7a1438`
+- Stage: **Goal 04 EXECUTED, PUSHED and GREEN on both Actions events; awaiting architecture review**
+- Current approved goal: `harness/GOAL_04_CACHE_REPORTS_UI.md` (executed)
 - Goal 03: accepted analytics core; its correction chain is closed by accepted Goal 03B
 - Goal 03A: COMPLETED / REVIEWED — corrections closed by accepted Goal 03B
 - Goal 03B: COMPLETED / REVIEWED / ACCEPTED
-- Goal 04: **APPROVED / EXECUTE**
+- Goal 04: **COMPLETED / PENDING ARCHITECTURE REVIEW**
+- Goal 05: **PROVISIONAL / DO NOT EXECUTE**
+
+## Goal 04 execution record
+
+Date/time: end of the Goal 04 execution session (local time). Branch:
+`bootstrap/cm-insight-architecture`. **PR #1 remains OPEN, draft, unmerged.**
+
+Checkpoint protocol: a commit cannot truthfully record its own SHA, and this file changes
+the tree, so the commit above is the implementation commit this section describes. The
+authoritative head is read from Git, and the handoff report records the exact local and
+verified remote HEAD after this documentation commit has been pushed.
+
+### Cache model: one truth, and freshness as a judgement
+
+**`cache.statistics.ttl.seconds` is a freshness threshold, not a cache.** The published
+`StatisticsSnapshot` remains the single authoritative in-memory statistics value; nothing
+copies it and no second mutable snapshot exists. Age is always reported, a stale result
+stays **visible** and is still served, and no GET can start database work because freshness
+is a pure function of a timestamp and a threshold - which is exactly why it is a value type
+with no access to a pool rather than a service that could be tempted to refresh.
+
+Two smaller decisions worth recording. A snapshot that has never been captured is reported
+as **unknown, not stale** - an operator who has never scanned should not see a staleness
+warning about data that does not exist. And a threshold of 0 means any non-zero age is
+stale, while a result captured in the same instant it is judged stays fresh, which is the
+only reading of "0 means no freshness period" that does not declare a just-published result
+stale.
+
+### Persistent L3 history
+
+History is an application-local store of **aggregate read-model data** behind a typed
+`HistoryStore` boundary, with a real embedded-H2 implementation and an explicitly
+unavailable one, so "history is missing" is a state rather than a null check. It is created
+once for the process and closed on shutdown - deliberately **not** per `RepositoryContext`,
+because a context is replaced on every repository switch and history exists precisely so
+yesterday's snapshots survive that.
+
+**Identity is store-owned.** `HistoryId` is an opaque, validated token (lowercase
+alphanumeric, no path separator, dot or percent) because it appears in
+`GET /api/history/{id}`; the scan's own `scanId` is monotonic only **within one context**,
+so using it as a key would make yesterday's scan collide with today's. It is carried as
+diagnostic metadata and never as an identity.
+
+**Only a normally completed full scan reaches history**, and that is a property of where the
+hook sits rather than a rule each caller remembers: the recorder is invoked from the
+coordinator's **single publication point**, after the snapshot is visible, with a listener
+failure **contained** so an optional local feature can never fail a scan. A timed-out,
+cancelled or catastrophic scan publishes nothing and therefore records nothing; a targeted
+refresh never builds a full snapshot at all, so it cannot reach the hook.
+
+**Durability and retention.** Schema version is explicit (v1), written last so "version
+table with no row" means creation did not finish, and a version from another build returns
+the same store object **refused** with both versions named rather than reinterpreting rows.
+One eagerly-opened connection, autocommit off, one lock per method, and a write that is ONE
+transaction - snapshot row, every ItemType row, every metric row and the retention prune -
+with a single commit. The retention bound prunes the **oldest rows of the same repository
+only**; two repositories never prune each other.
+
+**Absence is never zero.** `HistoryMetric` is a state plus an optional number, and a
+non-AVAILABLE metric **structurally cannot carry a value**. That is the single most important
+property of this feature: a stored zero would be indistinguishable from a measurement once
+it reached a report.
+
+### Targeted single-ItemType refresh
+
+A full scan and a targeted refresh share **ONE** `AnalyticsOperationGate` with two
+operations and an owner token. There was no such gate before this goal - the only latch was
+the coordinator's private full-scan CAS, which the targeted path could not share, and a
+second latch would have been two gates that can disagree.
+
+The gate is acquired **before any state is read** (a refusal is a value, never a queue) and
+released exactly once on every path, with a fresh owner token per attempt so a late release
+from a **replaced context** cannot open the gate while the current operation runs. The
+coordinator takes it after its own full-scan latch and, on conflict, **undoes its own
+latch** rather than leaving it stuck; it releases on the existing exactly-once **drained**
+path rather than when the result became final, because releasing earlier would let a
+targeted refresh start while a worker of a finished scan still held a JDBC lease.
+
+**The cardinal rule is proven, not described.** After a real full-scan publication, a
+targeted refresh anchored on a **different** date leaves the published snapshot the **same
+instance**, the totals record equal, the per-ItemType list the same object, the snapshot's
+own anchor unchanged, and the history publication counter unmoved. The targeted path holds
+no snapshot, totals, coordinator or history reference and never builds a
+`StatisticsSnapshot`. It is separate immutable detail data keyed by ItemType identity with
+its own `capturedAt`/anchor/age.
+
+### Reports
+
+One immutable model is the only input a renderer can see, so a format cannot reach anything
+the model does not carry. `fromHistory(...)` takes **no store, session or clock**, so a
+report from a stored snapshot performs **zero** IBM CM or JDBC reads by construction. Rows
+carry `HistoryMetric`, so no renderer can print `0` for an unmeasured metric while a
+measured zero stays `0`.
+
+| Format | Contract |
+| --- | --- |
+| HTML | JDK-only; every dynamic value escaped; inline CSS only; no script/link/img/iframe/base/svg, no remote URL, plus a `default-src 'none'` CSP meta |
+| CSV | text starting `= + - @ TAB CR` prefixed `'` **and** always quoted; quoting also on delimiter/quote/CR/LF/TAB/edge space with doubled quotes; CRLF; measured non-negative metrics stay bare digits |
+| XLSX | a **real** minimal OOXML workbook via `java.util.zip`: 7 parts, 2 sheets, text as `t="inlineStr"`, metrics as numeric `<v>` cells, **no code path that writes `<f>`**, no macros, no `TargetMode="External"` |
+
+**Output confinement** is `resolve` -> `normalize` -> containment check against the
+base computed once in the constructor, with no method accepting a name, suffix, subdirectory
+or path; `find()` additionally refuses symlinks and re-verifies the real path. The temporary
+file is created **inside** `reports.dir` so the atomic move cannot cross a filesystem, and is
+deleted on every failure path.
+
+### The new API and the operator UI
+
+Six routes, all authenticated: `GET /api/history`, `GET /api/history/{id}`,
+`POST /api/reports`, `GET /api/reports`, `GET /api/reports/{id}/download`,
+`POST /api/statistics/item/{itemTypeId}/refresh`. The router has no path-parameter support,
+so `{id}` and `{itemTypeId}` use the house pattern - one **prefix** registration that also
+serves the deeper path, branching on the trailing segment and refusing a malformed one.
+
+They are installed by the **same unconditional call** as the CM and analytics routes, before
+the socket opens, because "implemented but never installed" is a defect this project has
+shipped once. `POST /api/reports` requires `X-CM-Insight-Action: report-generate` and
+`POST /api/statistics/item/{id}/refresh` requires `statistics-item-refresh` - **distinct**
+values, checked **before any state is read or changed**, with the three form-sendable
+content types still refused. List limits are clamped to `[1,100]` with `limit+1` hasMore
+probing and an opaque cursor.
+
+The UI is the complete offline English console: repository selection, Dashboard, ItemTypes,
+ItemType Properties, Retention, History, Reports and System/Diagnostics. Every dynamic value
+goes through `textContent` and explicit element creation; there is no CDN, external font,
+analytics script or runtime Internet URL in any asset.
+
+### Two integration decisions worth recording
+
+**The read-only guard now names a SECOND exempt tree.** The history store legitimately issues
+CREATE/INSERT/DELETE/commit and names `java.sql` types - against its **own** local file, and
+it touches neither IBM CM nor the repository database, which is what the guard protects. So
+`src/main/java/com/mraibo/cminsight/history` is exempt **by name** in both the shell guard
+and its Java twin, never by loosening a pattern for all of `src/main/java` (which would
+delete the guarantee for every future file to accommodate one package). Proven with a
+planted control: a realistic H2 store **passes** inside the tree, the **same** file planted
+in the statistics tree is **refused with six violations**, and the Java twin still refuses a
+planted driver-handle type outside the exempt trees. A new test asserts the two guards agree
+on the same path, that the tree is real and non-empty, and that the exemption is scoped to
+the handle-type rule for that one tree.
+
+**`AppPaths` now reports `data.dir` and `reports.dir` as LIVE** rather than reserved for a
+later goal, because the history store and report output are their first consumers;
+`logs.dir` stays reserved and the stale assertion is updated to say so. Claiming an
+operational path is live before any code reads it is the inaccuracy that flag exists to
+prevent.
+
+### A real red, and its honest cause
+
+`tests/shell/run.sh` raised its per-file timeout from **300s to 900s** (total budget 600s to
+1800s). The analytics guard legitimately takes over **three minutes** because it now proves
+its rules **sensitively** - a known-bad and a known-good sample per statement-literal rule,
+each in its own copy of the source tree - and this host's filesystem makes copying far more
+expensive than a native Linux checkout (`real 3m33s`, of which `sys` was 2m11s). The old cap
+turned a **passing** suite into "timed out after 300s", which is the worst kind of red
+because it blames the code for the environment. The cap exists to catch a hang, not to race
+a thorough guard.
+
+### Tests actually executed, with results
+
+**Stub path**, solo runs on a quiet tree: `./build.sh` **exit 0**, core
+**"Tests run: 423, failures: 0"** (376 pre-existing plus **47 new**), IBM
+**"Tests run: 51, failures: 0"**, jar packaged; `./tests/selftest.sh` **exit 0**;
+`./tests/shell/run.sh` **exit 0** with all five suites (addr 29s, analytics_source_guard
+241s, ibm_source_guard 144s, lifecycle 0s, marker 34s); `./bin/doctor.sh` **exit 0**
+(0 failures, 17 warnings); `./build.sh --check-ibm-isolation` **exit 0**;
+`bash tests/shell/analytics_guard.sh` **exit 0**; `bash tests/shell/analytics_source_guard_test.sh`
+**exit 0**, **93 checks / 0 failures**.
+
+**New suites (47 tests):** `HistoryPublicationBoundaryTest` (8), `HistoryPersistenceTest` (5),
+`StatisticsFreshnessTest` (5), `TargetedRefreshConcurrencyTest` (6),
+`ReportContentSecurityTest` (6), `ReportOutputConfinementTest` (6),
+`Goal04ApiSecurityTest` (6), `OperatorUiOfflineAssetTest` (5). Fixture (not a suite):
+`RecordingHistoryStore`.
+
+**Mutation controls, raw output, run in throwaway copies:**
+- action-header check neutralised -> `Goal04ApiSecurityTest` **FAILS 2** ("must be refused
+  with 403, not 201" / "not 200");
+- formula-prefix defence neutralised -> `ReportContentSecurityTest` **FAILS 1** ("the hostile
+  value survived unfenced as a leading cell: '=1+1'");
+- typed-id validation dropped -> `Goal04ApiSecurityTest` **FAILS 1** ("must never reach the
+  store: the typed identifier has to refuse it first, not a later sanitization step").
+  Building the UI control found a **real gap** in the first scanner - a protocol-relative
+  `im.src = '//host/x'` slipped through - which is fixed.
+
+**Real IBM CM 8.7 SDK, reported separately:** `./build.sh --require-ibm` **exit 0** with the
+real jars staged (4 jars, then removed; `lib/ibm` is empty), compiling **17 adapter and 12
+test sources** and running the full IBM suite **51/0 on that real-SDK class path**.
+
+**Real H2, reported separately:** H2 2.2.224 was copied into `lib/app` for a real run and
+then removed (`lib/app` is empty). The history store's schema creation/version, full
+round-trip, ordering and paging, retention isolation, the failed-insert atomicity proof with
+a fresh reader, the one-connection witness and the version-mismatch refusal all ran against
+the real database; the **same** suite passes with **no** H2 present via the documented
+absent-driver contract.
+
+**Independent verification:** see the table below; the verdict and its evidence are stated
+there and in the handoff report. The work was committed as `c8a871d` **before** verification,
+so the verification ran against a frozen revision.
+
+### Live environment status - honest
+
+**NO LIVE DB2/ORACLE SQL VALIDATION WAS PERFORMED** and **no live IBM CM validation was
+performed**: neither a database nor a CM server is reachable from the execution host. A
+loadable driver is not live database validation and is not presented as it. The XLSX
+workbook was verified by parsing the produced package with the JDK **and** with an
+independent Python reader; **no spreadsheet application is installed locally**, so no
+third-party consumer opened it and that limitation is stated rather than implied away.
+
+### GitHub Actions - both events, same SHA
+
+| Commit | push run | pull_request run |
+| --- | --- | --- |
+| `c8a871d` (implementation) | `36791517987` **success** | `36791523587` **success** |
+
+### Unresolved risks
+
+1. **No live DB2/Oracle SQL validation and no live IBM CM validation** - unchanged, and still
+   the largest gap.
+2. **No spreadsheet application opened the XLSX output.** It is verified by two independent
+   parsers, not by Excel; a hostile value is asserted to be a text cell and a metric a
+   numeric cell, but a real consumer has not been exercised.
+3. **No browser or JS engine exists in this build**, so the UI's DOM behaviour is asserted on
+   the served asset bytes plus mutated-source controls rather than by rendering it. That is
+   the honest maximum here.
+4. **"No CM/JDBC lease held while rendering" is not directly observable.** It is covered by a
+   fake-driver call counter showing zero across all formats plus a structural check that the
+   report model and renderers cannot hold a `java.sql` or `com.ibm` type.
+5. **A genuinely interrupted mid-write export has no injectable seam**, so the reachable
+   failure modes were tested (oversized content, unusable output directory) rather than a
+   kill in the middle of a write.
+6. **The H2 storage cases need the local jar.** Without it the suite asserts the
+   absent-driver contract, which is not the same as verified storage; every assertion message
+   names the branch so it cannot be misread.
+7. **`Files.isWritable` reports false on this host for directories that are plainly
+   writable**, so a readiness line can say UNAVAILABLE while the store opens. The doctor
+   checks both `Files.isWritable` and `File.canWrite()`.
+8. **Concurrent `./build.sh` runs corrupt `build/`** on this host (no `flock` in the MSYS
+   shell), producing misleading `NoClassDefFoundError` failures for classes that exist on
+   disk. Every count above is a **solo** run.
+9. **The IBM SDK needs its own logging configuration** (unchanged from Goal 02B).
+10. **`bin/clean.sh` does not remove `data/` or `reports/`**, so H2 state and generated
+    reports survive a clean. That is a stated decision, not an oversight.
+
+### Architecture decisions and goal state
+
+No architecture rule was changed. Goal 04 **promoted one permissive seam to an explicit
+shared arbiter** (the analytics-operation gate), **made one inherited number a judgement
+rather than a cache** (`cache.statistics.ttl.seconds`), **added a second named exempt tree**
+to the read-only guard with a proven boundary, **activated two paths that were previously
+reserved**, and **raised a timeout that was mis-blaming the environment**.
+
+**Next goal: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 05.
+Do not merge PR #1.
+
+### Resume / review instruction
+
+"Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
+Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
+DATA_MODEL.md, REQUIREMENTS.md, harness/MASTER_GOAL.md and harness/GOAL_04_CACHE_REPORTS_UI.md
+completely. Goals 01 through 03B are completed and reviewed; Goal 03B is accepted; Goal 04 is
+executed, pushed and green on both Actions events for the same SHA. REVIEW Goal 04 before
+approving anything further - do not re-execute it and do not execute Goal 05. Preserve the accepted
+optional-SDK/read-only/API architecture, the frozen distinct-ItemID counting semantics, the
+one-anchor-per-scan rule, the hard-bounded lazy JDBC pool with no connection outside its factory,
+the Goal 03B generation-owned scan gate, and the single analytics-operation gate shared by full and
+targeted scans. Carry forward five facts: no live IBM CM validation and no live DB2/Oracle SQL
+validation has been performed because neither a CM server nor a database is reachable from the
+execution host; this repository is developed on Windows where git does not record the executable
+bit, so validate on Linux with JDK 17 before trusting a CI-touching change; for the same reason a
+second build in one working tree cannot be detected on that host, so verify in a private copy and
+treat nested-class NoClassDefFoundError as a concurrency artifact to re-run solo; the real IBM CM
+8.7 SDK jars and the H2 jar are local prerequisites that must never be committed; and the shell
+suite's per-file timeout is deliberately generous because a copy-heavy guard legitimately takes
+minutes on this filesystem."
+
 - Goal 05: PROVISIONAL / DO NOT EXECUTE
 - Cross-session continuation: `CM_INSIGHT_HANDOFF_2026-09-30_GOAL04.md`
 - DeepSeek Harness starter: `harness/GOAL_04_DEEPSEEK_HARNESS_PROMPT.md`
@@ -99,7 +377,7 @@ totals/history; confines report generation to immutable snapshot/history input; 
 HTML/CSV/XLSX capability and output-injection/path controls; and preserves the accepted
 Goal 03B operation/lifecycle gate across full and targeted refreshes.
 
-**Next approved goal: `harness/GOAL_04_CACHE_REPORTS_UI.md` — APPROVED / EXECUTE.**
+**Goal 04 has since been executed: see the Goal 04 execution record at the top of this file.**
 Goal 05 remains PROVISIONAL / DO NOT EXECUTE. PR #1 must remain open/draft/unmerged.
 
 ## Goal 03B execution record
@@ -1796,31 +2074,33 @@ make the unavailable-code semantics explicit and must not imply -1 came from IBM
 
 ## Exact next goal
 
-**NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 04 or Goal 05.
+**NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.** Do not execute Goal 05.
 
 Review first:
 
 1. `harness/MASTER_GOAL.md`
-2. `harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md` and the Goal 03A execution record at the top of this file
+2. `harness/GOAL_04_CACHE_REPORTS_UI.md` and the Goal 04 execution record at the top of this file
 
 ## Resume instruction
 
 "Continue CM Insight in mrAibo/cm_java_item_reporter on branch bootstrap/cm-insight-architecture.
 Fetch and fast-forward to the current remote state. Read STATUS.md, ARCHITECTURE.md, SECURITY.md,
-DATA_MODEL.md, harness/MASTER_GOAL.md and harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md
-completely. Goals 01 through 01C are accepted; Goal 02 was reviewed with changes required; Goals 02A
-and 02B are accepted; Goal 03 is accepted apart from the four corrections Goal 03A closed; Goal 03A is
-executed and pushed. REVIEW Goal 03A before approving anything further - do not re-execute it and do not
-execute Goal 04 or Goal 05. Preserve the accepted optional-SDK/read-only/API architecture, the frozen
-distinct-ItemID counting semantics, the one-anchor-per-scan rule, the hard-bounded lazy JDBC pool with no
-connection outside its factory, the latched one-scan gate with its separate draining fact, and every Goal
-01A-01C hard-bound, fail-closed, Linux lifecycle and security invariant. Carry forward four facts: no live
-IBM CM validation and no live DB2/Oracle SQL validation has been performed because neither a CM server
-nor a database is reachable from the execution host; this repository is developed on Windows where git
-does not record the executable bit, so validate on Linux with JDK 17 before trusting a CI-touching change;
-for the same reason a second build in one working tree cannot be detected on that host, so verify in a
-private copy and treat nested-class NoClassDefFoundError as a concurrency artifact to re-run solo; and
-the real IBM CM 8.7 SDK jars are a local prerequisite that must never be committed."
+DATA_MODEL.md, REQUIREMENTS.md, harness/MASTER_GOAL.md and harness/GOAL_04_CACHE_REPORTS_UI.md
+completely. Goals 01 through 03B are completed and reviewed, with Goal 03B accepted; Goal 04 is
+executed, pushed and green on both Actions events for the same SHA. REVIEW Goal 04 before approving
+anything further - do not re-execute it and do not execute Goal 05. Preserve the accepted
+optional-SDK/read-only/API architecture, the frozen distinct-ItemID counting semantics, the
+one-anchor-per-scan rule, the hard-bounded lazy JDBC pool with no connection outside its factory, the
+Goal 03B generation-owned scan gate, and the single analytics-operation gate shared by full and
+targeted scans. Carry forward five facts: no live IBM CM validation and no live DB2/Oracle SQL
+validation has been performed because neither a CM server nor a database is reachable from the
+execution host; this repository is developed on Windows where git does not record the executable bit,
+so validate on Linux with JDK 17 before trusting a CI-touching change; for the same reason a second
+build in one working tree cannot be detected on that host, so verify in a private copy and treat
+nested-class NoClassDefFoundError as a concurrency artifact to re-run solo; the real IBM CM 8.7 SDK
+jars and the H2 jar are local prerequisites that must never be committed; and the shell suite's
+per-file timeout is deliberately generous because a copy-heavy guard legitimately takes minutes on
+this filesystem."
 
 ## Mandatory checkpoint rule
 
