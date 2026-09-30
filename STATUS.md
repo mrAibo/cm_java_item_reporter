@@ -21,12 +21,107 @@
 - Goal 03 CI fix commit (the commit this section describes): `dc24dbb31b51619719416cf7da2b51b506cc6cb8`
 - Goal 03 final reviewed remote HEAD: `1dcd8f30b20cf57b2abfb688cc12b1e710e4ef6a`
 - Goal 03A reviewed checkpoint (the review that approved this goal): `023b47552169d9ac35058461ae07d7788a9fdafb`
-- Goal 03A implementation commit (the commit this section describes): `7313176fa0b9b97d79516aadaaddada6dbea5a39`
-- Stage: **Goal 03A EXECUTED, PUSHED; Actions verified below**
-- Current approved goal: `harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md` (executed)
-- Goal 03: accepted apart from the four corrections this goal closed
-- Goal 03A: COMPLETED / PENDING ARCHITECTURE REVIEW
+- Goal 03A implementation commit: `7313176fa0b9b97d79516aadaaddada6dbea5a39`
+- Goal 03A final execution/handoff HEAD: `b7d190a13178de894d44a7536a8e8b29526f19c7`
+- Stage: **Goal 03A REVIEWED — CHANGES REQUIRED; Goal 03B APPROVED / EXECUTE**
+- Current approved goal: `harness/GOAL_03B_SCAN_GENERATION_OWNERSHIP_AND_GUARD_CONTRACT.md`
+- Goal 03: accepted analytics core; correction chain remains open
+- Goal 03A: COMPLETED / REVIEWED — CORRECTION GOAL 03B REQUIRED
+- Goal 03B: APPROVED / EXECUTE
 - Goals 04-05: PROVISIONAL; do not execute
+
+## Goal 03A architecture review — changes required
+
+Reviewed tree: `b7d190a13178de894d44a7536a8e8b29526f19c7` on
+`bootstrap/cm-insight-architecture`. PR #1 remains open/draft/unmerged.
+
+The review accepts the currentSchema health correction and the runtime SQL admission
+correction. It also accepts the intended one-anchor cancellation design as production
+code, but requires a production-wiring regression test before that claim is considered
+closed. The scan lifecycle correction is **not accepted yet** because a worker/supervisor
+can still disappear from tracking before its Java thread actually terminates.
+
+### Blocking lifecycle finding: self-deregister is not physical thread death
+
+`ScanCoordinator` calls `deregisterThread(Thread.currentThread())` from a worker,
+supervisor or watchdog `finally`, then may open the one-scan gate from that same still-live
+thread. The gate therefore proves "not present in the list", not `Thread.isAlive()==false`.
+That distinction is exactly the invariant Goal 03A was meant to make structural.
+
+The review reproduced the forbidden schedule in a private exact-SHA clone by inserting
+only a barrier after the existing successful gate-release call. No action order was
+changed. With a scheduler delay that made the old supervisor the releaser, the probe
+reported:
+
+- `FIRST_RELEASER=cm-insight-scan-review-supervisor`
+- `OLD_SUPERVISOR_ALIVE_WITH_GATE_OPEN=true`
+- `SECOND_SCAN_STARTED_WHILE_OLD_SUPERVISOR_ALIVE=true`
+- `STALE_SUPERVISOR_CREATED_LINGERING_WATCHER=true`
+- `SUPERVISOR_GENERATION_VIOLATION=true`
+
+After scan N+1 repopulated the coordinator-global thread list, the still-live old
+supervisor resumed and ran `startLingeringWatcher()` against N+1's threads. This proves
+that the defect is not only a wording issue: old-generation cleanup can operate on a new
+generation's mutable tracking state.
+
+### Required test closure: production anchor cancellation wiring
+
+The production implementation correctly registers
+`cancellation.register(session::cancelInFlight)` in
+`JdbcStatisticsEngine.databaseCurrentDate(...)`. However, the committed tests currently
+prove the cancellation policy through a fake engine, not that production registration.
+
+Review mutation: replacing only the production anchor registration with a no-op left the
+complete `./build.sh` green: core **367/0**, IBM stub **51/0**, exit **0**. Goal 03B must
+add a real-`JdbcStatisticsEngine` fake-JDBC test whose blocked current-date statement
+observes `PreparedStatement.cancel()`, with an opposite mutation that fails.
+
+### Required guard closure: the declared path exemption is basename-wide
+
+The analytics source guard documents one exact literal-vocabulary exemption:
+`src/main/java/com/mraibo/cminsight/db/SqlAdmission.java`. The shell implementation uses
+`grep --exclude=SqlAdmission.java`, and the Java twin compares only `file.getFileName()`.
+The shell helper also applies that basename exclusion to JDBC call rules although the
+contract says only the literal-vocabulary sub-rule is exempt.
+
+Review mutation: adding
+`src/main/java/com/mraibo/cminsight/statistics/review/SqlAdmission.java` with a
+write-shaped SQL literal passed the standalone analytics guard and the entire build.
+The mutated build again reported core **367/0**, IBM stub **51/0**, exit **0**. Goal 03B
+must make the exemption exact-path-only and literal-rule-only, and must plant same-basename
+siblings as negative controls.
+
+### Baseline verification and accepted 03A areas
+
+A clean local clone of exact SHA `b7d190a` under WSL / JDK 17.0.20.1 ran
+`./build.sh` successfully: core **367/0**, IBM stub **51/0**, jar built. The earlier
+`git archive` and Windows-created-worktree reds were review-environment artefacts (`.git`
+metadata unavailable/mis-addressed to WSL), not product failures; the real local clone
+removed both artefacts.
+
+Accepted from Goal 03A and not to be reopened in 03B unless mechanically necessary:
+`JdbcSession.currentSchema()` health semantics; runtime `SqlAdmission`; generic JDBC
+`execute`/`createStatement` refusal; analytics guard integration into `build.sh`; frozen
+logical-item/date/segment semantics; optional hard-bounded JDBC; and all Goal 01C/02B
+resource rules.
+
+No live DB2 or Oracle SQL validation was performed during this review. A green driver or
+SDK compile is not live database evidence.
+
+**Next goal: `harness/GOAL_03B_SCAN_GENERATION_OWNERSHIP_AND_GUARD_CONTRACT.md` — APPROVED / EXECUTE.**
+Do not execute Goal 04 or Goal 05. Do not merge PR #1.
+
+### Resume / execution instruction
+
+"Continue CM Insight on `bootstrap/cm-insight-architecture`. Fetch and fast-forward first.
+Read `STATUS.md`, `ARCHITECTURE.md`, `SECURITY.md`, `DATA_MODEL.md`, `harness/MASTER_GOAL.md`,
+`harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md` and
+`harness/GOAL_03B_SCAN_GENERATION_OWNERSHIP_AND_GUARD_CONTRACT.md` completely. Execute ONLY Goal 03B.
+Do not re-execute Goal 03/03A and do not execute Goal 04/05. Preserve the accepted Goal 03A
+currentSchema and runtime SqlAdmission changes. Fix physical scan-generation ownership, add a production
+JdbcStatisticsEngine anchor-cancel mutation-sensitive test, and make the analytics guard exemption exact-path
+and literal-rule-only. Commit/push yourself, verify local==remote and both exact-SHA Actions green, leave PR #1
+draft/unmerged, then stop for architecture review."
 
 ## Goal 03A execution record
 
