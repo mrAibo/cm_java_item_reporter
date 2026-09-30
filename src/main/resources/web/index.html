@@ -3,28 +3,58 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>CM Insight</title>
+  <title>CM Insight console</title>
   <link rel="stylesheet" href="/web/app.css">
 </head>
 <body>
-<main>
-  <div class="bar">
-    <div class="brand">CM Insight</div>
-    <div class="badge">Bootstrap / Read-only</div>
-  </div>
-  <section class="hero">
-    <h1>IBM Content Manager insight console</h1>
-    <p>The core runtime is up. Repository profiles, IBM CM adapters, parallel statistics, retention
-       viewer and reports are delivered by the goals defined in this repository.</p>
-    <div class="grid">
-      <div class="card"><div class="label">Service</div><div class="value" id="service-name">CM Insight</div></div>
-      <div class="card"><div class="label">Version</div><div class="value" id="service-version">&mdash;</div></div>
-      <div class="card"><div class="label">Mode</div><div class="value" id="service-mode">&mdash;</div></div>
-      <div class="card"><div class="label">Health</div><div class="value" id="service-health">&mdash;</div></div>
+  <a class="skip-link" href="#main">Skip to the console content</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">CM</span>
+      <span>CM Insight</span>
     </div>
-    <p class="note" id="service-note">Loading runtime details&hellip;</p>
-  </section>
-</main>
-<script src="/web/app.js"></script>
+    <div class="topbar-facts">
+      <span class="badge">Read-only V1/V2</span>
+      <span class="pill" id="fact-repository">Repository: none active</span>
+      <span class="pill" id="fact-analytics">Analytics: unknown</span>
+      <span class="pill" id="fact-freshness">Statistics: no data</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidenav" aria-label="Console sections">
+      <ul class="nav-list">
+        <li><button type="button" class="nav-button" id="nav-repository" data-view="repository">Repository</button></li>
+        <li><button type="button" class="nav-button" id="nav-dashboard" data-view="dashboard">Dashboard</button></li>
+        <li><button type="button" class="nav-button" id="nav-itemtypes" data-view="itemtypes">ItemTypes</button></li>
+        <li><button type="button" class="nav-button" id="nav-retention" data-view="retention">Retention</button></li>
+        <li><button type="button" class="nav-button" id="nav-history" data-view="history">History</button></li>
+        <li><button type="button" class="nav-button" id="nav-reports" data-view="reports">Reports</button></li>
+        <li><button type="button" class="nav-button" id="nav-system" data-view="system">System</button></li>
+      </ul>
+      <p class="nav-note">
+        Every request is authenticated and every action requires its own header. No page of this console
+        contacts any host other than this one.
+      </p>
+    </nav>
+
+    <main id="main" tabindex="-1">
+      <div id="view" class="view"></div>
+    </main>
+  </div>
+
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
+    <div class="drawer-head">
+      <h2 id="drawer-title" class="drawer-title">Details</h2>
+      <button type="button" class="button ghost" id="drawer-close">Close</button>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="/web/app.js"></script>
 </body>
 </html>

@@ -147,6 +147,26 @@ PRIMARY_REL='src/main/java/com/mraibo/cminsight/db'
 # call added there is exactly as fatal as one added in db/.
 SECONDARY_RELS=('src/main/java/com/mraibo/cminsight/statistics')
 
+# ---------------------------------------------------------------------------
+# The APPLICATION-LOCAL history tree, exempt from the SQL rules by design.
+#
+# Goal 04 adds persistent aggregate history, backed by a local embedded H2 file. That
+# store necessarily issues CREATE, INSERT, DELETE and commit against ITS OWN file, and
+# it necessarily names java.sql.Connection/PreparedStatement. None of that touches
+# IBM CM or the repository database, which is what this guard exists to protect.
+#
+# So the exemption is a NAMED TREE, not a loosened pattern, and it is the same shape
+# this project already uses for the IBM driver class name and the admission rule's own
+# vocabulary: the exception is written down where a reviewer reads it, and the
+# tests/shell/analytics_source_guard_test.sh control proves the rule still bites
+# OUTSIDE this tree and still bites on a planted write INSIDE it that is not the
+# store's own persistence.
+#
+# The alternative - dropping the SQL rules for src/main/java - would delete the
+# guarantee for every future file to save one package, which is how a guard becomes
+# decoration.
+HISTORY_EXEMPT_REL='src/main/java/com/mraibo/cminsight/history'
+
 # The ONE exempt file, named by its exact repository-relative path rather than by
 # basename or pattern. It is the admission rule itself: its string literals ARE the
 # forbidden vocabulary, so only the statement-literal sub-rule may skip this exact file.
@@ -244,6 +264,8 @@ if [ "${LIST_ONLY}" = true ]; then
   printf 'scanned trees (root %s):\n' "${ROOT}"
   printf '  %s   (required, must be non-empty)\n' "${PRIMARY_REL}"
   for rel in "${SECONDARY_RELS[@]}"; do printf '  %s   (scanned when present)\n' "${rel}"; done
+  printf 'exempt tree (application-local history storage; it owns its own local file and never\n'
+  printf 'touches IBM CM or the repository database):\n  %s\n' "${HISTORY_EXEMPT_REL}"
   printf 'forbidden JDBC write/control calls:\n'
   for pattern in "${FORBIDDEN_CALL_PATTERNS[@]}"; do printf '  %s\n' "${pattern}"; done
   printf 'forbidden statement literals:\n'

@@ -21,6 +21,7 @@ import com.mraibo.cminsight.ibm.CmAdapterProvider;
 import com.mraibo.cminsight.ibm.CmAdapterSettings;
 import com.mraibo.cminsight.metadata.MetadataRepository;
 import com.mraibo.cminsight.retention.RetentionRepository;
+import com.mraibo.cminsight.statistics.FreshnessThreshold;
 import com.mraibo.cminsight.statistics.StatisticsCapability;
 import com.mraibo.cminsight.statistics.StatisticsService;
 
@@ -90,6 +91,7 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
     private final SecretResolver secrets;
     private final JdbcPoolSettings jdbcPoolSettings;
     private final StatisticsSettings statisticsSettings;
+    private final FreshnessThreshold freshnessThreshold;
 
     /**
      * @param provider the discovered adapter; the caller refuses to activate when there is none
@@ -99,7 +101,8 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
     public ProductionRepositoryContextFactory(CmAdapterProvider provider,
                                              CmAdapterSettings settings,
                                              SecretResolver secrets) {
-        this(provider, settings, secrets, JdbcPoolSettings.defaults(), StatisticsSettings.disabled());
+        this(provider, settings, secrets, JdbcPoolSettings.defaults(), StatisticsSettings.disabled(),
+                FreshnessThreshold.defaults());
     }
 
     /**
@@ -114,11 +117,22 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
                                              SecretResolver secrets,
                                              JdbcPoolSettings jdbcPoolSettings,
                                              StatisticsSettings statisticsSettings) {
+        this(provider, settings, secrets, jdbcPoolSettings, statisticsSettings, FreshnessThreshold.defaults());
+    }
+
+    /** Full Goal 04 form with the configured statistics freshness threshold. */
+    public ProductionRepositoryContextFactory(CmAdapterProvider provider,
+                                             CmAdapterSettings settings,
+                                             SecretResolver secrets,
+                                             JdbcPoolSettings jdbcPoolSettings,
+                                             StatisticsSettings statisticsSettings,
+                                             FreshnessThreshold freshnessThreshold) {
         this.provider = Objects.requireNonNull(provider, "provider");
         this.settings = Objects.requireNonNull(settings, "settings");
         this.secrets = Objects.requireNonNull(secrets, "secrets");
         this.jdbcPoolSettings = Objects.requireNonNull(jdbcPoolSettings, "jdbcPoolSettings");
         this.statisticsSettings = Objects.requireNonNull(statisticsSettings, "statisticsSettings");
+        this.freshnessThreshold = Objects.requireNonNull(freshnessThreshold, "freshnessThreshold");
     }
 
     @Override
@@ -201,7 +215,8 @@ public final class ProductionRepositoryContextFactory implements RepositoryConte
                 jdbcPoolSettings,
                 statisticsSettings,
                 statisticsMetadata == null ? List::of : statisticsMetadata::listItemTypes,
-                resources::add);
+                resources::add,
+                freshnessThreshold);
 
         RepositoryServices published = new RepositoryServices(
                 cache == null ? null : cache.metadataView(),

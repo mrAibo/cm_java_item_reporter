@@ -19,9 +19,16 @@ import java.util.Locale;
  * <p>The guard is a request header with a fixed value:
  *
  * <pre>
- *   X-CM-Insight-Action: repository-select      POST /api/repositories/select
- *   X-CM-Insight-Action: statistics-refresh     POST /api/statistics/refresh
+ *   X-CM-Insight-Action: repository-select          POST /api/repositories/select
+ *   X-CM-Insight-Action: statistics-refresh         POST /api/statistics/refresh
+ *   X-CM-Insight-Action: statistics-item-refresh    POST /api/statistics/item/{itemTypeId}/refresh
+ *   X-CM-Insight-Action: report-generate            POST /api/reports
  * </pre>
+ *
+ * <p>Every state-changing endpoint has its OWN exact value. The values are deliberately not
+ * interchangeable: accepting the statistics value on the report route (or the reverse) would mean a page that
+ * learned one of them could drive an unrelated action, so a caller that presents the wrong value is refused
+ * exactly as if it had presented none.</p>
  *
  * <p>An HTML form cannot set a request header at all - not even with {@code enctype="text/plain"} - so a
  * cross-site submission cannot satisfy it. The value must match EXACTLY: a presence check that accepted
@@ -55,6 +62,22 @@ public final class ActionGuard {
     /** The only value of {@link #ACTION_HEADER} that authorises a statistics refresh. */
     public static final String STATISTICS_REFRESH_ACTION = "statistics-refresh";
 
+    /**
+     * The only value of {@link #ACTION_HEADER} that authorises a targeted single-ItemType refresh.
+     *
+     * <p>Distinct from {@link #STATISTICS_REFRESH_ACTION} on purpose: a full multi-ItemType scan and a
+     * single-ItemType detail refresh are different amounts of work, so one value may not authorise both.
+     */
+    public static final String STATISTICS_ITEM_REFRESH_ACTION = "statistics-item-refresh";
+
+    /**
+     * The only value of {@link #ACTION_HEADER} that authorises a report generation.
+     *
+     * <p>Report generation writes a file below {@code reports.dir}, so it is a state change even though
+     * nothing in the repository is modified; it is guarded like every other local action.
+     */
+    public static final String REPORT_GENERATE_ACTION = "report-generate";
+
     private static final String FORM_URLENCODED = "application/x-www-form-urlencoded";
     private static final String FORM_MULTIPART = "multipart/form-data";
     private static final String FORM_PLAIN = "text/plain";
@@ -67,8 +90,9 @@ public final class ActionGuard {
      * not declare a body type an HTML form can send.
      *
      * @param ctx            the request
-     * @param expectedAction the exact required value, one of {@link #SELECT_ACTION} or
-     *                       {@link #STATISTICS_REFRESH_ACTION}
+     * @param expectedAction the exact required value, one of {@link #SELECT_ACTION},
+     *                       {@link #STATISTICS_REFRESH_ACTION}, {@link #STATISTICS_ITEM_REFRESH_ACTION} or
+     *                       {@link #REPORT_GENERATE_ACTION}
      */
     public static boolean authorises(RequestContext ctx, String expectedAction) {
         if (ctx == null || expectedAction == null) {

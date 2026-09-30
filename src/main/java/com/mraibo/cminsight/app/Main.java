@@ -13,6 +13,7 @@ import com.mraibo.cminsight.core.CmPoolDiagnostics;
 import com.mraibo.cminsight.core.FeatureIds;
 import com.mraibo.cminsight.core.FeatureModule;
 import com.mraibo.cminsight.core.FeatureRegistry;
+import com.mraibo.cminsight.core.HistorySettings;
 import com.mraibo.cminsight.core.JdbcPoolSettings;
 import com.mraibo.cminsight.core.StatisticsSettings;
 import com.mraibo.cminsight.db.JdbcDrivers;
@@ -26,6 +27,7 @@ import com.mraibo.cminsight.repository.RepositoryContextFactory;
 import com.mraibo.cminsight.repository.RepositoryException;
 import com.mraibo.cminsight.repository.RepositoryManager;
 import com.mraibo.cminsight.security.SecurityPolicy;
+import com.mraibo.cminsight.statistics.FreshnessThreshold;
 import com.mraibo.cminsight.web.AnalyticsApi;
 import com.mraibo.cminsight.web.Router;
 import com.mraibo.cminsight.web.WebServer;
@@ -96,7 +98,8 @@ public final class Main {
             "jdbc.pool.max.age.minutes", "jdbc.pool.max.operations",
             StatisticsSettings.ENABLED_KEY, StatisticsSettings.WORKERS_KEY,
             StatisticsSettings.QUERY_TIMEOUT_KEY, StatisticsSettings.SCAN_TIMEOUT_KEY,
-            "cache.metadata.ttl.seconds", "cache.statistics.ttl.seconds",
+            "cache.metadata.ttl.seconds", FreshnessThreshold.KEY,
+            HistorySettings.ENABLED_KEY, HistorySettings.MAX_SNAPSHOTS_KEY,
             "profiles.dir", "classifications.file", "secrets.dir",
             "data.dir", "reports.dir", "logs.dir",
             "repository.auto.activate");
@@ -254,17 +257,20 @@ public final class Main {
         // number this build refuses" and "the database side is not usable right now".
         JdbcPoolSettings jdbcPoolSettings = JdbcPoolSettings.from(config);
         StatisticsSettings statisticsSettings = StatisticsSettings.from(config, jdbcPoolSettings);
+        FreshnessThreshold freshnessThreshold = FreshnessThreshold.from(config);
+        HistorySettings historySettings = HistorySettings.from(config, paths);
 
         if (printConfig) {
             printEffectiveConfiguration(config, auth, features, profiles, classifications, secretsDir, bind, port,
-                    allowInsecureHttp, paths, adapters, jdbcPoolSettings, statisticsSettings);
+                    allowInsecureHttp, paths, adapters, jdbcPoolSettings, statisticsSettings,
+                    freshnessThreshold, historySettings);
             printWarnings(warnings);
             return 0;
         }
 
         if (checkRepositoryId != null) {
             return runRepositoryCheck(profiles, secrets, adapters, adapterSettings, jdbcPoolSettings,
-                    statisticsSettings, checkRepositoryId, System.out, System.err);
+                    statisticsSettings, freshnessThreshold, checkRepositoryId, System.out, System.err);
         }
 
         // Repository profiles are listed without an adapter; only ACTIVATION needs one. The manager is
@@ -286,7 +292,7 @@ public final class Main {
 
         RepositoryManager repositories =
                 new RepositoryManager(productionFactory(adapters, adapterSettings, secrets, jdbcPoolSettings,
-                        statisticsSettings));
+                        statisticsSettings, freshnessThreshold));
         if (autoActivated != null) {
             // An activation failure propagates out of execute(), so startup fails (exit 1) instead of
             // serving a console whose repository could not be opened.
@@ -307,11 +313,12 @@ public final class Main {
                                                               CmAdapterSettings adapterSettings,
                                                               SecretResolver secrets,
                                                               JdbcPoolSettings jdbcPoolSettings,
-                                                              StatisticsSettings statisticsSettings) {
+                                                              StatisticsSettings statisticsSettings,
+                                                              FreshnessThreshold freshnessThreshold) {
         Optional<CmAdapterProvider> provider = adapters.provider();
         if (provider.isPresent()) {
             return new ProductionRepositoryContextFactory(provider.get(), adapterSettings, secrets,
-                    jdbcPoolSettings, statisticsSettings);
+                    jdbcPoolSettings, statisticsSettings, freshnessThreshold);
         }
         // The two cases need different operator actions, so the refusal names which one it is: an adapter
         // that is not installed at all, or one that IS installed but reports its IBM runtime not ready
@@ -346,6 +353,7 @@ public final class Main {
                                           CmAdapterSettings adapterSettings,
                                           JdbcPoolSettings jdbcPoolSettings,
                                           StatisticsSettings statisticsSettings,
+                                          FreshnessThreshold freshnessThreshold,
                                           String repositoryId,
                                           PrintStream out,
                                           PrintStream err) {
@@ -387,7 +395,7 @@ public final class Main {
 
         RepositoryManager repositories =
                 new RepositoryManager(new ProductionRepositoryContextFactory(provider, adapterSettings, secrets,
-                        jdbcPoolSettings, statisticsSettings));
+                        jdbcPoolSettings, statisticsSettings, freshnessThreshold));
         try {
             repositories.switchTo(profile);
         } catch (RepositoryException e) {
@@ -657,7 +665,9 @@ public final class Main {
                                                      AppPaths paths,
                                                      IbmCmAdapterRegistry adapters,
                                                      JdbcPoolSettings jdbcPoolSettings,
-                                                     StatisticsSettings statisticsSettings) {
+                                                     StatisticsSettings statisticsSettings,
+                                                     FreshnessThreshold freshnessThreshold,
+                                                     HistorySettings historySettings) {
         System.out.println("CM Insight " + VERSION + " effective configuration");
         System.out.println("  config file       : " + describePath(config.sourcePath()));
         System.out.println("  web.bind          : " + bind);
@@ -698,6 +708,11 @@ public final class Main {
         System.out.println("  analytics         : " + statisticsSettings.describe()
                 + (statisticsSettings.enabled() ? "" : "  (feature.statistics=false: the analytics half is off"
                         + " and no JDBC pool is created; the repository is unaffected)"));
+        System.out.println("  statistics cache  : " + freshnessThreshold.describe()
+                + " (freshness judgement only; stale completed snapshots remain visible)");
+        System.out.println("  history           : " + historySettings.describe()
+                + (historySettings.enabled() ? "" : "  (persistent history disabled; live statistics unaffected)"));
+        System.out.println("  reports dir       : " + paths.reportsDir(config));
         for (RepositoryProfile profile : profiles) {
             printJdbcReadiness(profile);
         }

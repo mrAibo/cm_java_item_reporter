@@ -2,6 +2,14 @@ package com.mraibo.cminsight.web;
 
 import com.mraibo.cminsight.repository.RepositoryContext;
 import com.mraibo.cminsight.repository.RepositoryManager;
+import com.mraibo.cminsight.statistics.AnalyticsOperationGate;
+import com.mraibo.cminsight.statistics.Freshness;
+import com.mraibo.cminsight.statistics.FreshnessThreshold;
+import com.mraibo.cminsight.statistics.MetricValue;
+import com.mraibo.cminsight.statistics.StatisticsRepository;
+import com.mraibo.cminsight.statistics.TargetedItemTypeDetail;
+import com.mraibo.cminsight.statistics.TargetedRefreshResult;
+import com.mraibo.cminsight.web.http.HttpMethod;
 import com.mraibo.cminsight.web.http.HttpStatus;
 import com.mraibo.cminsight.web.http.JsonWriter;
 import com.mraibo.cminsight.web.http.RequestContext;
@@ -21,6 +29,23 @@ import java.util.Optional;
  *   POST /api/statistics/refresh     starts at most one scan; requires the action-guard header
  *   GET  /api/diagnostics/jdbc       driver, pool and scan facts, plus a sanitised last JDBC error
  * </pre>
+ *
+ * <p>Goal 04 adds one route to the same authenticated family:
+ *
+ * <pre>
+ *   POST /api/statistics/item/{itemTypeId}/refresh
+ *                                    refreshes EXACTLY one ItemType; requires {@code statistics-item-refresh}
+ * </pre>
+ *
+ * <p>{@link Router} has no path-parameter syntax, so {@code /api/statistics/item} is registered once as a
+ * PREFIX and the handler parses its own trailing {@code {itemTypeId}/refresh}. The prefix is longer than
+ * {@code /api/statistics} and is a POST, so it cannot collide with {@code POST /api/statistics/refresh}.
+ *
+ * <p>The targeted refresh is admitted by the SAME exclusive analytics-operation gate a full scan uses, and it
+ * is synchronous: the service measures this one ItemType and returns when the measurement was published or
+ * refused. The result is separate detail data with its own capture instant and its own database anchor - it
+ * never enters the published full snapshot, never changes a dashboard total and is never persisted as a full
+ * history entry.
  *
  * <p>Every route is registered through the authenticated {@link Router} methods only, exactly like the CM
  * read API, so an unauthenticated caller learns nothing - not even whether a repository is active.
@@ -55,6 +80,16 @@ import java.util.Optional;
  *                                     409 a scan is already in flight (scan_in_progress)
  *                                     409 the repository context is closing (repository_closing)
  *                                     202 a new scan was started
+ *   POST /api/statistics/item/{id}/refresh
+ *                                     403 missing/wrong {@code statistics-item-refresh} header, no side effect
+ *                                     400 malformed ItemType id
+ *                                     409 no active repository
+ *                                     503 analytics disabled/unavailable, with the reason
+ *                                     200 the ItemType was measured; the detail is in the body
+ *                                     409 another analytics operation holds the shared gate (analytics_busy)
+ *                                     404 the active repository has no such ItemType
+ *                                     409 the attempt was cancelled, or the repository is closing
+ *                                     502 the measurement ran and failed (refresh_failed)
  *   GET  /api/diagnostics/jdbc        200 always, like /api/diagnostics/cm: "why can this not read"
  *                                     has to be answerable exactly when nothing is active
  * </pre>
@@ -81,8 +116,31 @@ public final class StatisticsApiRoutes {
     /** Path of the scan action. */
     public static final String REFRESH_PATH = "/api/statistics/refresh";
 
+    /**
+     * Prefix of the targeted single-ItemType refresh form: {@code /api/statistics/item/{itemTypeId}/refresh}.
+     *
+     * <p>Registered as a prefix because the router has no path parameters; the handler validates the trailing
+     * {@code {itemTypeId}/refresh} itself.
+     */
+    public static final String ITEM_REFRESH_PATH = "/api/statistics/item";
+
+    /** The fixed final segment of {@link #ITEM_REFRESH_PATH}. */
+    public static final String ITEM_REFRESH_SEGMENT = "refresh";
+
+    /**
+     * Query parameter asking {@code GET /api/statistics} to include the latest TARGETED result of one
+     * ItemType, so the ItemType Properties view can show detail data with its own timestamp.
+     */
+    public static final String ITEM_TYPE_ID_PARAMETER = "itemTypeId";
+
     /** Path of the JDBC diagnostics read. */
     public static final String JDBC_DIAGNOSTICS_PATH = "/api/diagnostics/jdbc";
+
+    /**
+     * 404 for "the active repository has no such ItemType", kept local like the other family statuses: it is
+     * this route's own "the thing you named is not here" answer.
+     */
+    private static final int NOT_FOUND = 404;
 
     /**
      * 503 for "the feature is off or the database side cannot be used", kept local rather than added to
@@ -94,13 +152,18 @@ public final class StatisticsApiRoutes {
     private static final int CONFLICT = 409;
 
     /**
+     * 502 for "the analytics operation ran and did not produce a measurement", kept local rather than added to
+     * {@link HttpStatus} - the same convention the CM read routes use for their own upstream failure.
+     */
+    private static final int REFRESH_FAILED = 502;
+
+    /**
      * Fixed text for a read that threw. The failure's own message is never used: it comes from the
      * statistics layer and may name a resource, and a response body is not the place to find out whether
      * that text is safe. The type is not published either - the operator gets a state and a next step.
      */
     private static final String READ_FAILED =
             "The analytics capability could not be read; see the server log and GET /api/diagnostics/jdbc";
-
     private final RepositoryManager repositories;
     private final AnalyticsApi analytics;
 
@@ -118,17 +181,22 @@ public final class StatisticsApiRoutes {
                 : analytics;
     }
 
-    /** Registers the three routes. All of them are authenticated. */
+    /** Registers the four routes. All of them are authenticated. */
     public void install(Router router) {
         Objects.requireNonNull(router, "router");
         router.get(STATISTICS_PATH, this::statistics);
         router.post(REFRESH_PATH, this::refresh);
+        router.add(HttpMethod.POST, ITEM_REFRESH_PATH, true, true, this::itemRefreshRoute);
         router.get(JDBC_DIAGNOSTICS_PATH, this::jdbcDiagnostics);
     }
 
     // ---------------------------------------------------------------- GET /api/statistics
 
     private void statistics(RequestContext ctx) {
+        Integer requestedItemType = requestedItemType(ctx);
+        if (requestedItemType != null && requestedItemType < 0) {
+            return;
+        }
         View view = view();
         RepositoryManager.Status status = repositories.status();
         AnalyticsApi.Snapshot snapshot = view.snapshot().orElse(null);
@@ -142,11 +210,18 @@ public final class StatisticsApiRoutes {
                 // Whether a scan is in flight is also inside "scan"; it is mirrored here because it is the
                 // one fact a polling client branches on before it decides to parse the rest.
                 "refreshing", view.scan().running(),
-                // Freshness, reported rather than judged: this goal defines no staleness threshold for a
-                // snapshot, so the age is published and the client decides what to do with it.
                 "capturedAt", instant(snapshot == null ? null : snapshot.capturedAt()),
                 "ageMillis", ageMillis(snapshot == null ? null : snapshot.capturedAt()),
+                // cache.statistics.ttl.seconds as a JUDGEMENT: the snapshot is still served when it is stale,
+                // and nothing here can start a scan. Age is always reported; "unknown" is reported as unknown
+                // rather than as stale, so a repository that has never been scanned is not accused of being
+                // out of date.
+                "freshness", JsonWriter.raw(freshnessJson(snapshot)),
                 "scan", JsonWriter.raw(scanJson(view.scan())),
+                // Targeted detail data, published SEPARATELY from the snapshot above: it has its own anchor
+                // and its own capturedAt, it never feeds the dashboard totals, and it is never persisted as a
+                // history snapshot.
+                "targeted", JsonWriter.raw(targetedJson(requestedItemType, view)),
                 "snapshot", JsonWriter.raw(snapshotJson(snapshot))));
     }
 
@@ -227,6 +302,137 @@ public final class StatisticsApiRoutes {
                 "available", false,
                 "state", view.state().name(),
                 "reason", view.reason()));
+    }
+
+    // ---------------------------------------------------------------- POST /api/statistics/item/{id}/refresh
+
+    /**
+     * Refreshes exactly one ItemType, or explains deterministically why it did not.
+     *
+     * <p>The order is the whole security property: the action guard first, so a request without the exact
+     * header cannot read the repository state, cannot consult availability and cannot start anything; then the
+     * path segment (a {@code 400} for anything that is not a positive integer); then the repository
+     * ({@code 409} when none is active); then availability ({@code 503} with the documented reason); and only
+     * then the one call whose own outcome decides between the refreshed detail ({@code 200}), the {@code 409}
+     * conflict with an in-flight analytics operation, the {@code 404} for an unknown ItemType, the {@code 409}
+     * for a cancelled attempt or a closing repository, and the {@code 502} for a measurement that ran and
+     * failed.
+     *
+     * <p>There is deliberately no "is something running?" pre-check here either: the shared
+     * analytics-operation gate decides admission atomically, and a pre-check would be a race - it could report
+     * a conflict for an operation that had just finished, or start work while a full scan was still draining.
+     *
+     * <p>The call is SYNCHRONOUS: the analytics service measures this one ItemType under the shared gate and
+     * returns when the measurement was published or refused, so there is no second "is it done" endpoint. The
+     * work is one aggregate over one ItemType, bounded by the same query timeout and cancellation rules a full
+     * scan uses.
+     */
+    private void itemRefreshRoute(RequestContext ctx) {
+        if (!ActionGuard.authorises(ctx, ActionGuard.STATISTICS_ITEM_REFRESH_ACTION)) {
+            ctx.sendError(HttpStatus.FORBIDDEN, "action_forbidden",
+                    ActionGuard.refusalMessage(ActionGuard.STATISTICS_ITEM_REFRESH_ACTION));
+            return;
+        }
+
+        Integer itemTypeId = itemTypeIdFromPath(ctx);
+        if (itemTypeId == null) {
+            return;
+        }
+
+        RepositoryManager.Status status = repositories.status();
+        if (!status.usable()) {
+            ctx.sendError(CONFLICT, "no_active_repository",
+                    "No repository is active; activate one before refreshing an ItemType");
+            return;
+        }
+
+        StatisticsRepository statistics = activeStatistics();
+        if (statistics == null || !statistics.available()) {
+            ctx.sendJson(STATISTICS_UNAVAILABLE, JsonWriter.object(
+                    "refreshed", false,
+                    "available", false,
+                    "itemTypeId", itemTypeId,
+                    "state", AnalyticsApi.State.UNAVAILABLE.name(),
+                    "reason", statistics == null
+                            ? "The active repository provides no analytics capability"
+                            : DiagnosticText.scrub(statistics.unavailableReason())));
+            return;
+        }
+
+        TargetedRefreshResult result;
+        try {
+            result = statistics.refreshItemType(itemTypeId);
+        } catch (RuntimeException failure) {
+            ctx.sendError(REFRESH_FAILED, "refresh_failed",
+                    "The targeted refresh could not be completed; see the server log");
+            return;
+        }
+        if (result == null) {
+            ctx.sendError(REFRESH_FAILED, "refresh_failed",
+                    "The targeted refresh could not be completed; see the server log");
+            return;
+        }
+
+        switch (result.outcome()) {
+            case REFRESHED -> ctx.sendJson(HttpStatus.OK, JsonWriter.object(
+                    "refreshed", true,
+                    "itemTypeId", itemTypeId,
+                    "repositoryId", activeRepositoryId(status),
+                    "state", AnalyticsApi.State.AVAILABLE.name(),
+                    // Targeted detail data, explicitly NOT a dashboard total: the latest full scan keeps
+                    // supplying those, and this measurement carries its own capturedAt and its own anchor.
+                    "scope", "TARGETED_ITEMTYPE",
+                    "kind", TargetedItemTypeDetail.DETAIL_KIND,
+                    "detail", JsonWriter.raw(targetedDetailJson(result.detail()))));
+            case REFUSED -> ctx.sendError(CONFLICT, "analytics_busy",
+                    "Another analytics operation (" + holderLabel(result)
+                            + ") is already running for this repository; no targeted refresh was started");
+            case NOT_FOUND -> ctx.sendError(NOT_FOUND, "unknown_item_type",
+                    "The active repository has no ItemType with that id");
+            case CANCELLED -> ctx.sendError(CONFLICT, "refresh_cancelled",
+                    "The targeted refresh was cancelled before it published a result");
+            case CLOSED -> ctx.sendError(CONFLICT, "repository_closing",
+                    "The repository is shutting down and no targeted refresh can be started");
+            case UNAVAILABLE -> ctx.sendJson(STATISTICS_UNAVAILABLE, JsonWriter.object(
+                    "refreshed", false,
+                    "available", false,
+                    "itemTypeId", itemTypeId,
+                    "state", AnalyticsApi.State.UNAVAILABLE.name(),
+                    "reason", DiagnosticText.scrub(result.reason())));
+            case FAILED -> ctx.sendError(REFRESH_FAILED, "refresh_failed",
+                    "The targeted refresh ran and did not produce a measurement; see the server log");
+        }
+    }
+
+    /** The label of the operation that held the shared gate, or a fixed phrase when it did not say. */
+    private static String holderLabel(TargetedRefreshResult result) {
+        AnalyticsOperationGate.Operation holder = result.refusedByOperation().orElse(null);
+        return holder == null ? "an analytics operation" : DiagnosticText.scrub(holder.label());
+    }
+
+    /**
+     * The {@code {itemTypeId}/refresh} trailing segment as a positive integer, or {@code null} after
+     * answering a malformed path with {@code 400}.
+     *
+     * <p>A deeper path is refused rather than truncated to its first segment, and the id is validated as a
+     * plain decimal integer: no ItemType name, path fragment, schema name or SQL text can reach the service.
+     */
+    private static Integer itemTypeIdFromPath(RequestContext ctx) {
+        String trailing = RequestPaths.trailingSegment(ctx.path(), ITEM_REFRESH_PATH);
+        String suffix = "/" + ITEM_REFRESH_SEGMENT;
+        if (trailing == null || !trailing.endsWith(suffix)) {
+            ctx.sendError(HttpStatus.BAD_REQUEST, "bad_request",
+                    "Expected " + ITEM_REFRESH_PATH + "/{itemTypeId}/" + ITEM_REFRESH_SEGMENT);
+            return null;
+        }
+        String idPart = trailing.substring(0, trailing.length() - suffix.length());
+        int itemTypeId = idPart.indexOf('/') >= 0 ? -1 : RequestPaths.positiveInt(idPart);
+        if (itemTypeId < 0) {
+            ctx.sendError(HttpStatus.BAD_REQUEST, "bad_request",
+                    "The ItemType id must be a positive whole number");
+            return null;
+        }
+        return itemTypeId;
     }
 
     // ---------------------------------------------------------------- GET /api/diagnostics/jdbc
@@ -323,6 +529,171 @@ public final class StatisticsApiRoutes {
     }
 
     // ---------------------------------------------------------------- payload shapers
+
+    /**
+     * The optional {@code itemTypeId} query parameter of {@code GET /api/statistics}.
+     *
+     * @return {@code null} when the client did not ask for targeted detail, {@code -1} after answering a
+     *         malformed value with {@code 400}, otherwise the validated ItemType id
+     */
+    private static Integer requestedItemType(RequestContext ctx) {
+        String raw = ctx.query(ITEM_TYPE_ID_PARAMETER);
+        if (raw == null) {
+            return null;
+        }
+        int itemTypeId = RequestPaths.positiveInt(raw);
+        if (itemTypeId < 0) {
+            ctx.sendError(HttpStatus.BAD_REQUEST, "bad_request",
+                    "The '" + ITEM_TYPE_ID_PARAMETER + "' parameter must be a positive whole number");
+            return -1;
+        }
+        return itemTypeId;
+    }
+
+    /**
+     * {@code cache.statistics.ttl.seconds} as a judgement about the published snapshot.
+     *
+     * <p>Age is always reported; a stale snapshot is still served and nothing here can start a scan. The
+     * judgement comes from the ACTIVE repository's own statistics service, so the threshold is the one the
+     * operator configured rather than a number restated here; a repository that is not active yet is judged
+     * against the documented default. When no snapshot exists the state is {@code UNKNOWN} rather than
+     * {@code STALE}: a repository that has never been scanned must not be accused of being out of date.
+     */
+    private String freshnessJson(AnalyticsApi.Snapshot snapshot) {
+        StatisticsRepository service = activeStatistics();
+        Freshness freshness = null;
+        if (service != null) {
+            try {
+                freshness = service.freshness();
+            } catch (RuntimeException failure) {
+                freshness = null;
+            }
+        }
+        if (freshness == null) {
+            Instant capturedAt = snapshot == null ? null : snapshot.capturedAt();
+            Duration threshold = FreshnessThreshold.defaults().threshold();
+            freshness = capturedAt == null
+                    ? Freshness.none(threshold)
+                    : Freshness.of(capturedAt, threshold, Instant.now());
+        }
+        return JsonWriter.object(
+                "known", freshness.known(),
+                "capturedAt", instant(freshness.capturedAt()),
+                "ageMillis", freshness.ageMillis().orElse(null),
+                "thresholdSeconds", freshness.thresholdSeconds(),
+                "fresh", freshness.known() && !freshness.stale(),
+                "stale", freshness.stale(),
+                "state", !freshness.known() ? "UNKNOWN" : freshness.stale() ? "STALE" : "FRESH");
+    }
+
+    /**
+     * The latest targeted detail of one ItemType, or the reason there is none.
+     *
+     * <p>Published under its own key with its own {@code capturedAt}, its own {@code anchorDate} and its own
+     * freshness judgement, and labelled with {@link TargetedItemTypeDetail#DETAIL_KIND} so a client cannot
+     * mistake it for part of the full snapshot the dashboard totals come from. A read only: it consults the
+     * active context's already-published detail and starts nothing.
+     */
+    private String targetedJson(Integer itemTypeId, View view) {
+        if (itemTypeId == null) {
+            return "null";
+        }
+        StatisticsRepository service = activeStatistics();
+        if (view.state() != AnalyticsApi.State.AVAILABLE || service == null) {
+            return JsonWriter.object(
+                    "itemTypeId", itemTypeId,
+                    "present", false,
+                    "scope", "TARGETED_ITEMTYPE",
+                    "state", view.state().name(),
+                    "reason", view.reason());
+        }
+        final TargetedItemTypeDetail detail;
+        try {
+            Optional<TargetedItemTypeDetail> found = service.targetedDetail(itemTypeId);
+            detail = found == null ? null : found.orElse(null);
+        } catch (RuntimeException failure) {
+            return JsonWriter.object(
+                    "itemTypeId", itemTypeId,
+                    "present", false,
+                    "scope", "TARGETED_ITEMTYPE",
+                    "state", AnalyticsApi.State.UNAVAILABLE.name(),
+                    "reason", READ_FAILED);
+        }
+        if (detail == null) {
+            return JsonWriter.object(
+                    "itemTypeId", itemTypeId,
+                    "present", false,
+                    "scope", "TARGETED_ITEMTYPE",
+                    "state", "NONE",
+                    "reason", "No targeted refresh has been run for this ItemType");
+        }
+        return targetedDetailJson(detail);
+    }
+
+    /** One targeted detail result, in the shape the Properties view and the refresh route both publish. */
+    private static String targetedDetailJson(TargetedItemTypeDetail detail) {
+        Freshness freshness;
+        try {
+            freshness = detail.freshnessAt(Instant.now());
+        } catch (RuntimeException failure) {
+            freshness = detail.freshness();
+        }
+        return JsonWriter.object(
+                "itemTypeId", detail.itemTypeId(),
+                "present", true,
+                "scope", "TARGETED_ITEMTYPE",
+                "kind", TargetedItemTypeDetail.DETAIL_KIND,
+                "repositoryId", DiagnosticText.scrub(detail.repositoryId()),
+                "name", DiagnosticText.scrub(detail.itemTypeName()),
+                "businessClassification", DiagnosticText.scrub(detail.businessClassification()),
+                "capturedAt", instant(detail.capturedAt()),
+                "ageMillis", freshness.ageMillis().orElse(null),
+                "anchorDate", detail.anchorDate() == null ? null : detail.anchorDate().toString(),
+                "durationMs", detail.durationMs(),
+                "status", DiagnosticText.label(detail.status().name()),
+                "freshness", JsonWriter.raw(JsonWriter.object(
+                        "known", freshness.known(),
+                        "capturedAt", instant(freshness.capturedAt()),
+                        "ageMillis", freshness.ageMillis().orElse(null),
+                        "thresholdSeconds", freshness.thresholdSeconds(),
+                        "fresh", freshness.known() && !freshness.stale(),
+                        "stale", freshness.stale(),
+                        "state", !freshness.known() ? "UNKNOWN" : freshness.stale() ? "STALE" : "FRESH")),
+                "totalItems", JsonWriter.raw(targetedMetricJson(detail.logicalItems())),
+                "today", JsonWriter.raw(targetedMetricJson(detail.createdToday())),
+                "last7Days", JsonWriter.raw(targetedMetricJson(detail.createdLast7Days())),
+                "last30Days", JsonWriter.raw(targetedMetricJson(detail.createdLast30Days())),
+                "currentYear", JsonWriter.raw(targetedMetricJson(detail.createdCurrentYear())),
+                "versions", JsonWriter.raw(targetedMetricJson(detail.versions())),
+                "parts", JsonWriter.raw(targetedMetricJson(detail.parts())));
+    }
+
+    /**
+     * One statistics metric. An unavailable or failed metric carries NO number: the state is published and
+     * the value key is {@code null}, so a client can never read "0 items" for something nobody counted.
+     */
+    private static String targetedMetricJson(MetricValue metric) {
+        if (metric == null) {
+            return JsonWriter.object("available", false, "state", "UNAVAILABLE", "value", null);
+        }
+        if (metric.isAvailable()) {
+            return JsonWriter.object("available", true, "state", "AVAILABLE", "value", metric.value());
+        }
+        return JsonWriter.object(
+                "available", false,
+                "state", metric.isError() ? "ERROR" : "UNAVAILABLE",
+                "value", null,
+                "reason", DiagnosticText.scrub(metric.reason()));
+    }
+
+    /** The active repository's analytics service, or {@code null} when no context owns one. */
+    private StatisticsRepository activeStatistics() {
+        RepositoryContext context = repositories.status().context();
+        if (context == null) {
+            return null;
+        }
+        return context.statistics().orElse(null);
+    }
 
     private static String snapshotJson(AnalyticsApi.Snapshot snapshot) {
         if (snapshot == null) {

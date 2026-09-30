@@ -8,6 +8,7 @@ import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
 import com.mraibo.cminsight.metadata.ItemTypeInfo;
 import com.mraibo.cminsight.metadata.ItemTypeSummary;
 import com.mraibo.cminsight.metadata.MetadataRepository;
+import com.mraibo.cminsight.report.ReportService;
 import com.mraibo.cminsight.repository.RepositoryContext;
 import com.mraibo.cminsight.repository.RepositoryException;
 import com.mraibo.cminsight.repository.RepositoryManager;
@@ -23,7 +24,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.regex.Pattern;
 
 /**
  * The authenticated CM read API: repository listing, selection and status, ItemType and retention reads,
@@ -50,6 +50,24 @@ import java.util.regex.Pattern;
  *   POST /api/statistics/refresh        starts at most one scan; requires {@code statistics-refresh}
  *   GET  /api/diagnostics/jdbc          driver, pool and scan facts, plus a sanitised last JDBC error
  * </pre>
+ *
+ * <p>Goal 04 adds the history and report families and one more analytics route, installed by the SAME
+ * {@link #install(Router)} call for the same reason:
+ *
+ * <pre>
+ *   GET  /api/history                   stored full snapshots, newest first and bounded
+ *   GET  /api/history/{id}              one stored snapshot in full
+ *   POST /api/reports                   generate a report; requires {@code report-generate}
+ *   GET  /api/reports                   formats, capability and generated artifacts
+ *   GET  /api/reports/{id}/download     one artifact, as an attachment
+ *   POST /api/statistics/item/{id}/refresh  one ItemType; requires {@code statistics-item-refresh}
+ * </pre>
+ *
+ * <p>Those six are delegated to {@link HistoryApiRoutes}, {@link ReportApiRoutes} and
+ * {@link StatisticsApiRoutes} because their payloads and refusals are a different shape; they are registered
+ * HERE because "installed with the CM routes, before the socket opens, unconditionally" is the property that
+ * must not be re-litigated later. A missing history store, a switched-off feature or an unwired report
+ * capability answers its documented state - never a {@code 404}.
  *
  * <p>The analytics routes are delegated to {@link StatisticsApiRoutes} because their payloads and their
  * refusals are a different shape; they are registered HERE because "installed with the CM routes, before
@@ -125,6 +143,12 @@ public final class CmApiRoutes {
     /** The only value of {@link #ACTION_HEADER} that authorises a statistics refresh. */
     public static final String STATISTICS_REFRESH_ACTION = ActionGuard.STATISTICS_REFRESH_ACTION;
 
+    /** The only value of {@link #ACTION_HEADER} that authorises a targeted single-ItemType refresh. */
+    public static final String STATISTICS_ITEM_REFRESH_ACTION = ActionGuard.STATISTICS_ITEM_REFRESH_ACTION;
+
+    /** The only value of {@link #ACTION_HEADER} that authorises a report generation. */
+    public static final String REPORT_GENERATE_ACTION = ActionGuard.REPORT_GENERATE_ACTION;
+
     /** Path of the repository list. */
     public static final String REPOSITORIES_PATH = "/api/repositories";
     /** Path of the repository selection action. */
@@ -143,6 +167,12 @@ public final class CmApiRoutes {
     public static final String STATISTICS_REFRESH_PATH = StatisticsApiRoutes.REFRESH_PATH;
     /** Path of the JDBC diagnostics read (Goal 03). */
     public static final String JDBC_DIAGNOSTICS_PATH = StatisticsApiRoutes.JDBC_DIAGNOSTICS_PATH;
+    /** Path of the history collection, and the prefix of the single-snapshot form (Goal 04). */
+    public static final String HISTORY_PATH = HistoryApiRoutes.HISTORY_PATH;
+    /** Path of the report collection, the generate action and the download prefix (Goal 04). */
+    public static final String REPORTS_PATH = ReportApiRoutes.REPORTS_PATH;
+    /** Prefix of the targeted single-ItemType refresh form (Goal 04). */
+    public static final String STATISTICS_ITEM_REFRESH_PATH = StatisticsApiRoutes.ITEM_REFRESH_PATH;
 
     /** Query parameter carrying the repository id of a selection. */
     public static final String REPOSITORY_PARAMETER = "repository";
@@ -156,25 +186,15 @@ public final class CmApiRoutes {
      */
     private static final int CM_UNAVAILABLE = 502;
 
-    /** Longest accepted ItemType or retention policy name. */
-    private static final int MAX_NAME_LENGTH = 128;
-
     /** Longest diagnostic text published verbatim; the adapter's contract keeps it far shorter than this. */
     private static final int MAX_DIAGNOSTIC_TEXT = 200;
-
-    /** Repository ids, exactly as {@link RepositoryProfile} validates them. */
-    private static final Pattern SAFE_ID = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,63}");
-
-    /**
-     * The ItemType/retention name allow-list: an alphanumeric first character, then letters, digits, space,
-     * dot, underscore and dash.
-     */
-    private static final Pattern SAFE_NAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}");
 
     private final RepositoryManager repositories;
     private final List<RepositoryProfile> profiles;
     private final IbmCmAdapterRegistry adapters;
     private final StatisticsApiRoutes statisticsRoutes;
+    private final HistoryApiRoutes historyRoutes;
+    private final ReportApiRoutes reportRoutes;
 
     /**
      * Every route of the frozen table, with analytics wired to the seam that reports it as unavailable.
@@ -207,22 +227,47 @@ public final class CmApiRoutes {
                        List<RepositoryProfile> profiles,
                        IbmCmAdapterRegistry adapters,
                        AnalyticsApi analytics) {
+        this(repositories, profiles, adapters, analytics, HistoryApi.unavailable(
+                "No history capability is wired into this runtime"), null);
+    }
+
+    /**
+     * The full wiring: the CM read routes, the Goal 03 analytics routes and the Goal 04 history/report routes.
+     *
+     * @param repositories the manager that owns the single active repository
+     * @param profiles     the configured repository profiles, listed without an adapter and selectable
+     *                     only through the action guard
+     * @param adapters     the discovered adapter verdict, reported as availability/version/release only
+     * @param analytics    the analytics port; {@code null} becomes {@link AnalyticsApi#unavailable(String)}
+     * @param history      the history capability; {@code null} becomes the documented unavailable state
+     * @param reports      the report service; {@code null} means the report routes report that no capability
+     *                     is wired, which is a state and not a missing endpoint
+     */
+    public CmApiRoutes(RepositoryManager repositories,
+                       List<RepositoryProfile> profiles,
+                       IbmCmAdapterRegistry adapters,
+                       AnalyticsApi analytics,
+                       HistoryApi history,
+                       ReportService reports) {
         this.repositories = Objects.requireNonNull(repositories, "repositories");
         this.profiles = List.copyOf(Objects.requireNonNull(profiles, "profiles"));
         this.adapters = Objects.requireNonNull(adapters, "adapters");
         this.statisticsRoutes = new StatisticsApiRoutes(repositories, analytics);
+        this.historyRoutes = new HistoryApiRoutes(repositories, history);
+        this.reportRoutes = new ReportApiRoutes(repositories, history, reports);
     }
 
     /**
      * Registers every route of the frozen table on a {@link Router}.
      *
-     * <p>All nine registrations are authenticated ones; none of them can be reached without a principal.
-     * The collection and the {@code {name}} form of ItemTypes and retention policies share one prefix
-     * registration each, because a path parameter is not expressible here.
+     * <p>All registrations are authenticated ones; none of them can be reached without a principal. The
+     * collection and the {@code {name}} form of ItemTypes and retention policies share one prefix registration
+     * each, because a path parameter is not expressible here; the same workaround carries the history,
+     * report-download and targeted-refresh forms.
      *
-     * <p>The three Goal 03 analytics routes are installed by this same call, from one place, so the
-     * "implemented but never installed" defect cannot be reintroduced for one family while the other
-     * still works.
+     * <p>The Goal 03 analytics routes, the Goal 04 history routes and the Goal 04 report routes are installed by
+     * this same call, from one place, so the "implemented but never installed" defect cannot be reintroduced
+     * for one family while the others still work.
      */
     public void install(Router router) {
         Objects.requireNonNull(router, "router");
@@ -233,6 +278,8 @@ public final class CmApiRoutes {
         router.add(HttpMethod.GET, RETENTION_POLICIES_PATH, true, true, this::retentionRoute);
         router.get(CM_DIAGNOSTICS_PATH, this::cmDiagnostics);
         statisticsRoutes.install(router);
+        historyRoutes.install(router);
+        reportRoutes.install(router);
     }
 
     // ---------------------------------------------------------------- repository routes
@@ -686,45 +733,31 @@ public final class CmApiRoutes {
      * The trailing path segment after {@code base}, or {@code null} when the request targets {@code base}
      * itself.
      *
-     * <p>The router matched this handler through {@code base} as a prefix, so a non-null result always has
-     * at least one character; a deeper path (one containing another slash) is rejected by
-     * {@link #safeName(String)} rather than being silently truncated to its first segment.
+     * <p>Delegated to {@link RequestPaths#trailingSegment(String, String)}, the one implementation every
+     * prefix-registered family shares. The router matched this handler through {@code base} as a prefix, so a
+     * non-null result always has at least one character; a deeper path (one containing another slash) is
+     * rejected by {@link #safeName(String)} rather than being silently truncated to its first segment.
      */
     private static String trailingSegment(String path, String base) {
-        if (path == null || !path.startsWith(base + "/")) {
-            return null;
-        }
-        return path.substring(base.length() + 1);
+        return RequestPaths.trailingSegment(path, base);
     }
 
     /**
      * A validated ItemType or retention policy name, or {@code null} when the segment is not one.
      *
-     * <p>An allow-list rather than a block-list of attacks: letters, digits, space, dot, underscore and
-     * dash, at most {@value #MAX_NAME_LENGTH} characters. That refuses traversal and an encoded traversal
-     * that survived decoding, an embedded {@code %} (so a double-decoded name cannot be smuggled in), a
-     * slash or backslash (which would make the segment a path), a control character and an overlong name,
-     * without needing a rule per attack. A name outside the list is simply not addressable, and the caller
-     * is authenticated before any of this runs.
+     * <p>Delegated to {@link RequestPaths#safeName(String)}, which now owns the allow-list for every family
+     * that parses a trailing segment: an allow-list rather than a block-list of attacks, so traversal and an
+     * encoded traversal that survived decoding, an embedded {@code %}, a slash or backslash, a control
+     * character and an overlong name are refused without a rule per attack. A name outside the list is simply
+     * not addressable, and the caller is authenticated before any of this runs.
      */
     private static String safeName(String raw) {
-        if (raw == null) {
-            return null;
-        }
-        String candidate = raw.trim();
-        if (candidate.isEmpty() || candidate.length() > MAX_NAME_LENGTH || candidate.contains("..")
-                || candidate.indexOf('/') >= 0 || candidate.indexOf('\\') >= 0) {
-            return null;
-        }
-        return SAFE_NAME.matcher(candidate).matches() ? candidate : null;
+        return RequestPaths.safeName(raw);
     }
 
     /** A validated repository id, or {@code null} when the value is absent, blank or malformed. */
     private static String safeId(String raw) {
-        if (raw == null) {
-            return null;
-        }
-        return SAFE_ID.matcher(raw.trim()).matches() ? raw.trim() : null;
+        return RequestPaths.safeId(raw);
     }
 
     // ---------------------------------------------------------------- JSON shapes

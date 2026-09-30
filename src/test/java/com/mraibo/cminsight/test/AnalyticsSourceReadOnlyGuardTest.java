@@ -77,6 +77,21 @@ public class AnalyticsSourceReadOnlyGuardTest {
     private static final String DATABASE_PACKAGE = "src/main/java/com/mraibo/cminsight/db";
 
     /**
+     * The application-local history package, the SECOND tree allowed to hold a {@code java.sql} type.
+     *
+     * <p>Goal 04 persists aggregate history into an embedded local H2 file, so this package necessarily names
+     * {@code java.sql.Connection} and {@code PreparedStatement} - and, unlike the analytics path, it
+     * legitimately issues {@code CREATE}, {@code INSERT}, {@code DELETE} and {@code commit} against ITS OWN
+     * file. None of that reaches IBM CM or the repository database, which is what the rule protects.
+     *
+     * <p>This mirrors {@code HISTORY_EXEMPT_REL} in {@code tests/shell/analytics_guard.sh} exactly: same one
+     * path, and the two are asserted to agree rather than kept in sync by hand. The exemption is a named
+     * TREE and never a loosened pattern - widening the rule for all of {@code src/main/java} would delete the
+     * guarantee for every future file in order to accommodate one package.
+     */
+    private static final String HISTORY_PACKAGE = "src/main/java/com/mraibo/cminsight/history";
+
+    /**
      * The statement-literal rules of the analytics guard: a string literal carrying a write/control SQL
      * keyword as a WHOLE TOKEN, positioned where a statement can actually start it.
      *
@@ -607,7 +622,7 @@ public class AnalyticsSourceReadOnlyGuardTest {
         List<String> violations = new ArrayList<>();
         for (Path file : javaFiles(core)) {
             String relative = relative(root, file);
-            if (relative.startsWith(DATABASE_PACKAGE)) {
+            if (relative.startsWith(DATABASE_PACKAGE) || relative.startsWith(HISTORY_PACKAGE)) {
                 continue;
             }
             List<String> lines = readLines(file);
@@ -621,8 +636,77 @@ public class AnalyticsSourceReadOnlyGuardTest {
             }
         }
         Assert.assertTrue(violations.isEmpty(),
-                "no code outside " + DATABASE_PACKAGE + " may name a JDBC driver handle type, or the web layer"
-                        + " could receive one: " + violations);
+                "no code outside " + DATABASE_PACKAGE + " and " + HISTORY_PACKAGE + " may name a JDBC driver"
+                        + " handle type, or the web layer could receive one: " + violations);
+    }
+
+    /**
+     * The history exemption is real, non-empty, and cannot be widened.
+     *
+     * <p>Three things are asserted, and each exists because of a way an exemption rots. The tree must EXIST
+     * and hold at least one source file, or the exemption has outlived its subject while still suppressing
+     * the rule. The committed shell guard must name the SAME path, or the two guards disagree about which
+     * tree is special - which has already happened twice in this project. And the exemption must be scoped to
+     * the handle-type rule for that one tree: a plant carrying a driver handle type in the SCANNED sibling
+     * tree must still be refused, which is what stops "exempt the history package" from quietly becoming
+     * "exempt everything".
+     */
+    public void theHistoryExemptionIsRealNonEmptyAndCannotBeWidened() throws IOException {
+        Path root = repositoryRoot();
+        Path history = root.resolve(HISTORY_PACKAGE);
+        Assert.assertTrue(Files.isDirectory(history),
+                "the history exemption names " + HISTORY_PACKAGE + ", which does not exist. An exemption with"
+                        + " no tree behind it suppresses a rule for nothing");
+
+        List<Path> historyFiles = javaFiles(history);
+        Assert.assertFalse(historyFiles.isEmpty(),
+                "the history exemption must cover a real, non-empty source tree; an empty one means the"
+                        + " exception outlived the thing it was written for");
+
+        String script = readString(SourceGuard.analyticsShellGuard());
+        Assert.assertTrue(script.contains("HISTORY_EXEMPT_REL"),
+                "the committed shell guard must declare the same named history exemption, or the two guards"
+                        + " disagree about which tree is special");
+        Assert.assertTrue(script.contains(HISTORY_PACKAGE),
+                "the shell guard's exemption must name the same path '" + HISTORY_PACKAGE + "' that this suite"
+                        + " exempts; a different value means one of them is enforcing a rule the other cannot"
+                        + " see");
+
+        // The other direction: the same construct OUTSIDE the exempt tree is still refused.
+        Path copy = copyAnalyticsTree();
+        try {
+            Path planted = copy.resolve(ANALYTICS_STATISTICS_SOURCE).resolve("PlantedDriverHandle.java");
+            Files.createDirectories(planted.getParent());
+            Files.writeString(planted, """
+                    package com.mraibo.cminsight.statistics;
+
+                    import java.sql.Connection;
+
+                    final class PlantedDriverHandle {
+                        Connection handle;
+                    }
+                    """, java.nio.charset.StandardCharsets.UTF_8);
+
+            List<String> escaped = new ArrayList<>();
+            for (Path file : javaFiles(copy.resolve(CORE_SOURCE))) {
+                String relative = relative(copy, file);
+                if (relative.startsWith(DATABASE_PACKAGE) || relative.startsWith(HISTORY_PACKAGE)) {
+                    continue;
+                }
+                for (String line : readLines(file)) {
+                    if (!isCommentLine(line) && DRIVER_HANDLE_TYPE.matcher(line).find()) {
+                        escaped.add(relative);
+                    }
+                }
+            }
+            Assert.assertTrue(escaped.stream().anyMatch(entry -> entry.contains("PlantedDriverHandle")),
+                    "a driver handle type planted OUTSIDE the exempt tree must still be refused, or the"
+                            + " history exemption has widened into a hole. Found: " + escaped);
+        } catch (java.io.IOException failure) {
+            throw new AssertionError("could not build the exemption control: " + failure, failure);
+        } finally {
+            deleteRecursively(copy);
+        }
     }
 
     /** True for a line that is entirely a comment or javadoc continuation, which publishes no type. */

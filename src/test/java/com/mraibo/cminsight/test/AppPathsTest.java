@@ -301,9 +301,13 @@ public class AppPathsTest {
                 Assert.assertEquals("classifications.file", described.get(1).key(), "a configured file is listed");
                 Assert.assertEquals(AppPaths.Origin.CONFIGURED, described.get(1).origin(),
                         "a present key is reported as configured");
-                Assert.assertTrue(described.get(3).reservedForLaterGoal(), "data.dir is reserved for a later goal");
-                Assert.assertTrue(described.get(4).reservedForLaterGoal(), "reports.dir is reserved for a later goal");
-                Assert.assertTrue(described.get(5).reservedForLaterGoal(), "logs.dir is reserved for a later goal");
+                Assert.assertFalse(described.get(3).reservedForLaterGoal(),
+                        "data.dir is live from Goal 04: persistent history resolves its store below it");
+                Assert.assertFalse(described.get(4).reservedForLaterGoal(),
+                        "reports.dir is live from Goal 04: generated reports are confined below it");
+                Assert.assertTrue(described.get(5).reservedForLaterGoal(),
+                        "logs.dir is STILL reserved: no Java owner reads it yet, and diagnostics must not"
+                                + " claim an operational path is live before code actually uses it");
                 Assert.assertFalse(described.get(0).reservedForLaterGoal(), "profiles.dir is read now");
                 for (AppPaths.OperationalPath entry : described) {
                     Assert.assertTrue(entry.path().isAbsolute(),

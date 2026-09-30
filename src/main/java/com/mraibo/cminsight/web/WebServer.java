@@ -4,6 +4,7 @@ import com.mraibo.cminsight.config.AppConfig;
 import com.mraibo.cminsight.config.RepositoryProfile;
 import com.mraibo.cminsight.config.WebAuthSettings;
 import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
+import com.mraibo.cminsight.report.ReportService;
 import com.mraibo.cminsight.repository.RepositoryManager;
 import com.mraibo.cminsight.security.Authenticator;
 import com.mraibo.cminsight.security.LoginThrottle;
@@ -211,8 +212,8 @@ public final class WebServer implements AutoCloseable {
     }
 
     /**
-     * Installs the authenticated API - the CM read routes and the Goal 03 analytics routes - and binds
-     * the repository manager the handlers read through.
+     * Installs the authenticated API - the CM read routes, the Goal 03 analytics routes and the Goal 04
+     * history/report routes - and binds the repository manager the handlers read through.
      *
      * <p>Deliberately one additive call: the mandatory routes above are installed exactly as they were,
      * and this registers the Goal 02 routes from {@link CmApiRoutes} on the same router while retaining
@@ -228,6 +229,29 @@ public final class WebServer implements AutoCloseable {
                                    List<RepositoryProfile> profiles,
                                    IbmCmAdapterRegistry adapters,
                                    AnalyticsApi analytics) {
+        installCmApiRoutes(repositories, profiles, adapters, analytics, null, null);
+    }
+
+    /**
+     * Installs the whole authenticated API, including the Goal 04 history and report families.
+     *
+     * <p>Six routes depend on capabilities that may legitimately be absent - history may be switched off or
+     * have no local store, and a runtime may wire no report service at all - and the rule that matters is the
+     * one this project shipped a defect against once: an unavailable feature answers its DOCUMENTED STATE,
+     * never a {@code 404} that reads like a typo in the client's URL. So a {@code null} capability here does
+     * not remove a route; it makes that route report the documented unavailable state. The three mandatory
+     * analytics routes behave the same way.
+     *
+     * @param history the history capability, or {@code null} when the runtime has none
+     * @param reports the report service, or {@code null} when the runtime has none
+     * @throws IllegalStateException when the API routes have already been installed
+     */
+    public void installCmApiRoutes(RepositoryManager repositories,
+                                   List<RepositoryProfile> profiles,
+                                   IbmCmAdapterRegistry adapters,
+                                   AnalyticsApi analytics,
+                                   HistoryApi history,
+                                   ReportService reports) {
         Objects.requireNonNull(repositories, "repositories");
         Objects.requireNonNull(profiles, "profiles");
         Objects.requireNonNull(adapters, "adapters");
@@ -235,7 +259,7 @@ public final class WebServer implements AutoCloseable {
             if (cmApiRoutes != null) {
                 throw new IllegalStateException("The CM API routes are already installed");
             }
-            CmApiRoutes installed = new CmApiRoutes(repositories, profiles, adapters, analytics);
+            CmApiRoutes installed = new CmApiRoutes(repositories, profiles, adapters, analytics, history, reports);
             installed.install(router);
             this.cmApiRoutes = installed;
         }
@@ -308,7 +332,18 @@ public final class WebServer implements AutoCloseable {
         ctx.sendJson(HttpStatus.OK, JsonWriter.object(
                 "name", "CM Insight",
                 "version", version,
-                "mode", mode));
+                "mode", mode,
+                // Local runtime facts only: the JVM this process is running on. It exists so the
+                // System/Diagnostics view can state the application and Java version without a second
+                // endpoint, and it reads no configuration and opens nothing. Anything that could carry a
+                // path, a credential or a connection string is deliberately not here.
+                "javaVersion", javaVersion()));
+    }
+
+    /** The running JVM's version string, or {@code ""} when the property is unavailable. */
+    private static String javaVersion() {
+        String value = System.getProperty("java.version");
+        return value == null ? "" : value.trim();
     }
 
     private static void index(RequestContext ctx) {

@@ -173,6 +173,26 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
     private final AtomicReference<ActiveScan> active = new AtomicReference<>();
     private final AtomicLong scanSequence = new AtomicLong();
 
+    /**
+     * The context-wide analytics arbiter, or null when this coordinator runs ungated.
+     *
+     * <p>Null is the correct default rather than a shared no-op gate: a coordinator built without a gate is
+     * a test or core-only coordinator, and giving it a private gate instance would make
+     * {@link #analyticsGate()} appear to offer something that is not actually shared with anything.
+     */
+    private final AnalyticsOperationGate scanGate;
+
+    /** The token this coordinator presents when releasing the shared gate; never null when a gate exists. */
+    private final String gateOwnerToken;
+
+    /**
+     * Called once for each published snapshot, after it is visible.
+     *
+     * <p>Never null: the default is a no-op, so the publication path has no null check and a caller that
+     * does not want history cannot create a coordinator that forgets to check.
+     */
+    private final java.util.function.Consumer<StatisticsSnapshot> publicationListener;
+
     private final ReentrantLock stateLock = new ReentrantLock();
     private final Condition scanFinished = stateLock.newCondition();
     private final Condition scanProgressed = stateLock.newCondition();
@@ -232,17 +252,121 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
         this(settings, repositoryId, itemTypeSource, engine, () -> { });
     }
 
+    /**
+     * A coordinator that shares one {@link AnalyticsOperationGate} with the targeted-refresh path.
+     *
+     * <p>A full scan and a targeted single-ItemType refresh must never overlap in one repository context.
+     * This coordinator already owns the one-<em>full-scan</em> latch, so the shared gate is acquired and
+     * released alongside it rather than replacing it: the latch stays the authority for "a full scan is
+     * running or draining", and the gate adds the cross-operation exclusion the targeted path needs.
+     *
+     * <p>The gate is released on the SAME exactly-once path as the latch, after the generation has been
+     * proven physically drained. That ordering matters: if the gate were released when the result became
+     * final, a targeted refresh could start while a worker of the finished scan still held a JDBC lease.
+     *
+     * @param scanGate       the context-wide arbiter, or null to run ungated (tests and core-only mode)
+     * @param gateOwnerToken the token this coordinator presents when releasing the gate; must be unique to
+     *                       this coordinator so a late release cannot open the gate for another operation
+     */
+    public ScanCoordinator(StatisticsSettings settings,
+                           String repositoryId,
+                           Supplier<List<ItemTypeSummary>> itemTypeSource,
+                           StatisticsEngine engine,
+                           AnalyticsOperationGate scanGate,
+                           String gateOwnerToken) {
+        this(settings, repositoryId, itemTypeSource, engine, () -> { }, scanGate, gateOwnerToken, snapshot -> { });
+    }
+
+    /**
+     * The full production form: shares the context gate and reports each published snapshot to a listener.
+     *
+     * <p>The listener is how persistent history sees a completed scan, and it is deliberately invoked from
+     * the SINGLE publication point rather than from a poller or from the request that started the scan. Only
+     * a scan that reached normal terminal completion ever reaches that point, so "timeout, cancel and
+     * catastrophic scans create no history row" is a property of where the hook sits rather than a rule each
+     * caller has to remember. A targeted refresh never publishes a full snapshot at all, so it can never
+     * reach here either.
+     *
+     * @param publicationListener called after a snapshot is published; a failure inside it is swallowed
+     *                            because the scan's result is already visible and durable history is
+     *                            best-effort with respect to the scan
+     */
+    public ScanCoordinator(StatisticsSettings settings,
+                           String repositoryId,
+                           Supplier<List<ItemTypeSummary>> itemTypeSource,
+                           StatisticsEngine engine,
+                           AnalyticsOperationGate scanGate,
+                           String gateOwnerToken,
+                           java.util.function.Consumer<StatisticsSnapshot> publicationListener) {
+        this(settings, repositoryId, itemTypeSource, engine, () -> { }, scanGate, gateOwnerToken,
+                publicationListener);
+    }
+
     /** Package-private lifecycle hook used only by deterministic generation-ownership tests. */
     ScanCoordinator(StatisticsSettings settings,
                     String repositoryId,
                     Supplier<List<ItemTypeSummary>> itemTypeSource,
                     StatisticsEngine engine,
                     Runnable beforeSupervisorReturn) {
+        this(settings, repositoryId, itemTypeSource, engine, beforeSupervisorReturn, null, "", snapshot -> { });
+    }
+
+    /** The full form: every other constructor forwards here, so there is one field-assignment site. */
+    ScanCoordinator(StatisticsSettings settings,
+                    String repositoryId,
+                    Supplier<List<ItemTypeSummary>> itemTypeSource,
+                    StatisticsEngine engine,
+                    Runnable beforeSupervisorReturn,
+                    AnalyticsOperationGate scanGate,
+                    String gateOwnerToken) {
+        this(settings, repositoryId, itemTypeSource, engine, beforeSupervisorReturn, scanGate, gateOwnerToken,
+                snapshot -> { });
+    }
+
+    /** The one constructor that assigns fields. */
+    ScanCoordinator(StatisticsSettings settings,
+                    String repositoryId,
+                    Supplier<List<ItemTypeSummary>> itemTypeSource,
+                    StatisticsEngine engine,
+                    Runnable beforeSupervisorReturn,
+                    AnalyticsOperationGate scanGate,
+                    String gateOwnerToken,
+                    java.util.function.Consumer<StatisticsSnapshot> publicationListener) {
         this.settings = Objects.requireNonNull(settings, "settings");
         this.repositoryId = repositoryId == null ? "" : repositoryId.trim();
         this.itemTypeSource = Objects.requireNonNull(itemTypeSource, "itemTypeSource");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.beforeSupervisorReturn = Objects.requireNonNull(beforeSupervisorReturn, "beforeSupervisorReturn");
+        this.scanGate = scanGate;
+        this.gateOwnerToken = gateOwnerToken == null ? "" : gateOwnerToken;
+        this.publicationListener = Objects.requireNonNull(publicationListener, "publicationListener");
+    }
+
+    /**
+     * Reports a published snapshot to the listener, swallowing a listener failure.
+     *
+     * <p>The snapshot is ALREADY published at this point, so the scan succeeded and its result is visible.
+     * Letting a history-store problem propagate from here would convert a successful scan into a failed one -
+     * turning an optional local feature into a failure of the core path, which is exactly the coupling this
+     * project keeps refusing. The failure is therefore contained, and the store reports its own state.
+     */
+    private void notifyPublished(StatisticsSnapshot snapshot) {
+        try {
+            publicationListener.accept(snapshot);
+        } catch (RuntimeException | Error contained) {
+            // Deliberately not rethrown and deliberately not logged with its message: a history store can
+            // name a local file path, and a scan result must not depend on it either way.
+        }
+    }
+
+    /**
+     * The context-wide analytics arbiter this coordinator participates in, or empty when it runs ungated.
+     *
+     * <p>Exposed so a targeted-refresh capability can share the very same instance instead of keeping a
+     * second latch that could disagree with this one.
+     */
+    public Optional<AnalyticsOperationGate> analyticsGate() {
+        return Optional.ofNullable(scanGate);
     }
 
     public StatisticsSettings settings() {
@@ -410,6 +534,19 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             // No side effect whatsoever: the running scan keeps its frozen list, anchor and results. This is
             // also the answer while a previous scan is DRAINING - its result is final but a worker of it is
             // still alive, and isDraining() names that fact for a caller that wants the distinction.
+            return ScanStartResult.ALREADY_RUNNING;
+        }
+        if (scanGate != null && scanGate.tryAcquire(AnalyticsOperationGate.Operation.FULL_SCAN, gateOwnerToken)
+                .isPresent()) {
+            // The shared context gate is held by another analytics operation - a targeted refresh. The full-scan
+            // latch has already been taken, so it MUST be given back here or this coordinator would refuse
+            // every later scan for a reason that no longer exists. Releasing in this order keeps the gate the
+            // outer authority and the latch the inner one.
+            boolean restored = scanInFlight.compareAndSet(true, false);
+            if (!restored) {
+                throw new IllegalStateException("the full-scan latch changed while a conflicting shared-gate"
+                        + " acquisition was being undone");
+            }
             return ScanStartResult.ALREADY_RUNNING;
         }
         long scanId = scanSequence.incrementAndGet();
@@ -912,6 +1049,7 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             StatisticsSnapshot snapshot = StatisticsSnapshot.of(repositoryId, scan.scanId, finished,
                     startedAt, durationMs, anchorDate, results.size(), results);
             published.set(snapshot);
+            notifyPublished(snapshot);
             terminal = ScanStatus.Phase.COMPLETED;
         } else if (scan.deadlineExceeded.get()) {
             // Checked BEFORE cancellation, and the order matters: the deadline path aborts its own in-flight
@@ -1009,6 +1147,13 @@ public final class ScanCoordinator implements StatisticsRepository, CloseStateAw
             if (!scanInFlight.compareAndSet(true, false)) {
                 throw new IllegalStateException("scan generation gate ownership changed before release");
             }
+        }
+
+        // The shared context gate is released on THIS exactly-once path, after physical draining has been
+        // proven, and not when the result became final. Released earlier, a targeted refresh could start
+        // while a worker of this finished scan still held a JDBC lease.
+        if (scanGate != null) {
+            scanGate.release(gateOwnerToken);
         }
 
         // From this point a later generation may start. Do not mutate active scan state, progress,

@@ -3,6 +3,8 @@ package com.mraibo.cminsight.statistics;
 import com.mraibo.cminsight.metadata.ItemTypeSummary;
 
 import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -91,4 +93,76 @@ public interface StatisticsRepository {
      * message: when analytics is disabled or has no pool, this reports that fact with zero counters.
      */
     StatisticsDiagnostics diagnostics();
+
+    // ---------------------------------------------------------------- freshness
+
+    /**
+     * The freshness judgement of the latest completed snapshot, taken now.
+     *
+     * <p>A read, not a refresh: it is a pure function of the snapshot's own {@code capturedAt} and the
+     * configured threshold, so calling it can never start database work and never discards what it judges.
+     * A stale snapshot stays visible - {@link Freshness#stale()} is reported beside the value, and
+     * {@link #snapshot()} keeps returning it.
+     */
+    default Freshness freshness() {
+        return freshness(Instant.now());
+    }
+
+    /**
+     * The same judgement at a caller-supplied instant, so a payload and its diagnostics can describe one
+     * instant.
+     *
+     * <p>The default judges against the documented default threshold and {@link Freshness#none} when no
+     * snapshot exists. An implementation that knows the CONFIGURED threshold overrides this - the
+     * statistics service does - so a repository never reports a threshold the operator did not set.
+     */
+    default Freshness freshness(Instant now) {
+        return FreshnessThreshold.defaults().judge(snapshot(), now);
+    }
+
+    // ---------------------------------------------------------------- targeted single-ItemType refresh
+
+    /**
+     * Refreshes ONE ItemType under the context's shared analytics-operation gate.
+     *
+     * <p>Synchronous: it returns when the measurement was published or refused, so there is no second
+     * "is it done" endpoint. The result is SEPARATE immutable detail data keyed by the ItemType id, with
+     * its own capture instant and its own database anchor; it never becomes part of a
+     * {@link StatisticsSnapshot}, never changes a total and is never persisted as history. A caller that
+     * finds the outcome empty of a detail can render the previously published one, which this call does not
+     * touch when it fails or is refused.
+     *
+     * <p>The default refuses for every implementation without the capability - an unavailable or disabled
+     * service, or a bare coordinator - rather than pretending to start work.
+     */
+    default TargetedRefreshResult refreshItemType(int itemTypeId) {
+        return TargetedRefreshResult.unavailable(itemTypeId,
+                "this analytics service has no targeted single-ItemType refresh capability");
+    }
+
+    /** The published targeted detail for one ItemType, or empty when this context has none. */
+    default Optional<TargetedItemTypeDetail> targetedDetail(int itemTypeId) {
+        return Optional.empty();
+    }
+
+    /** Every published targeted detail in this context, in ItemType id order; a bounded, copied list. */
+    default List<TargetedItemTypeDetail> targetedDetails() {
+        return List.of();
+    }
+
+    /**
+     * True while a targeted single-ItemType refresh is running in this context.
+     *
+     * <p>A diagnostics fact, not a gate: it never refuses work and never decides admission. It is asked by
+     * the System/Diagnostics view, which must be able to say that an analytics operation is in flight even
+     * though a targeted refresh is not a scan.
+     */
+    default boolean isTargetedRefreshInFlight() {
+        return false;
+    }
+
+    /** How many ItemTypes have a published targeted detail in this context; zero when there is none. */
+    default int targetedDetailCount() {
+        return 0;
+    }
 }

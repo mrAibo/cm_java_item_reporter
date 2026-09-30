@@ -12,9 +12,13 @@ import com.mraibo.cminsight.config.WebAuthSettings;
 import com.mraibo.cminsight.core.JdbcPoolSettings;
 import com.mraibo.cminsight.core.StatisticsSettings;
 import com.mraibo.cminsight.db.JdbcDrivers;
+import com.mraibo.cminsight.history.HistoryFinding;
+import com.mraibo.cminsight.history.HistoryStores;
 import com.mraibo.cminsight.ibm.CmAdapterSettings;
 import com.mraibo.cminsight.ibm.IbmCmAdapterRegistry;
+import com.mraibo.cminsight.report.ReportFormat;
 import com.mraibo.cminsight.security.SecurityPolicy;
+import com.mraibo.cminsight.statistics.FreshnessThreshold;
 
 import java.io.IOException;
 import java.io.PrintStream;
@@ -244,6 +248,11 @@ public final class ConfigCheck {
         // "could this runtime run a statistics scan, and if not, why" - kept apart from the two above for
         // the same reason they are apart from each other.
         doctorFindings.addAll(statisticsFindings(paths, config, secrets));
+        // Goal 04 section 11: the local-storage half - history, the data/reports directories, the report
+        // formats and the statistics freshness threshold. A fourth independent question, and, like the three
+        // above, answered WITHOUT opening anything: no CM session, no repository database and no H2
+        // connection is created merely to print configuration.
+        doctorFindings.addAll(localStorageFindings(paths, config));
 
         out.println(OK_PREFIX + "home = " + paths.describeHome());
         out.println(OK_PREFIX + "config file = " + configPath);
@@ -655,6 +664,140 @@ public final class ConfigCheck {
                 + " retention routes are unaffected.");
     }
 
+    /**
+     * The Goal 04 local-storage section of the report: history, the operational directories the new features
+     * write into, the report formats and the statistics freshness threshold.
+     *
+     * <h2>Local only, and that is the whole point</h2>
+     *
+     * <p>Goal 04 section 11 forbids the doctor from connecting to IBM CM, the repository database or H2 merely
+     * to print configuration, and it also forbids the public health endpoint from doing it. So every verdict
+     * here comes from a class-loading probe and a filesystem check:
+     *
+     * <ul>
+     *   <li>the history lines come from {@link HistoryStores#findings(AppPaths, AppConfig)} - the history
+     *       layer's own local verdict - which loads a driver CLASS NAME and inspects the data directory, and
+     *       opens no database;</li>
+     *   <li>the directory lines report whether {@code data.dir} and {@code reports.dir} are writable, or can
+     *       be created inside a writable ancestor, and they create nothing;</li>
+     *   <li>the report-format lines come from the format enum itself, so an unavailable XLSX is stated as
+     *       unavailable rather than omitted;</li>
+     *   <li>the freshness line comes from {@link FreshnessThreshold}, the one reader of
+     *       {@code cache.statistics.ttl.seconds} the runtime uses, so the doctor cannot accept a value the
+     *       runtime refuses or refuse one it accepts.</li>
+     * </ul>
+     *
+     * <p>"Expected ready" is deliberately not reported as "opened": the store is opened by the
+     * application-local history lifecycle, not by a configuration check, and a diagnostics line that let the
+     * two blur would claim more than it proved.
+     */
+    public static List<Finding> localStorageFindings(AppPaths paths, AppConfig config) {
+        Objects.requireNonNull(paths, "paths");
+        Objects.requireNonNull(config, "config");
+
+        List<Finding> findings = new ArrayList<>(10);
+
+        // History: the history layer's own local readiness, mapped into this report's level type rather than
+        // re-derived here. An absent H2 driver is a WARN and not an ERROR, because the runtime serves the
+        // documented "history unavailable" state and everything else keeps working.
+        for (HistoryFinding finding : HistoryStores.findings(paths, config)) {
+            findings.add(new Finding(switch (finding.level()) {
+                case OK -> Level.OK;
+                case WARN -> Level.WARN;
+                case ERROR -> Level.ERROR;
+            }, finding.message()));
+        }
+
+        // The two directories the new features write into. reports.dir holds generated reports; data.dir holds
+        // the local history store. Both are resolved by AppPaths exactly as the runtime resolves them.
+        findings.add(directoryFinding(AppPaths.DATA_DIR_KEY, paths.dataDir(config)));
+        findings.add(directoryFinding(AppPaths.REPORTS_DIR_KEY, paths.reportsDir(config)));
+
+        // Report formats: the COMPLETE list, with an unavailable one stated as unavailable and its reason.
+        List<String> available = new ArrayList<>(ReportFormat.values().length);
+        for (ReportFormat format : ReportFormat.availableFormats()) {
+            available.add(format.token());
+        }
+        findings.add(new Finding(Level.OK, "report formats available in this build: "
+                + String.join(", ", available)
+                + " (HTML and CSV are produced by JDK-only code; XLSX is a real minimal OOXML workbook written"
+                + " with the JDK zip support, never a renamed CSV)"));
+        for (ReportFormat format : ReportFormat.unavailableFormats()) {
+            findings.add(new Finding(Level.WARN, "report format " + format.token() + " is UNAVAILABLE: "
+                    + format.detail() + ". /api/reports and the Reports view state it as unavailable and never"
+                    + " substitute another format."));
+        }
+
+        // The freshness threshold, read by the runtime's own reader.
+        try {
+            FreshnessThreshold freshness = FreshnessThreshold.from(config);
+            findings.add(new Finding(Level.OK, "statistics freshness: " + freshness.describe()
+                    + " (a judgement only: the published snapshot stays visible when it is stale, age is always"
+                    + " reported, and no GET request starts a scan)"));
+        } catch (ConfigException e) {
+            // Main reads this value before it serves anything and refuses the same way.
+            findings.add(new Finding(Level.ERROR, e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            findings.add(new Finding(Level.ERROR, e.getMessage()));
+        }
+
+        findings.add(new Finding(Level.OK, "history and report readiness is LOCAL only: no IBM CM session, no"
+                + " repository-database connection and no local history database was opened to produce these"
+                + " lines, and 'expected ready' does not claim that the store has been opened"));
+        return List.copyOf(findings);
+    }
+
+    /**
+     * One operational directory's writability as a single classified line.
+     *
+     * <p>Writability is a property of the directory that is already there, or of the nearest existing ancestor
+     * that is, so asking the question creates NOTHING: the report cannot make an operator's filesystem look
+     * different from what it said. A path that exists but is not a directory can never contain the output, so
+     * it is reported as NOT writable however permissive its own attributes are.
+     */
+    private static Finding directoryFinding(String key, Path directory) {
+        if (directory == null) {
+            return new Finding(Level.WARN, key + " could not be resolved to a path");
+        }
+        Path candidate = directory.toAbsolutePath().normalize();
+        boolean exists = Files.exists(candidate);
+        Path existing = exists ? candidate : candidate.getParent();
+        while (existing != null && !Files.exists(existing)) {
+            existing = existing.getParent();
+        }
+        if (existing == null) {
+            return new Finding(Level.WARN, key + " = " + candidate + " has no existing ancestor, so it cannot"
+                    + " be created; reports or history would be unavailable and everything else is unaffected");
+        }
+        boolean usable = Files.isDirectory(existing) && writable(existing);
+        if (usable) {
+            return new Finding(Level.OK, key + " = " + candidate + (exists
+                    ? " (writable"
+                    : " (does not exist yet; it can be created inside " + existing + ", which is writable")
+                    + ")");
+        }
+        return new Finding(Level.WARN, key + " = " + candidate + " is NOT writable (" + existing
+                + " is not a writable directory); reports or history would report their documented unavailable"
+                + " state and repository activation is unaffected");
+    }
+
+    /**
+     * True when a directory can be written to, checked without creating anything.
+     *
+     * <p>Two independent access checks, because one of them lies on some hosts: the NIO
+     * {@link Files#isWritable(Path)} check reports "not writable" for a directory this project can plainly
+     * write to when the JVM runs under a restricted Windows token, while the legacy
+     * {@link java.io.File#canWrite()} verdict is the attribute-based one most Windows tooling uses. A
+     * directory is reported writable when EITHER check says so, which removes the false negative without
+     * making the check optimistic on a platform where the two agree (on Linux they are the same call).
+     */
+    private static boolean writable(Path directory) {
+        if (Files.isWritable(directory)) {
+            return true;
+        }
+        return directory.toFile().canWrite();
+    }
+
     private static Finding credentialFinding(SecretResolver secrets, String key, SecretRef declared) {
         if (declared.source() == SecretRef.Source.MISSING) {
             return new Finding(Level.WARN, "credential " + key + " is not configured; declare '" + key
@@ -740,6 +883,14 @@ public final class ConfigCheck {
         out.println("derived from a live session at scan time. It opens NO database connection - a loadable");
         out.println("driver is not evidence of a reachable database - and an out-of-range bound is an ERROR,");
         out.println("because the runtime refuses to start on the same message.");
+        out.println();
+        out.println("The local-storage section reports whether persistent history is enabled by feature, whether");
+        out.println("the local database driver is present, whether the history store is expected ready or");
+        out.println("unavailable and why, whether data.dir and reports.dir are writable, which report formats");
+        out.println("this build can produce (an unavailable XLSX is stated as unavailable, never omitted), and");
+        out.println("the cache.statistics.ttl.seconds freshness threshold. It is LOCAL only: no IBM CM session,");
+        out.println("no repository-database connection and no history database is opened to print it, so");
+        out.println("\"expected ready\" does not claim that the store has been opened.");
         out.println();
         out.println("  --config <file>   configuration file (default <home>/conf/application.properties)");
         out.println("  --validate-config accepted and ignored (the flag that dispatches here from Main)");

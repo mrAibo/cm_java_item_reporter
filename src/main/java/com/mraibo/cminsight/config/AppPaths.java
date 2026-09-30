@@ -262,12 +262,12 @@ public final class AppPaths {
         return resolve(config.get(SECRETS_DIR_KEY, null), DEFAULT_SECRETS_DIR);
     }
 
-    /** {@code data.dir} - resolved now, read by a later goal. */
+    /** {@code data.dir} - application-local persistent data, including Goal 04 history. */
     public Path dataDir(AppConfig config) {
         return resolve(config.get(DATA_DIR_KEY, null), DEFAULT_DATA_DIR);
     }
 
-    /** {@code reports.dir} - resolved now, read by a later goal. */
+    /** {@code reports.dir} - confined output directory for Goal 04 generated reports. */
     public Path reportsDir(AppConfig config) {
         return resolve(config.get(REPORTS_DIR_KEY, null), DEFAULT_REPORTS_DIR);
     }
@@ -290,10 +290,11 @@ public final class AppPaths {
             entries.add(entry(config, CLASSIFICATIONS_FILE_KEY, null, false));
         }
         entries.add(entry(config, SECRETS_DIR_KEY, DEFAULT_SECRETS_DIR, false));
-        // Carried by Goal 01 for a stable configuration shape; nothing in Java reads them yet, and
-        // they are listed here so that the future reader inherits the same one rule.
-        entries.add(entry(config, DATA_DIR_KEY, DEFAULT_DATA_DIR, true));
-        entries.add(entry(config, REPORTS_DIR_KEY, DEFAULT_REPORTS_DIR, true));
+        // Goal 04 activates the application-local data and report directories. logs.dir stays reserved
+        // until a Java logging owner consumes it; keeping that distinction explicit prevents diagnostics
+        // from claiming an operational path is live before any code actually uses it.
+        entries.add(entry(config, DATA_DIR_KEY, DEFAULT_DATA_DIR, false));
+        entries.add(entry(config, REPORTS_DIR_KEY, DEFAULT_REPORTS_DIR, false));
         entries.add(entry(config, LOGS_DIR_KEY, DEFAULT_LOGS_DIR, true));
         return List.copyOf(entries);
     }

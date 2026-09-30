@@ -29,6 +29,7 @@ import java.util.Objects;
  * @param itemTypeName           the ItemType name as IBM CM reports it
  * @param businessClassification the label already present in metadata; totals are grouped by it and this
  *                               class never re-derives SAP/NON-SAP
+ * @param retentionPolicyName    the retention policy name frozen with metadata for this ItemType, or empty
  * @param scanStartedAt          when the scan that produced this result started
  * @param capturedAt             when this ItemType's measurement finished
  * @param logicalItems           distinct ItemIDs, or the ERROR state with a sanitized reason
@@ -47,6 +48,7 @@ public record ItemTypeStatistics(String repositoryId,
                                  int itemTypeId,
                                  String itemTypeName,
                                  String businessClassification,
+                                 String retentionPolicyName,
                                  Instant scanStartedAt,
                                  Instant capturedAt,
                                  MetricValue logicalItems,
@@ -81,6 +83,7 @@ public record ItemTypeStatistics(String repositoryId,
         repositoryId = repositoryId == null ? "" : repositoryId.trim();
         itemTypeName = SanitizedText.clean(itemTypeName, MAX_NAME_LENGTH);
         businessClassification = SanitizedText.clean(businessClassification, MAX_NAME_LENGTH);
+        retentionPolicyName = SanitizedText.clean(retentionPolicyName, MAX_NAME_LENGTH);
         source = SanitizedText.clean(source, 32);
         errorMessage = SanitizedText.clean(errorMessage, MAX_MESSAGE_LENGTH);
         Objects.requireNonNull(logicalItems, "logicalItems");
@@ -119,7 +122,7 @@ public record ItemTypeStatistics(String repositoryId,
                 ? Status.OK
                 : Status.PARTIAL;
         return new ItemTypeStatistics(repositoryId, itemType.itemTypeId(), itemType.name(),
-                itemType.businessClassification(), scanStartedAt, capturedAt,
+                itemType.businessClassification(), itemType.retentionPolicyName(), scanStartedAt, capturedAt,
                 total, today, last7, last30, year, null, null,
                 durationMs, source, status, "");
     }
@@ -143,7 +146,7 @@ public record ItemTypeStatistics(String repositoryId,
         Objects.requireNonNull(itemType, "itemType");
         MetricValue error = errorMetric(errorMessage);
         return new ItemTypeStatistics(repositoryId, itemType.itemTypeId(), itemType.name(),
-                itemType.businessClassification(), scanStartedAt, capturedAt,
+                itemType.businessClassification(), itemType.retentionPolicyName(), scanStartedAt, capturedAt,
                 error, error, error, error, error, null, null,
                 durationMs, source, Status.ERROR, errorMessage);
     }

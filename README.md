@@ -194,7 +194,9 @@ Read by this build:
 - `web.auth.maxFailures`, `web.auth.lockout`, `web.auth.maxTrackedKeys` (brute-force guard)
 - `feature.<id>` switches (see `FeatureRegistry`; `feature.retention.admin` cannot be enabled)
 - `classification.<name>.label` / `classification.<name>.regex` rules, optionally from `classifications.file`
-- `profiles.dir`, `secrets.dir`
+- `profiles.dir`, `secrets.dir`, `data.dir`, `reports.dir` (`logs.dir` remains reserved for a later logging owner)
+- `jdbc.pool.*`, `statistics.*`, `cache.statistics.ttl.seconds`
+- `feature.history`, `history.max.snapshots.per.repository`
 - `repository.auto.activate` to optionally activate one configured repository at startup
 
 ### CM adapter, pool and metadata cache
@@ -218,11 +220,19 @@ rather than publishing an empty placeholder context. Without the key, repository
 listed and nothing is activated. `bin/doctor.sh` reports the same verdict as a `WARN` when nothing is
 configured to activate and an `ERROR` as soon as this key names a repository.
 
-Reserved for later goals: `jdbc.pool.*`, `statistics.*` and `cache.statistics.ttl.seconds`. They are
-accepted and carried in the example so the configuration shape is stable, but no code reads them yet.
-`data.dir`, `reports.dir` and `logs.dir` are also not read as directory values by any code: they are
-declared as home-relative path keys with their own defaults, and the shell scripts create the
-directories without resolving them from this file.
+### Analytics freshness, history and reports
+
+Goal 03 activates the bounded `jdbc.pool.*` / `statistics.*` settings. Goal 04 adds
+`cache.statistics.ttl.seconds` (default `300`, range `0..86400`) as a freshness judgement only: a stale
+completed snapshot remains visible and a GET never triggers a refresh. `0` means any non-zero age is stale.
+
+Persistent history is optional and application-local. `feature.history` defaults to `true` and
+`history.max.snapshots.per.repository` defaults to `1000` (range `1..100000`). History data is kept below
+`data.dir`; a missing local H2 driver makes history explicitly unavailable without failing repository
+activation or live statistics. H2 remains an optional runtime JAR under `lib/app` and is not a compile-time
+dependency. Generated HTML/CSV/XLSX artifacts are confined below `reports.dir`. Both paths use the same
+application-home resolution rule described above. `logs.dir` remains reserved until a Java logging owner
+actually consumes it.
 
 Unknown keys are reported at startup instead of being ignored, matched against an exact key list so
 that a typo such as `web.prt=8080` is caught rather than passing as part of the `web.` family.
