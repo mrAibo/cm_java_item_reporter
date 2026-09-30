@@ -206,6 +206,14 @@ the total plus the four window counts. Versions and Parts remain `UNAVAILABLE`.
   complete total for the frozen list. Versions and Parts stay `UNAVAILABLE` in every result and every total.
 - `StatisticsDiagnostics` is the safe pool view the web layer publishes: counters, a close state and one
   sanitised error sentence. No `java.sql` type crosses it.
+- Scan ownership is generation-scoped. A terminal phase decides publication/status, not physical quiescence:
+  scan N+1 is refused until every worker and supervisor belonging to scan N is physically dead. One bounded
+  per-generation observer releases the gate only after that fact is observable; old-generation cleanup may
+  never inspect, interrupt or mutate a later generation's thread registry. A bounded close therefore remains
+  `CLOSING` while any coordinator-owned scan thread is alive and becomes `CLOSED_CLEAN` only after all are gone.
+- The single database-current-date anchor participates in the same scan cancellation domain as ItemType
+  queries. Overall deadline, explicit cancellation and context close all reach the in-flight prepared
+  statement through `JdbcSession.cancelInFlight`; no second anchor or JVM-local date fallback is allowed.
 
 ### JDBC is optional to repository activation
 

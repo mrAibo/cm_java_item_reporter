@@ -1,6 +1,11 @@
 # Goal 03B - Scan generation ownership and guard-contract closure
 
-**Status: APPROVED / EXECUTE.**
+**Status: COMPLETED / PUSHED / GREEN — AWAITING ARCHITECTURE REVIEW. DO NOT RE-EXECUTE.**
+
+Implementation commit: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`.
+Implementation Actions: push `36711455135` success; pull_request `36711461832` success.
+Core 375 tests and IBM 51 tests are green on the stub path; the real IBM CM 8.7 SDK path is also green.
+NO LIVE DB2/ORACLE SQL VALIDATION WAS PERFORMED.
 
 This is a narrow correction gate after the architecture review of Goal 03A.
 

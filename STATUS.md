@@ -23,12 +23,225 @@
 - Goal 03A reviewed checkpoint (the review that approved this goal): `023b47552169d9ac35058461ae07d7788a9fdafb`
 - Goal 03A implementation commit: `7313176fa0b9b97d79516aadaaddada6dbea5a39`
 - Goal 03A final execution/handoff HEAD: `b7d190a13178de894d44a7536a8e8b29526f19c7`
-- Stage: **Goal 03A REVIEWED — CHANGES REQUIRED; Goal 03B APPROVED / EXECUTE**
-- Current approved goal: `harness/GOAL_03B_SCAN_GENERATION_OWNERSHIP_AND_GUARD_CONTRACT.md`
-- Goal 03: accepted analytics core; correction chain remains open
-- Goal 03A: COMPLETED / REVIEWED — CORRECTION GOAL 03B REQUIRED
-- Goal 03B: APPROVED / EXECUTE
+- Goal 03B reviewed checkpoint (the review that approved this goal): `155379c38e9a3afdc090c4b9991aeaf7e1bf2059`
+- Goal 03B implementation commit: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`
+- Stage: **Goal 03B EXECUTED / PUSHED / GREEN — PENDING ARCHITECTURE REVIEW**
+- Current approved goal: none; **NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED**
+- Goal 03: accepted analytics core; correction chain closed by Goal 03B implementation, pending review
+- Goal 03A: COMPLETED / REVIEWED — its three review findings are implemented in Goal 03B
+- Goal 03B: COMPLETED / PUSHED / GREEN — PENDING ARCHITECTURE REVIEW
 - Goals 04-05: PROVISIONAL; do not execute
+
+## Goal 03B execution record
+
+Date: 2026-09-30. Branch: `bootstrap/cm-insight-architecture`.
+Reviewed/approved checkpoint: `155379c38e9a3afdc090c4b9991aeaf7e1bf2059`.
+Implementation commit: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`.
+**PR #1 remains OPEN, draft and unmerged.**
+
+Goal 03B is a correction closure only. It does not add Goal 04/05 functionality and does
+not change the frozen analytics counting model.
+
+### A. Scan ownership is generation-scoped and gate release follows physical death
+
+The coordinator no longer lets a scan thread remove its own ownership record and then use
+that absence as proof that the Java thread is gone. Each `ActiveScan` now owns its own
+thread registry, lock, worker-registration counter and one immutable generation id.
+Every owned thread is recorded with an explicit role: reaper, watchdog, supervisor or
+worker.
+
+One dedicated daemon reaper belongs to exactly one scan generation. It is the normal-path
+owner of gate release. It may release the one-scan gate only when:
+
+- the generation is sealed, so no further worker can be registered;
+- no worker batch is mid-registration;
+- every non-reaper worker/supervisor/watchdog belonging to that exact generation has
+  `Thread.isAlive() == false`;
+- the coordinator's active generation is still that generation; and
+- that generation has not already released the gate.
+
+After gate release the reaper only signals waiters and returns. It does not clear, watch,
+interrupt or otherwise mutate a later generation. Cancellation is likewise generation
+scoped: it walks only that scan's owned threads and deliberately does not cancel its
+physical-death observer.
+
+Coordinator lifetime accounting is separate from per-generation ownership. Dead owned
+references may be pruned, but a live coordinator-owned thread remains visible to
+`closeState()`. A bounded `close()` therefore stays `CLOSING` until the held
+supervisor and its reaper are actually gone; a slow thread is still not reclassified as
+`CLOSED_UNCERTAIN`.
+
+The deterministic regression test places a barrier at the supervisor's final action. The
+scan may already have a terminal phase and be sealed, but while that barrier holds the
+supervisor Java thread is still alive. The test proves a second scan is refused until the
+barrier is released and the supervisor actually terminates.
+
+**Mutation evidence:** in a private copy, the reaper was changed to ignore the
+supervisor's `isAlive()` result. The committed suite then failed exactly the relevant
+Goal 03B controls:
+
+- `ScanGateLatchTest.closeRemainsClosingUntilTheHeldSupervisorAndItsReaperAreActuallyGone`
+- `ScanGateLatchTest.supervisorMustPhysicallyDieBeforeTheNextGenerationCanStart`
+
+Result: core **375 tests / 2 failures**. The correct implementation is **375/0**.
+
+### B. Production database-anchor cancellation is now mutation-sensitive
+
+The existing production wiring remains
+`JdbcStatisticsEngine.databaseCurrentDate(ScanCancellation)` registering
+`JdbcSession::cancelInFlight`. Goal 03B adds tests that exercise that exact production
+path rather than a fake `StatisticsEngine` only:
+
+`ScanCoordinator -> JdbcStatisticsEngine -> BoundedPool<JdbcSession> -> JdbcSession ->
+PreparedStatement.executeQuery()`.
+
+A registered fake JDBC driver blocks the DB2 current-date statement
+(`SELECT CURRENT DATE FROM SYSIBM.SYSDUMMY1`) and records the real
+`PreparedStatement.cancel()` call. The tests prove independently that:
+
+- a 1 s overall scan deadline cancels the blocked anchor even when the statement query
+  timeout is 60 s;
+- explicit `cancelScan()` reaches the same prepared statement;
+- context `close()` reaches the same prepared statement;
+- the deadline case remains `TIMED_OUT`, explicit/close cases remain `CANCELLED`;
+- no timed-out/cancelled scan publishes a replacement snapshot; and
+- the database anchor statement is issued exactly once, with no retry, JVM-date fallback
+  or second boundary read.
+
+**Mutation evidence:** replacing only the production anchor registration with a no-op
+left all unrelated tests intact but made all three production-wiring tests fail:
+
+- context close: expected one `Statement.cancel()`, observed zero;
+- deadline: the prepared anchor never observed cancellation;
+- explicit cancel: the prepared anchor never observed cancellation.
+
+Result: core **375 tests / 3 failures**. The correct implementation is **375/0**.
+
+### C. Analytics source-guard exemption is exact-path and literal-rule-only
+
+The one allowed vocabulary declaration is now exactly:
+
+`src/main/java/com/mraibo/cminsight/db/SqlAdmission.java`.
+
+The exemption is compared as a repository-relative path, never by basename. It applies
+only to the statement-literal vocabulary rules; the JDBC call/control rules still scan
+the canonical file itself.
+
+Committed positive/negative controls prove:
+
+- `statistics/review/SqlAdmission.java` receives no exemption and a write-shaped SQL
+  literal is refused;
+- `db/review/SqlAdmission.java` receives no exemption and is refused the same way;
+- the canonical exempt path containing a real JDBC write call is still refused;
+- removing/renaming the canonical exempt target makes the guard fail closed as a stale
+  exemption;
+- all previously required SELECT-wrapped DML, CTE DML, separator, comment-obfuscation
+  and generic JDBC call plants still bite; and
+- all approved read-only production forms still pass.
+
+The explicit shell guard regression reports **93 checks / 0 failures**.
+
+### Frozen semantics and safety boundaries preserved
+
+Goal 03B does not change:
+
+- logical item = one distinct `ItemID`;
+- per-segment DISTINCT plus cross-segment union/dedup;
+- every root segment 1..N and missing-middle-segment failure;
+- immutable ItemID creation-date windows and one database date per scan;
+- Versions/Parts = `UNAVAILABLE`;
+- partial-failure snapshot coverage and atomic publication;
+- timeout/cancel/catastrophic scans publish nothing;
+- hard-bounded lazy JDBC with no ad-hoc connection;
+- JDBC optional to CM repository activation;
+- `JdbcSession.currentSchema()` health semantics from Goal 03A;
+- runtime `SqlAdmission` from Goal 03A;
+- Goal 01C / Goal 02B close/create/health contracts;
+- authenticated analytics API and action-header rule; or
+- the no-vendor-JAR-in-Git rule.
+
+The implementation diff touches only `ScanCoordinator` plus Goal 03B tests/guard
+surfaces. `BoundedPool`, `RepositoryManager`, `ResourceFactory`,
+`CreationFailure` and the accepted counting/dialect classes are unchanged.
+
+### Validation actually executed
+
+Validation was run serially in a private clean WSL clone based on the reviewed checkpoint
+with the exact implementation diff applied, using OpenJDK **17.0.20.1**:
+
+- `./build.sh` — exit 0; core **375/0**, IBM stub **51/0**, jar packaged.
+- `./tests/selftest.sh` — exit 0; core **375/0**, IBM stub **51/0**.
+- `./tests/shell/run.sh` — exit 0; **5 passed, 0 failed**, including the 58 s lifecycle
+  identity race/soak suite.
+- `./bin/doctor.sh` — exit 0 after supplying the normal local ignored
+  `conf/application.properties`; **0 failures, 11 warnings**. The warnings are the
+  expected local development-credential / absent optional-runtime-library notices.
+- `./build.sh --check-ibm-isolation` — exit 0.
+- `bash tests/shell/analytics_guard.sh` — exit 0.
+- `bash tests/shell/analytics_source_guard_test.sh` — exit 0,
+  **93 checks / 0 failures**.
+- `git diff --check` — clean.
+- tracked proprietary JAR check — **zero tracked `*.jar` files**.
+
+**Real IBM CM 8.7 SDK, separately:** four local SDK JARs were staged only in the private
+validation copy and removed from the repository workflow. `./build.sh --require-ibm`
+exited 0, compiled **17 IBM adapter sources** and **12 IBM test sources**, ran core
+**375/0** and the real-SDK IBM suite **51/0**, and packaged the jar. The SDK printed its
+known local logging-configuration warning (`cmbcmenv.properties` / Log4J2 fallback);
+that is not a compile/test failure and is unchanged from earlier goals.
+
+### Live environment status
+
+**NO LIVE DB2 OR ORACLE SQL VALIDATION WAS PERFORMED.**
+No reachable CM Library Server database is available from the execution host. A fake
+JDBC driver and a loadable vendor driver are not presented as live database evidence.
+
+**NO SUCCESSFUL LIVE IBM CM SERVER VALIDATION WAS PERFORMED.**
+The real IBM SDK result above is compile/test compatibility evidence, not proof of a live
+CM connection.
+
+### GitHub Actions for the implementation commit
+
+Exact implementation SHA `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`:
+
+- push run `36711455135` — **success**;
+- pull_request run `36711461832` — **success**.
+
+Both events report the same implementation SHA.
+
+### Remaining risks
+
+1. Live DB2/Oracle query validation remains the largest evidence gap.
+2. Live IBM CM server success is still unavailable from this host.
+3. A JDBC driver that ignores `Statement.cancel()` intentionally keeps its scan
+   generation draining and blocks a later scan until the physical query thread exits.
+4. The Windows/MSYS working tree still cannot safely host concurrent builds when
+   `flock` is unavailable. Final validation therefore used one private WSL clone
+   serially.
+5. The IBM SDK still needs its normal production logging configuration; its fallback
+   warning is unrelated to Goal 03B.
+
+### Architecture / next-goal state
+
+No product architecture decision changed. Goal 03B makes the already-required one-scan
+invariant physically true, closes the production test blind spot, and narrows a guard
+exception to the exact scope it documented.
+
+**Next goal: NOT YET APPROVED / ARCHITECTURE REVIEW REQUIRED.**
+Do not execute Goal 04 or Goal 05. Do not merge PR #1.
+
+### Resume / review instruction
+
+"Continue CM Insight in `mrAibo/cm_java_item_reporter` on branch
+`bootstrap/cm-insight-architecture`. Fetch and fast-forward first. Read `STATUS.md`,
+`ARCHITECTURE.md`, `SECURITY.md`, `DATA_MODEL.md`, `harness/MASTER_GOAL.md`,
+`harness/GOAL_03A_SCAN_LIFECYCLE_AND_SQL_GUARD_HARDENING.md` and
+`harness/GOAL_03B_SCAN_GENERATION_OWNERSHIP_AND_GUARD_CONTRACT.md` completely.
+Goal 03B is executed, pushed and green on both implementation Actions events. REVIEW
+Goal 03B before approving anything further; do not re-execute Goal 03/03A/03B and do
+not execute Goal 04/05. Preserve the generation-scoped physical-death gate, production
+anchor-cancel tests, exact-path literal-only guard exemption, frozen distinct-ItemID
+analytics semantics and all accepted Goal 01C/02B resource rules."
 
 ## Goal 03A architecture review — changes required
 
