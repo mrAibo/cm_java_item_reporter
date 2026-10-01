@@ -277,6 +277,47 @@ with **zero** jars anywhere, and the only `org.h2` occurrence in `src/main/java`
 `HistoryStores.H2_DRIVER_CLASS` name constant - which is the point of the class-name discovery
 design, since an `import org.h2.*` would compile locally and fail only on a clean CI checkout.
 
+### Coverage limits of the verification - stated, not glossed
+
+The t6 verdict is PASS with **0 failures across 358 probe checks** (119 + 78 + 79 + 20 + 22 +
+6 + 34), but limits qualify how far that reached, and they are recorded because a verification
+report is only useful if it says what it did **not** establish:
+
+1. **"A stale read performs zero database work" counts calls into the statistics engine - the
+   only component that can reach JDBC - not pool borrows**, because the freshness fixture has
+   no pool. The HTTP path (`GET /api/statistics` against a real coordinator) was not driven with
+   pool counting. The property is established at the service level, not end to end.
+2. **The symlink-in-`reports.dir` case could not be exercised at all**: Windows refused symlink
+   creation ("administrator rights are required"). The verifier fell back to an artifact-named
+   **directory**, which is also refused, and junctions cannot substitute because `find()`
+   requires a regular file. Containment is nevertheless shown **load-bearing** by the mutation
+   control - neutralising `ReportId.parse` produced 10 failures.
+3. **The "exempt vocabulary plus a real write, outside the tree" combination was not
+   independently reproduced.** It exists as a committed author test
+   (`aPlantCombiningTheExemptVocabularyWithARealWriteIsStillRefused`) and is green inside
+   `selftest`, but the verifier did not replicate that exact combination itself.
+4. **`tests/shell/analytics_guard.sh` implements no JDBC-driver-handle rule.** A planted
+   `Class.forName("org.h2.Driver")` outside the exempt trees exits **0** there; that rule lives
+   **only** in the Java twin (`AnalyticsSourceReadOnlyGuardTest.noJdbcDriverHandleTypeEscapes...`),
+   which is green. This is recorded because the shell guard alone does **not** support a claim
+   that driver-handle types are contained - the two guards cover different rule sets, and only
+   the driver-handle rule was previously described as if both enforced it.
+5. **End-to-end URL traversal cannot occur**, because the report-download path never
+   percent-decodes, so an encoded traversal never reaches the filesystem. The refusals the
+   verifier observed are therefore **status and side-effect level** (400/404, no file, no port
+   call), and a mutated build escaping through a real URL could not be demonstrated - the
+   neutralised parser was detected at the parser level instead.
+6. **The verifier's own leak probe prints PASS/FAIL lines but no summary line and no exit
+   code**, so its evidence is the printed lines (34 PASS, 0 FAIL) rather than a status. The gap
+   is in the harness, not the implementation.
+7. **`lib/ibm` was empty during verification**, so `--require-ibm` is NOT APPLICABLE and the IBM
+   suite ran against the test-only signature stubs. The real-SDK run recorded above is the
+   applicable evidence for that path.
+8. **The verifier did not check remote HEAD or Actions**, by design - that evidence is the
+   lead's and is recorded in its own table above.
+9. **No live DB2/Oracle/IBM CM validation, and no browser was driven**, so live dialect
+   behaviour and real-browser UI behaviour remain unverified.
+
 ### Live environment status - honest
 
 **NO LIVE DB2/ORACLE SQL VALIDATION WAS PERFORMED** and **no live IBM CM validation was
