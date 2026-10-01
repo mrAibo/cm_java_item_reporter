@@ -27,15 +27,114 @@
 - Goal 03B implementation commit: `6fbee64bb047bd6ff841a5a530a0897703ab5b0f`
 - Goal 03B final execution/handoff HEAD: `edab82f25e69af2a8170fb3130ec69f7314fb0c8`
 - Goal 04 reviewed checkpoint (the review that approved this goal): `fdb8ecd7be04013cd9ca1f3ed5adebc994a1ca96`
-- Goal 04 implementation commit (the commit this section describes): `c8a871d00e66cd857e2cd5f4148b0df76b7a1438`
-- Stage: **Goal 04 REVIEWED - CHANGES REQUIRED; Goal 04A APPROVED correction goal**
-- Current approved goal: harness/GOAL_04A_REPORT_CONFINEMENT_AND_HISTORY_BOUNDARY.md
+- Goal 04 implementation commit: `c8a871d00e66cd857e2cd5f4148b0df76b7a1438`
+- Goal 04 architecture-review checkpoint that approved Goal 04A: `fb3c3d760468b62468472422eb1c789f6583e8dd`
+- Goal 04A implementation commit: `9c98b2c55de0d2e73deb0b4b23a4b14350a7118a`
+- Stage: **Goal 04A COMPLETED / NOT YET APPROVED - ARCHITECTURE REVIEW REQUIRED**
+- Current execution state: Goal 04A is complete and awaits architecture review; no later goal is approved for execution
 - Goal 03: accepted analytics core; its correction chain is closed by accepted Goal 03B
 - Goal 03A: COMPLETED / REVIEWED — corrections closed by accepted Goal 03B
 - Goal 03B: COMPLETED / REVIEWED / ACCEPTED
-- Goal 04: **COMPLETED / REVIEWED - CHANGES REQUIRED**
-- Goal 04A: **APPROVED / NOT YET EXECUTED**
+- Goal 04: **COMPLETED / REVIEWED - CHANGES REQUIRED; correction delivered by Goal 04A, awaiting review**
+- Goal 04A: **COMPLETED / NOT YET APPROVED - ARCHITECTURE REVIEW REQUIRED**
 - Goal 05: **PROVISIONAL / DO NOT EXECUTE**
+
+## Goal 04A execution record
+
+Date: 2026-10-01. Branch: `bootstrap/cm-insight-architecture`.
+Implementation commit: `9c98b2c55de0d2e73deb0b4b23a4b14350a7118a`.
+The implementation commit was pushed before this status record was written; at that checkpoint
+local HEAD and `origin/bootstrap/cm-insight-architecture` were the same exact SHA. PR #1 was
+verified **OPEN / DRAFT / UNMERGED** with that head.
+
+Goal 04A closes only the three findings approved by the Goal 04 architecture review. Goal 05 was
+not executed and remains prohibited pending review.
+
+### Report-download confinement: the final open is now the authority
+
+The HTTP layer no longer receives a checked filesystem `Path` and then reopens it. Instead,
+`ReportService.readForDownload(...)` owns the decisive content operation: it opens the final
+component with `READ + NOFOLLOW_LINKS`, enforces `MAX_REPORT_BYTES` against that opened channel
+and again while consuming it, and returns an immutable byte-oriented transport value. Replacing a
+previously described artifact with a symlink therefore cannot redirect the later read outside
+`reports.dir`.
+
+The committed Linux-capable regression is deliberately adversarial. It captures valid metadata,
+replaces the artifact with a symlink to an outside file containing `OUTSIDE_SECRET`, proves the
+**old** plain-following open would read those outside bytes, then proves the production
+`NOFOLLOW_LINKS` download refuses the same swapped leaf. The test uses the platform temporary
+filesystem; on non-Windows systems inability to create the symlink is a failure rather than a skip.
+The frozen WSL/Linux validation passed this regression, so the primitive was actually exercised.
+A separate test proves the HTTP-facing download transport carries bytes but no filesystem `Path`.
+The same service-owned read also proves the opened-handle size bound on an oversized artifact.
+
+### History exemption: structurally local H2 only
+
+The existing named `history/` exemption remains valid for its local transactional store, but it is
+no longer an open repository-JDBC escape hatch. Both the shell source guard and its Java twin now
+require the fixed local H2 identities (`org.h2.Driver`, `jdbc:h2:file:`) and refuse repository
+connection dependencies from that tree, including `DriverManager`, the
+`com.mraibo.cminsight.db` path, repository profile/JDBC credential paths, DB2/Oracle JDBC URLs and
+DB2/Oracle driver identities.
+
+Mutation controls plant a repository DB dependency/DB2 URL and a `DriverManager`/Oracle path
+**inside the exempt history tree**; both are refused. The Java twin independently plants the same
+class of repository dependency and refuses it. The ordinary analytics write/read-only guard remains
+unchanged outside this narrow boundary. The shell implementation was also reduced to one combined
+ERE/pass per source file, taking **4.69 s** on this mounted filesystem instead of spawning thousands
+of per-line grep processes.
+
+### Shell-runner timeout contract
+
+The accepted execution defaults remain **900 s per file / 1800 s total**. `--help` now renders
+those same variables instead of stale duplicated 300/600 values, and
+`ScriptPermissionTest.theShellRunnerHelpCannotDriftFromItsTimeoutDefaults` binds help text to the
+actual defaults. The shell README now labels the old three-test timing table as historical rather
+than presenting it as the current expanded suite.
+
+### Validation on the frozen Goal 04A tree
+
+The validated source/test tree is exactly the tree committed as `9c98b2c`; no production or test
+file was changed after the frozen runs.
+
+- `./build.sh`: **exit 0**, core **428/0**, IBM signature-stub suite **51/0**, package built.
+- `./tests/selftest.sh`: **exit 0**; it repeated the required build/test/package path.
+- `./tests/shell/run.sh`: **exit 0**, **5 passed / 0 failed / 0 not run in 114 s**; lifecycle
+  regression remained **137 assertions / 10 cycles**.
+- `./bin/doctor.sh`: **exit 0**, **0 failures / 17 warnings**.
+- `./build.sh --check-ibm-isolation`: **exit 0**.
+- `bash tests/shell/analytics_guard.sh`: **exit 0**, 51 analytics Java files and 14 history Java
+  files scanned; Goal 03 read-only and Goal 04A local-history boundaries both hold.
+- `bash tests/shell/analytics_source_guard_test.sh`: **exit 0**, **95 checks / 0 failures**,
+  including the two new history-boundary mutation plants.
+- The complete serial chain above ended with `GOAL04A_FULL_VALIDATION=PASS`, **exit 0**
+  (273.69 s). A separate frozen `./build.sh` also passed **428/0 + 51/0**.
+
+No proprietary or local database JAR is tracked, and `lib/{ibm,db2,oracle,app}` was empty at the
+checkpoint. Therefore Goal 04A did **not** repeat a real IBM SDK or real H2 run; the applicable
+real-SDK and real-H2 evidence remains the earlier Goal 04 evidence, while this correction was
+validated against the clean no-jar/stub path. **No live IBM CM, DB2 or Oracle server validation is
+claimed.**
+
+### Exact-SHA GitHub evidence for the implementation checkpoint
+
+| Commit | push run | pull_request run |
+| --- | --- | --- |
+| `9c98b2c55de0d2e73deb0b4b23a4b14350a7118a` | `36930345343` **success** | `36930352593` **success** |
+
+Both workflow runs were read from the GitHub API and report that exact `head_sha`. At the same
+checkpoint local HEAD and remote HEAD were exactly `9c98b2c55de0d2e73deb0b4b23a4b14350a7118a`,
+and PR #1 was **open, draft, unmerged** with the same head.
+
+This status update necessarily creates a later documentation-only commit whose own SHA and Actions
+cannot truthfully be embedded inside itself. The implementation checkpoint above is the frozen code
+revision the validation binds to. The handoff must externally verify the final documentation HEAD,
+its exact-SHA push and pull_request runs, and that
+`git diff --name-only 9c98b2c HEAD -- src tests` is empty. Do not create a recursive sequence of
+documentation commits merely to make a file contain its own future SHA.
+
+**Goal 04A is complete but not architecture-approved. Stop here. Goal 05 remains
+PROVISIONAL / DO NOT EXECUTE.**
 
 ## Goal 04 external architecture review
 
