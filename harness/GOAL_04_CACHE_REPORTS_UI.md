@@ -1,6 +1,6 @@
 # Goal 04 - Persistent history, reports, targeted refresh and complete operator Web UI
 
-**Status: COMPLETED / PENDING ARCHITECTURE REVIEW.** Executed against reviewed checkpoint
+**Status: COMPLETED / REVIEWED - CHANGES REQUIRED.** Goal 04A is approved; Goal 05 remains blocked. Executed against reviewed checkpoint
 `fdb8ecd7be04013cd9ca1f3ed5adebc994a1ca96`; implementation commit
 `c8a871d00e66cd857e2cd5f4148b0df76b7a1438`, green on both GitHub Actions events for that SHA.
 See the Goal 04 execution record at the top of `STATUS.md` for the full evidence, the honest

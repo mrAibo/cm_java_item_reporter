@@ -28,13 +28,79 @@
 - Goal 03B final execution/handoff HEAD: `edab82f25e69af2a8170fb3130ec69f7314fb0c8`
 - Goal 04 reviewed checkpoint (the review that approved this goal): `fdb8ecd7be04013cd9ca1f3ed5adebc994a1ca96`
 - Goal 04 implementation commit (the commit this section describes): `c8a871d00e66cd857e2cd5f4148b0df76b7a1438`
-- Stage: **Goal 04 EXECUTED, PUSHED and GREEN on both Actions events; awaiting architecture review**
-- Current approved goal: `harness/GOAL_04_CACHE_REPORTS_UI.md` (executed)
+- Stage: **Goal 04 REVIEWED - CHANGES REQUIRED; Goal 04A APPROVED correction goal**
+- Current approved goal: harness/GOAL_04A_REPORT_CONFINEMENT_AND_HISTORY_BOUNDARY.md
 - Goal 03: accepted analytics core; its correction chain is closed by accepted Goal 03B
 - Goal 03A: COMPLETED / REVIEWED — corrections closed by accepted Goal 03B
 - Goal 03B: COMPLETED / REVIEWED / ACCEPTED
-- Goal 04: **COMPLETED / PENDING ARCHITECTURE REVIEW**
+- Goal 04: **COMPLETED / REVIEWED - CHANGES REQUIRED**
+- Goal 04A: **APPROVED / NOT YET EXECUTED**
 - Goal 05: **PROVISIONAL / DO NOT EXECUTE**
+
+## Goal 04 external architecture review
+
+Reviewed delivered HEAD: `e8d5a298dc0b7021c1e93f2eef898a541648781e`.
+Verified code revision: `c8a871d00e66cd857e2cd5f4148b0df76b7a1438`; no `src/` or `tests/`
+file differs between that revision and the delivered HEAD. Exact-SHA Actions for the delivered
+HEAD are push `36796158752` success and pull_request `36796162618` success. PR #1 remains
+open, draft and unmerged.
+
+### Review verdict
+
+**Goal 04 is substantively sound, but one report-download security blocker and one structural
+history-boundary gap must be closed before Goal 05.** The shared analytics gate, history
+publication model, freshness semantics, targeted-refresh isolation, report renderers, authenticated
+API surface and offline operator UI are accepted subject to the narrow Goal 04A correction.
+
+### BLOCKER 1 - report download retains a check/use symlink race
+
+`ReportService.find()` checks the named artifact with `NOFOLLOW_LINKS` and `toRealPath()`, then
+returns a `GeneratedReport` carrying an ordinary `Path`. `ReportApiRoutes.download()` later
+performs `Files.readAllBytes(path)`, which follows links at that later open.
+
+The review reproduced this on Linux with a deterministic probe: create a valid report file, call
+`find()`, replace that file with a symlink to a file outside `reports.dir`, then read the returned
+path. The bytes read were exactly `OUTSIDE_SECRET`. Therefore the current documentation claim that
+the real-path check closes the window is incorrect.
+Goal 04A must move the content open/read operation behind the confinement authority and open the
+final component with `NOFOLLOW_LINKS`, reading from that same already-open handle with the size bound
+enforced there. A second lexical/real-path check immediately before a normal following open is not a fix.
+
+### REQUIRED HARDENING 2 - the history exemption needs an explicit local-only boundary
+
+The named `history/` exemption is architecturally accepted: a local H2 read model must legitimately
+issue CREATE/INSERT/DELETE/commit and hold JDBC handles. Current production source builds the H2 URL
+from `data.dir`, asks the discovered H2 `Driver` directly and does not use `DriverManager`, the
+analytics pool or repository JDBC credentials.
+
+What is not yet structural is the negative half of that claim. Because `history/` is exempt from the
+analytics write guard, a future edit could import the repository JDBC path and still sit inside the
+exempt tree. Goal 04A must add a committed source-boundary guard that refuses repository DB
+driver/session/pool/credential dependencies and DB2/Oracle JDBC identities from `history/`, while
+allowing the fixed local H2 path. Planted controls are required.
+
+### SMALL CONTRACT DEFECT - shell-runner help is stale
+
+The runner actually defaults to 900 seconds per file and 1800 seconds total, which this review accepts.
+Its `--help` block still says 300/600. Goal 04A must make help and execution agree and prevent drift.
+
+### Accepted observations / non-blocking limits
+
+The review accepts the documented split that the shell analytics guard and Java twin do not enforce
+identical rule sets, provided the documentation remains precise. The stale-read verification is
+service-level rather than HTTP/pool-borrow-level evidence; it does not contradict the implementation.
+No live IBM CM, DB2 or Oracle validation is claimed. The history API accepting a shape-valid historical
+repository id is not a Goal 04 blocker because history is deliberately process-wide stored data for
+authenticated operators, but its wording should not claim configuration validation it does not perform.
+
+### Goal state after review
+
+- Goals 01-03B: accepted.
+- Goal 04: completed/reviewed; changes required.
+- Goal 04A: **APPROVED correction goal**:
+  `harness/GOAL_04A_REPORT_CONFINEMENT_AND_HISTORY_BOUNDARY.md`.
+- Goal 05: **PROVISIONAL / DO NOT EXECUTE**.
+- PR #1: keep open, draft and unmerged.
 
 ## Goal 04 execution record
 
