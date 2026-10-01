@@ -336,20 +336,26 @@ text - so the earlier "no third-party consumer has opened it" gap is closed.
 | `c8a871d` (implementation - the revision the verification binds to) | `36791517987` **success** | `36791523587` **success** |
 | `212656c` (STATUS + architecture/security/data-model/requirements docs) | `36793280634` **success** | `36793284554` **success** |
 | `5a8cef4` (the verification verdict, its coverage limits, and this table) | `36794116088` **success** | `36794120766` **success** |
-| `f52bd55` (final delivered head) | `36794785912` **success** | `36794791201` **success** |
+| `f52bd55` | `36794785912` **success** | `36794791201` **success** |
+| `3061105` (documentation only) | `36795528827` **success** | `36795535656` **success** |
 
 Every run was verified **for the same exact SHA** in its row, by reading the workflow runs for
-that `head_sha` from the GitHub API rather than by trusting the branch's latest status. This
-table was written twice, because recording a run id necessarily produces a commit whose own
-run id does not exist yet; the last row is the delivered head.
+that `head_sha` from the GitHub API rather than by trusting the branch's latest status.
 
-**The relationship between the verified revision and the delivered head:**
-`git merge-base --is-ancestor c8a871d HEAD` exits **0**, and
-`git diff --name-only c8a871d HEAD -- src tests` lists **0 files** - every commit in between is
-`STATUS.md`, `ARCHITECTURE.md`, `DATA_MODEL.md`, `SECURITY.md`, `REQUIREMENTS.md` and the two
-harness files. The verification therefore applies to the delivered code **exactly**; what
-changed after it is the record of the verification itself, which is the only place such a
-verdict can honestly live.
+**A note on the head, because this table is inherently self-referential.** Recording a commit's
+own run id produces a commit whose run id does not exist yet, so the last row always describes a
+commit that is no longer the head. Rather than chase that indefinitely, the authoritative head is
+read from Git and the relationship that matters is stated once:
+
+- the delivered head is whatever `git rev-parse origin/bootstrap/cm-insight-architecture` returns;
+- **`git merge-base --is-ancestor c8a871d HEAD` exits 0**, and
+- **`git diff --name-only c8a871d HEAD -- src tests` lists 0 files**, because every commit after
+  `c8a871d` is `STATUS.md`, `ARCHITECTURE.md`, `DATA_MODEL.md`, `SECURITY.md`,
+  `REQUIREMENTS.md` or one of the two harness files.
+
+So the verification applies to the delivered code **exactly**, and the only thing that changed
+after it is the record of the verification itself. Any later documentation-only commit inherits
+this same relationship, and a documentation-only commit cannot change compiled behaviour.
 
 **PR #1 is OPEN, draft and unmerged.**
 
