@@ -1,0 +1,25 @@
+# ItemType classification rules.
+#
+# Rules are declared as  classification.<name>.label  plus  classification.<name>.regex.
+# They may live here (referenced by classifications.file) or inline in application.properties;
+# inline keys win when both are present.
+#
+# Matching semantics: a rule matches when its regex matches the ENTIRE ItemType name
+# (java.util.regex.Matcher.matches()), so a rule that should match anywhere must wrap the
+# pattern in .* ... .*   Rules are evaluated in alphabetical order of <name>, and the reserved
+# rule named "default" supplies the fallback label and is always evaluated last.
+#
+# Backslash warning: a single backslash is an escape character in .properties files. Write a
+# regex backslash doubled, for example  \\d+  or  [A-Za-z_]+_[0-9]{4} , or the value reaching the
+# matcher will not be the pattern you wrote.
+#
+# An invalid regex is a startup error that names the offending rule, so a typo cannot silently
+# misclassify every ItemType.
+
+classification.sap.label=SAP
+classification.sap.regex=.*(_PRI_|_DOC_|_DAT_|_PK_).*
+
+# The fallback label used when no rule matches. Omit it and unmatched ItemTypes are reported as
+# "Unclassified" instead.
+classification.default.label=Other
+classification.default.regex=.*

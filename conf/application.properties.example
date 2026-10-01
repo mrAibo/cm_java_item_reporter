@@ -1,0 +1,179 @@
+# CM Insight configuration example.
+#
+# Copy it next to the application and edit:
+#     cp conf/application.properties.example conf/application.properties
+#
+# Secrets are never stored inline by default. A secret-valued key can be given in
+# three forms, and the suffix selects the source:
+#     <key>.env=NAME    value read from environment variable NAME   (recommended)
+#     <key>.file=PATH   value read from PATH, interpreted relative to secrets.dir
+#                       when it is not absolute (keep that file mode 0600)
+#     <key>=value       inline value in this file (DISCOURAGED: it ends up in a
+#                       readable file, in backups, in process listings and in shell
+#                       history; use one of the two forms above instead)
+# This example deliberately contains no password value.
+#
+# With web.bind on loopback and no password configured, the application starts
+# with the built-in admin/admin fallback and prints a warning. On a non-loopback
+# bind it refuses to start (fail closed) until a real password is configured AND
+# web.allowInsecureHttp=true has been set deliberately.
+
+app.name=CM Insight
+
+# Optional, reported by GET /api/info (defaults shown; safe to delete).
+app.version=0.1.0-SNAPSHOT
+app.mode=bootstrap-read-only
+
+web.bind=127.0.0.1
+web.port=8080
+web.threads=8
+
+# --- Remote exposure ----------------------------------------------------------
+# Do NOT enable this just to reach the console from another machine. HTTP Basic
+# sends reusable credentials in cleartext, so a non-loopback bind over plain HTTP
+# is refused by default; web.allowInsecureHttp=true is an explicitly accepted
+# insecure test/development exposure that prints a SECURITY WARNING at startup.
+# For production remote access, keep web.bind=127.0.0.1 and terminate HTTPS in a
+# reverse proxy or an equivalent secure tunnel in front of the application (this
+# build has no TLS listener). Development credentials stay refused beyond loopback
+# either way: admin/admin, a password set to admin, and a blank web.auth.password
+# or web.auth.user (a blank value is treated as unset and silently falls back to
+# the published development default). Default shown; safe to delete.
+# web.allowInsecureHttp=false
+
+# Optional hardening for the built-in basic-auth throttle (defaults shown).
+# web.backlog is the listen backlog, 0..4096 (0 = JDK default).
+# web.auth.lockout accepts a bare number of milliseconds or an ms/s/m/h/d suffix.
+web.backlog=0
+web.auth.maxFailures=5
+web.auth.lockout=5m
+web.auth.maxTrackedKeys=4096
+
+# --- Web credentials ----------------------------------------------------------
+# With NONE of the web.auth.user*/web.auth.password* keys present, the application
+# starts with the built-in admin/admin development credentials on a loopback bind
+# and prints a warning; on a non-loopback bind it refuses to start until a real
+# password is configured (and web.allowInsecureHttp=true is set deliberately).
+#
+# A BLANK value is not a configured value: web.auth.password= (or a blank
+# web.auth.user=) is treated as unset and silently falls back to the published
+# development default. That credential is refused on a non-loopback bind even
+# with web.allowInsecureHttp=true, so fill in both fields for a remote bind.
+#
+# If you DO configure a source, that source must resolve. The application fails
+# closed rather than silently falling back to admin/admin, so only uncomment the
+# line below once CM_INSIGHT_WEB_PASSWORD is actually exported in the environment
+# that starts the JVM.
+web.auth.user=admin
+# web.auth.password.env=CM_INSIGHT_WEB_PASSWORD
+# web.auth.password.file=web.password
+# web.auth.password=<inline value>   (discouraged: it ends up in backups and shell history)
+
+feature.dashboard=true
+feature.itemtypes=true
+feature.statistics=true
+feature.retention.viewer=true
+feature.history=true
+feature.reports=true
+feature.system.diagnostics=true
+feature.item.lookup=false
+feature.retention.admin=false
+
+# --- IBM CM adapter: session pool and metadata cache --------------------------
+# Read by CmAdapterSettings.from(...), the single reader of these keys. Each value
+# is range-checked and an out-of-range one is a CONFIGURATION ERROR naming the key
+# (process exit 3) - never a silently clamped number. The same reader is used by
+# --print-config, --check-repository and bin/doctor.sh, so they cannot disagree.
+#
+# cm.pool.size                 default 4,    1..64        hard bound of the per-repository CM session pool
+# cm.pool.borrow.timeout.ms    default 5000, 1..600000    how long a borrow waits before it times out
+# cm.pool.max.age.minutes      default 30,   1..1440      retire a session returned after this age
+# cm.pool.max.operations       default 1000, 1..1000000   retire a session after this many uses
+# cache.metadata.ttl.seconds   default 600,  0..86400     metadata snapshot freshness; 0 disables caching
+#
+# The bound is hard: every capacity slot is accounted for as idle, leased, creating,
+# retiring or quarantined, there is no emergency/overflow connection path, and a
+# resource whose close() outcome is unproven stays quarantined rather than freeing
+# capacity. Values are shown at their defaults; safe to delete.
+cm.pool.size=4
+cm.pool.borrow.timeout.ms=5000
+cm.pool.max.age.minutes=30
+cm.pool.max.operations=1000
+cache.metadata.ttl.seconds=600
+
+# --- Repository activation ---------------------------------------------------
+# repository.auto.activate=<id> activates one configured repository at startup.
+# Absent by default (nothing is activated; repository profiles are still listed).
+#
+# It FAILS CLOSED, and this is the point of the key:
+#   * it names a repository that is not in conf/profiles/  -> configuration error, exit 3
+#   * it is set while NO usable CM adapter is available    -> startup refuses, exit 4
+#     (adapter ABSENT, AMBIGUOUS or UNAVAILABLE - the adapter JARs are not on the
+#      class path, or more than one provider is registered)
+# An empty placeholder context is never published: a console that reports a working
+# repository nobody can read is worse than a refused start. Install the IBM SDK JARs
+# in lib/ibm/ (see lib/README.md) before enabling this key.
+# repository.auto.activate=
+
+# --- Fast analytics: the bounded JDBC pool and the scan (Goal 03) -------------
+# Read by JdbcPoolSettings.from(...) and StatisticsSettings.from(...), the single
+# readers of these keys. Every value is range-checked and an out-of-range one is a
+# CONFIGURATION ERROR naming the key and the range (process exit 3) - never a
+# silently clamped number. --print-config, --validate-config (bin/doctor.sh) and the
+# serving path all use these same readers, so they cannot disagree.
+#
+# jdbc.pool.size                     default 4,    1..64        hard bound on live JDBC connections
+# jdbc.pool.borrow.timeout.ms        default 5000, 1..600000    how long a borrow waits before it fails
+# jdbc.pool.max.age.minutes          default 30,   1..1440      rotate a connection older than this
+# jdbc.pool.max.operations           default 1000, 1..1000000   rotate a connection after this many uses
+# statistics.workers                 default min(4, jdbc.pool.size), 1..64
+# statistics.query.timeout.seconds   default 60,   1..3600      per-statement query timeout
+# statistics.scan.timeout.seconds    default 1800, 1..86400     overall deadline for one scan
+# cache.statistics.ttl.seconds       default 300,  0..86400     freshness judgement only; stale
+#                                                               completed snapshots remain visible
+#
+# statistics.workers is REFUSED, never clamped, when it exceeds jdbc.pool.size: every
+# concurrent query holds one JDBC connection for its whole duration, so a larger
+# worker count could not be delivered and the requested parallelism must not be
+# reported as if it existed. Leave it out to get min(4, jdbc.pool.size).
+#
+# The JDBC pool is lazily created: nothing here causes a connection at startup, and
+# feature.statistics=false, a missing driver, a missing JDBC credential, an unusable
+# schema or an unreachable database never deactivates a repository - the metadata and
+# retention halves keep working and the analytics routes report why. A loadable driver
+# is NOT evidence of a reachable database (see lib/README.md).
+jdbc.pool.size=4
+jdbc.pool.borrow.timeout.ms=5000
+jdbc.pool.max.age.minutes=30
+jdbc.pool.max.operations=1000
+statistics.workers=4
+statistics.query.timeout.seconds=60
+statistics.scan.timeout.seconds=1800
+cache.statistics.ttl.seconds=300
+
+# --- Local history and report output (Goal 04) --------------------------------
+# Persistent history is application-local and OPTIONAL. feature.history is declared
+# with the other feature switches above. When it is enabled, an H2 JDBC driver may be
+# supplied locally in lib/app; no H2 class is a compile-time dependency. A missing
+# driver makes history unavailable without affecting repository activation or live
+# statistics.
+#
+# history.max.snapshots.per.repository  default 1000, 1..100000
+history.max.snapshots.per.repository=1000
+
+# Paths: use forward slashes (conf/profiles) or doubled backslashes (conf\\profiles).
+# A single backslash is an escape character in .properties files, so conf\profiles
+# silently becomes confprofiles and the application then fails on an unreadable path.
+# profiles.dir, classifications.file and secrets.dir are read and resolved by the
+# application. Goal 04 also consumes data.dir for local history and reports.dir for
+# generated report artifacts. logs.dir remains reserved for a later Java logging owner.
+profiles.dir=conf/profiles
+classifications.file=conf/classifications.properties
+data.dir=data
+reports.dir=reports
+logs.dir=logs
+secrets.dir=conf/secrets
+
+# web.port=0 binds a random free port; the application is then reachable only at the
+# port printed in its startup banner, and bin/start.sh / bin/status.sh skip the HTTP
+# health check (they cannot derive the URL) and verify the process instead.

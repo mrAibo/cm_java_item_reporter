@@ -1,0 +1,10 @@
+repository.id=example-oracle
+repository.name=Example Oracle Repository
+repository.ssid=LSDB
+repository.db.vendor=ORACLE
+repository.cm.user.env=CM_EXAMPLE_ORACLE_USER
+repository.cm.password.env=CM_EXAMPLE_ORACLE_PASSWORD
+repository.jdbc.url=jdbc:oracle:thin:@//dbhost.example:1521/LSDB
+repository.jdbc.user.env=CM_EXAMPLE_ORACLE_JDBC_USER
+repository.jdbc.password.env=CM_EXAMPLE_ORACLE_JDBC_PASSWORD
+repository.jdbc.schema=ICMADMIN

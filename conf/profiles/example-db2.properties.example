@@ -1,0 +1,10 @@
+repository.id=example-db2
+repository.name=Example DB2 Repository
+repository.ssid=LSDB
+repository.db.vendor=DB2
+repository.cm.user.env=CM_EXAMPLE_DB2_USER
+repository.cm.password.env=CM_EXAMPLE_DB2_PASSWORD
+repository.jdbc.url=jdbc:db2://dbhost.example:50000/LSDB
+repository.jdbc.user.env=CM_EXAMPLE_DB2_JDBC_USER
+repository.jdbc.password.env=CM_EXAMPLE_DB2_JDBC_PASSWORD
+repository.jdbc.schema=ICMADMIN

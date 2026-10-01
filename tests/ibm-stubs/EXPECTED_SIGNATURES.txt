@@ -1,0 +1,379 @@
+# CM Insight - pinned public signature expectation for the test-only IBM CM 8.7 compile stubs.
+#
+# WHAT THIS IS
+#   The concatenated `javap -public -constants` output of every class produced from tests/ibm-stubs,
+#   in ordinal (LC_ALL=C) order of the fully qualified class name. It is the contract that keeps the
+#   stubs an honest mirror of the real proprietary surface: a stub member that is renamed, widened or
+#   silently dropped changes this file and fails the build instead of letting src/ibm/java compile
+#   against an API that does not exist.
+#
+# AUTHORITY ORDER
+#   1. a real cmbicmsdk81.jar compile (lib/ibm/*.jar present) is authoritative over every stub here;
+#   2. this file pins what the stubs currently claim;
+#   3. harness/GOAL_02_IMPLEMENTATION_SPEC.md section 1 and IBM_CM87_SDK_API_SURFACE.md are the source
+#      the signatures were copied from (real javap output against cmbicmsdk81.jar).
+#
+# HOW TO REGENERATE (canonical, do not hand-edit)
+#   tests/ibm-stubs/check-signatures.sh --write
+# which is exactly:
+#   javac --release 17 -encoding UTF-8 -Xlint:all -d <scratch>/stub-classes $(find tests/ibm-stubs -name '*.java')
+#   for each FQCN in LC_ALL=C sort order:  javap -public -constants -cp <scratch>/stub-classes <FQCN>
+#
+# HOW IT IS CHECKED
+#   Every line starting with '#' (this header) is ignored, CRLF is normalised to LF, and the rest must
+#   match the freshly generated output byte for byte.
+#
+# DELIBERATE PROPERTIES ENCODED BELOW (see tests/ibm-stubs/README.md)
+#   * no close() member anywhere - the real SDK has none; teardown is disconnect() then destroy();
+#   * no mutating member (commit/rollback/startTransaction/add/del/update/set*/clearCache) on any
+#     stub, so a write call in src/ibm/java fails to compile rather than merely failing a regex guard;
+#   * datastoreDef() returns dkDatastoreDef and datastoreAdmin() returns dkDatastoreAdmin - neither is
+#     narrowed, so both casts in the adapter are structurally required;
+#   * DKDatastoreICM.isConnected() declares no throws while dkDatastore.isConnected() declares
+#     throws java.lang.Exception;
+#   * the retention enums are nested enums (DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE,
+#     $DK_ICM_POLICY_TIME_UNIT, $DK_ICM_EXPIRATION_ACTION_TYPE), never int constants;
+#   * the enum-constant -> CM numeric-code mapping is NOT recoverable from the class files: no numeric
+#     value is pinned anywhere, and the adapter must render anything it cannot map as UNKNOWN(<value>).
+Compiled from "DKComponentTypeDefICM.java"
+public class com.ibm.mm.sdk.common.DKComponentTypeDefICM extends com.ibm.mm.sdk.common.dkAbstractEntityDef implements java.io.Serializable {
+  public com.ibm.mm.sdk.common.DKComponentTypeDefICM();
+  public com.ibm.mm.sdk.common.DKComponentTypeDefICM(com.ibm.mm.sdk.common.dkDatastore);
+  public com.ibm.mm.sdk.common.DKComponentTypeDefICM(com.ibm.mm.sdk.common.DKComponentTypeDefICM);
+  public short getId();
+  public int getIntId();
+}
+Compiled from "DKConstant.java"
+public interface com.ibm.mm.sdk.common.DKConstant {
+  public static final short DK_BASE = 128;
+  public static final int DK_CM_TRUE = 1;
+}
+Compiled from "DKConstantICM.java"
+public interface com.ibm.mm.sdk.common.DKConstantICM extends com.ibm.mm.sdk.common.DKConstant {
+  public static final java.lang.String DK_ICM_ENTITY_TYPE = "ENTITY_TYPE";
+  public static final int DK_ICM_BASE = 1;
+  public static final int DK_ICM_BASE_AND_VIEW = 3;
+  public static final short DK_ICM_ITEMTYPE = 1;
+  public static final short DK_ICM_ITEMTYPEVIEW = 2;
+  public static final java.lang.String DK_ICM_RELEASE_VERSION = "8.7.0.000";
+  public static final java.lang.String DK_ICM_API_VERSION = "0807000000";
+  public static final java.lang.String DK_ICM_SYSTEM_HIERARCHICAL_ITEMTYPE_NAME = "ICM$FOLDER";
+  public static final int DK_ICM_SYSTEM_HIERARCHICAL_ITEMTYPE_ID = 410;
+  public static final short DK_ICM_ITEMTYPE_CLASS_ITEM = 0;
+  public static final short DK_ICM_ITEMTYPE_CLASS_RESOURCE_ITEM = 1;
+  public static final short DK_ICM_ITEMTYPE_CLASS_DOC_MODEL = 2;
+  public static final short DK_ICM_ITEMTYPE_CLASS_DOC_PART = 3;
+  public static final int DK_ICM_VERSION_CONTROL_NEVER = 0;
+  public static final int DK_ICM_VERSION_CONTROL_ALWAYS = 1;
+  public static final int DK_ICM_VERSION_CONTROL_BY_APPLICATION = 2;
+  public static final short DK_ICM_DOC_NO_VERSIONING = 0;
+  public static final short DK_ICM_ITEM_VERSIONING_OPTIMIZED = 1;
+  public static final short DK_ICM_ITEM_VERSIONING_FULL = 2;
+}
+Compiled from "DKDatastoreAccessError.java"
+public class com.ibm.mm.sdk.common.DKDatastoreAccessError extends com.ibm.mm.sdk.common.DKException implements java.io.Serializable {
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError();
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String);
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String, int, int);
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String, int, java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String, int, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKDatastoreAccessError(java.lang.String, int, java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public java.lang.String name();
+  public short exceptionId();
+}
+Compiled from "DKDatastoreAdminICM.java"
+public class com.ibm.mm.sdk.common.DKDatastoreAdminICM extends com.ibm.mm.sdk.common.dkAbstractDatastoreAdmin {
+  public com.ibm.mm.sdk.common.DKDatastoreAdminICM(com.ibm.mm.sdk.common.dkDatastore);
+  public com.ibm.mm.sdk.common.DKPolicyMgmtICM policyMgmt() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+}
+Compiled from "DKDatastoreDefICM.java"
+public class com.ibm.mm.sdk.common.DKDatastoreDefICM extends com.ibm.mm.sdk.common.dkAbstractDatastoreDef implements java.io.Serializable {
+  public static final int DK_ICM_USER_ITEM_TYPES = 1;
+  public static final int DK_ICM_ALL_ITEM_TYPES = 2;
+  public static final int DK_ICM_SYSTEM_ITEM_TYPES = 3;
+  public static final int DK_ICM_PARTS_ITEM_TYPES = 4;
+  public com.ibm.mm.sdk.common.DKDatastoreDefICM(com.ibm.mm.sdk.common.dkDatastore);
+  public com.ibm.mm.sdk.common.dkDatastoreAdmin datastoreAdmin() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkEntityDef retrieveEntity(java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkEntityDef retrieveEntity(int) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkCollection listEntities() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkCollection listEntities(int) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public java.lang.String[] listEntityNames() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public java.lang.String[] listEntityNames(int) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public int getEntityIdByName(java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public java.lang.String getEntityNameById(int) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+}
+Compiled from "DKException.java"
+public class com.ibm.mm.sdk.common.DKException extends com.ibm.mm.sdk.logtool.DKLogException implements com.ibm.mm.sdk.common.DKConstant,java.io.Serializable {
+  public com.ibm.mm.sdk.common.DKException();
+  public com.ibm.mm.sdk.common.DKException(java.lang.String);
+  public com.ibm.mm.sdk.common.DKException(java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKException(java.lang.String, int, int);
+  public com.ibm.mm.sdk.common.DKException(java.lang.String, int, java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKException(com.ibm.mm.sdk.common.DKException);
+  public com.ibm.mm.sdk.common.DKException(java.lang.String, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKException(java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKException(java.lang.String, int, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKException(java.lang.String, int, java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public java.lang.String errorState();
+  public int errorCode();
+  public java.lang.String name();
+  public int getErrorId();
+  public short exceptionId();
+}
+Compiled from "DKItemTypeDefICM.java"
+public class com.ibm.mm.sdk.common.DKItemTypeDefICM extends com.ibm.mm.sdk.common.DKComponentTypeDefICM implements java.io.Serializable {
+  public static final short DK_ICM_RETENTION_UNIT_YEAR = 0;
+  public static final short DK_ICM_ITEM_RETRENTION_NO_EXPIRE = 0;
+  public com.ibm.mm.sdk.common.DKItemTypeDefICM();
+  public com.ibm.mm.sdk.common.DKItemTypeDefICM(com.ibm.mm.sdk.common.dkDatastore);
+  public com.ibm.mm.sdk.common.DKItemTypeDefICM(com.ibm.mm.sdk.common.DKItemTypeDefICM);
+  public short getClassification();
+  public short getDefaultRMCode();
+  public short getDefaultCollCode();
+  public short getDefaultRetentionUnit();
+  public int getDefaultItemRetention();
+  public int getXDOClassID();
+  public java.lang.String getXDOClassName();
+  public java.lang.String getJavaXDOClassName();
+  public short getVersionControl();
+  public short getVersioningType();
+  public int getItemTypeRetentionPolicyId() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public java.lang.String getItemTypeRetentionPolicyName() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+}
+Compiled from "DKMessageId.java"
+public interface com.ibm.mm.sdk.common.DKMessageId {
+}
+Compiled from "DKMessageIdICM.java"
+public interface com.ibm.mm.sdk.common.DKMessageIdICM extends com.ibm.mm.sdk.common.DKMessageId {
+}
+Compiled from "DKNVPair.java"
+public class com.ibm.mm.sdk.common.DKNVPair implements com.ibm.mm.sdk.common.DKMessageId,java.io.Serializable {
+  public com.ibm.mm.sdk.common.DKNVPair(java.lang.String, java.lang.Object);
+  public java.lang.String getName();
+  public java.lang.Object getValue();
+}
+Compiled from "DKNotExistException.java"
+public class com.ibm.mm.sdk.common.DKNotExistException extends com.ibm.mm.sdk.common.DKDatastoreAccessError implements java.io.Serializable {
+  public com.ibm.mm.sdk.common.DKNotExistException();
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String);
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String, int, int);
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String, int, java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String, int, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKNotExistException(java.lang.String, int, java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public java.lang.String name();
+  public short exceptionId();
+}
+Compiled from "DKPolicyMgmtICM.java"
+public class com.ibm.mm.sdk.common.DKPolicyMgmtICM {
+  public com.ibm.mm.sdk.common.DKPolicyMgmtICM(com.ibm.mm.sdk.common.dkDatastore) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkCollection listRetentionPolicies() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public java.lang.String[] listRetentionPolicyNames() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public java.lang.String[] listItemTypeNamesByRetentionPolicy(java.lang.String) throws com.ibm.mm.sdk.common.DKNotExistException, com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkCollection listItemTypesByRetentionPolicy(java.lang.String) throws com.ibm.mm.sdk.common.DKNotExistException, com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM retrieveRetentionPolicy(int) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM retrieveRetentionPolicy(java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+}
+Compiled from "DKProjectionListICM.java"
+public class com.ibm.mm.sdk.common.DKProjectionListICM {
+  public static com.ibm.mm.sdk.common.DKProjectionListICM createInstance(com.ibm.mm.sdk.common.dkDatastoreIntICM) throws com.ibm.mm.sdk.common.DKUsageError, java.lang.Exception;
+  public void addProjection(java.lang.String, java.lang.String[]) throws com.ibm.mm.sdk.common.DKUsageError, java.lang.Exception;
+  public void addProjection(java.lang.String, java.lang.String) throws com.ibm.mm.sdk.common.DKUsageError, java.lang.Exception;
+  public java.lang.String toString();
+}
+Compiled from "DKRetentionPolicyDefICM.java"
+public class com.ibm.mm.sdk.common.DKRetentionPolicyDefICM implements com.ibm.mm.sdk.common.DKMessageIdICM {
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM();
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM(java.lang.String);
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM(com.ibm.mm.sdk.common.DKRetentionPolicyDefICM);
+  public int getID();
+  public java.lang.String getName();
+  public java.lang.String getDescription();
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE getRetentionType();
+  public boolean isRetentionEnabled();
+  public int getRetentionTimePeriod();
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT getDefaultRetentionTimeUnit();
+  public boolean isExpirationEnabled();
+  public int getExpirationTimePeriod();
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT getDefaultExpirationTimeUnit();
+  public com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_EXPIRATION_ACTION_TYPE getExpirationAction();
+  public java.lang.String getDeleteExpiredItemsScheduleInformation();
+  public int getDeleteExpiredItemsCommitCount();
+  public int getDeleteExpiredItemsMaximumRows();
+  public int getDeleteExpiredItemsMaximumDuration();
+  public boolean isDeleteExpiredItemsForceCheckInEnabled();
+}
+Compiled from "DKRetentionPolicyDefICM.java"
+public final class com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_EXPIRATION_ACTION_TYPE extends java.lang.Enum<com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_EXPIRATION_ACTION_TYPE> {
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_EXPIRATION_ACTION_TYPE NO_ACTION;
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_EXPIRATION_ACTION_TYPE AUTO_DELETE;
+  public static com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_EXPIRATION_ACTION_TYPE[] values();
+  public static com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_EXPIRATION_ACTION_TYPE valueOf(java.lang.String);
+}
+Compiled from "DKRetentionPolicyDefICM.java"
+public final class com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT extends java.lang.Enum<com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT> {
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT DAY;
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT WEEK;
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT MONTH;
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT YEAR;
+  public static com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT[] values();
+  public static com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_POLICY_TIME_UNIT valueOf(java.lang.String);
+}
+Compiled from "DKRetentionPolicyDefICM.java"
+public final class com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE extends java.lang.Enum<com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE> {
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE FIXED_TIME;
+  public static final com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE EVENT_DRIVEN;
+  public static com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE[] values();
+  public static com.ibm.mm.sdk.common.DKRetentionPolicyDefICM$DK_ICM_RETENTION_TYPE valueOf(java.lang.String);
+}
+Compiled from "DKRetrieveOptionsICM.java"
+public class com.ibm.mm.sdk.common.DKRetrieveOptionsICM {
+  public static com.ibm.mm.sdk.common.DKRetrieveOptionsICM createInstance(com.ibm.mm.sdk.common.dkDatastoreIntICM) throws com.ibm.mm.sdk.common.DKUsageError, java.lang.Exception;
+  public com.ibm.mm.sdk.common.DKNVPair[] dkNVPair();
+  public void attributeFilters(com.ibm.mm.sdk.common.DKProjectionListICM);
+  public com.ibm.mm.sdk.common.DKProjectionListICM attributeFilters();
+  public void baseAttributes(boolean);
+  public boolean baseAttributes();
+  public void behaviorIgnoreNoneFoundError(boolean);
+  public boolean behaviorIgnoreNoneFoundError();
+  public java.lang.String toString();
+}
+Compiled from "DKSystemError.java"
+public class com.ibm.mm.sdk.common.DKSystemError extends com.ibm.mm.sdk.common.DKException implements java.io.Serializable {
+  public com.ibm.mm.sdk.common.DKSystemError();
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String);
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String, int, int);
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String, int, java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String, int, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKSystemError(java.lang.String, int, java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public java.lang.String name();
+  public short exceptionId();
+}
+Compiled from "DKUsageError.java"
+public class com.ibm.mm.sdk.common.DKUsageError extends com.ibm.mm.sdk.common.DKException implements java.io.Serializable {
+  public com.ibm.mm.sdk.common.DKUsageError();
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String);
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String, int, int);
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String, int, java.lang.String, int);
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String, int, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.common.DKUsageError(java.lang.String, int, java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public java.lang.String name();
+  public short exceptionId();
+}
+Compiled from "dkAbstractDatastoreAdmin.java"
+public class com.ibm.mm.sdk.common.dkAbstractDatastoreAdmin implements com.ibm.mm.sdk.common.dkDatastoreAdmin,com.ibm.mm.sdk.common.DKMessageId,com.ibm.mm.sdk.common.DKConstant,java.io.Serializable {
+  public com.ibm.mm.sdk.common.dkAbstractDatastoreAdmin();
+  public com.ibm.mm.sdk.common.dkAbstractDatastoreAdmin(com.ibm.mm.sdk.common.dkDatastore);
+}
+Compiled from "dkAbstractDatastoreDef.java"
+public abstract class com.ibm.mm.sdk.common.dkAbstractDatastoreDef implements com.ibm.mm.sdk.common.dkDatastoreDef,com.ibm.mm.sdk.common.DKMessageId,java.io.Serializable {
+  public com.ibm.mm.sdk.common.dkAbstractDatastoreDef();
+  public com.ibm.mm.sdk.common.dkAbstractDatastoreDef(com.ibm.mm.sdk.common.dkDatastore);
+}
+Compiled from "dkAbstractEntityDef.java"
+public class com.ibm.mm.sdk.common.dkAbstractEntityDef implements com.ibm.mm.sdk.common.dkEntityDef,com.ibm.mm.sdk.common.DKMessageId,java.io.Serializable {
+  public com.ibm.mm.sdk.common.dkAbstractEntityDef();
+  public com.ibm.mm.sdk.common.dkAbstractEntityDef(com.ibm.mm.sdk.common.dkDatastore);
+  public java.lang.String getName();
+  public java.lang.String getDescription();
+  public short getId();
+  public short getType();
+}
+Compiled from "dkCollection.java"
+public interface com.ibm.mm.sdk.common.dkCollection {
+  public abstract int cardinality();
+  public abstract com.ibm.mm.sdk.common.dkIterator createIterator();
+  public abstract java.lang.Object retrieveElementAt(com.ibm.mm.sdk.common.dkIterator) throws com.ibm.mm.sdk.common.DKUsageError;
+}
+Compiled from "dkDatastore.java"
+public interface com.ibm.mm.sdk.common.dkDatastore {
+  public abstract void connect(java.lang.String, java.lang.String, java.lang.String, java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract void disconnect() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract void destroy() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract boolean isConnected() throws java.lang.Exception;
+  public abstract com.ibm.mm.sdk.common.dkDatastoreDef datastoreDef() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract short validateConnection() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+}
+Compiled from "dkDatastoreAdmin.java"
+public interface com.ibm.mm.sdk.common.dkDatastoreAdmin {
+}
+Compiled from "dkDatastoreDef.java"
+public interface com.ibm.mm.sdk.common.dkDatastoreDef {
+  public abstract com.ibm.mm.sdk.common.dkEntityDef retrieveEntity(java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract com.ibm.mm.sdk.common.dkCollection listEntities() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract com.ibm.mm.sdk.common.dkCollection listEntities(int) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract java.lang.String[] listEntityNames() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract java.lang.String[] listEntityNames(int) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public abstract com.ibm.mm.sdk.common.dkDatastoreAdmin datastoreAdmin() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+}
+Compiled from "dkDatastoreIntICM.java"
+public interface com.ibm.mm.sdk.common.dkDatastoreIntICM extends com.ibm.mm.sdk.common.dkDatastore {
+}
+Compiled from "dkEntityDef.java"
+public interface com.ibm.mm.sdk.common.dkEntityDef {
+  public abstract java.lang.String getName();
+  public abstract java.lang.String getDescription();
+  public abstract short getId();
+  public abstract short getType();
+}
+Compiled from "dkIterator.java"
+public interface com.ibm.mm.sdk.common.dkIterator {
+  public abstract java.lang.Object next() throws com.ibm.mm.sdk.common.DKUsageError;
+  public abstract void reset();
+  public abstract boolean more();
+}
+Compiled from "DKLogException.java"
+public class com.ibm.mm.sdk.logtool.DKLogException extends java.lang.Exception implements java.io.Serializable {
+  public com.ibm.mm.sdk.logtool.DKLogException();
+  public com.ibm.mm.sdk.logtool.DKLogException(java.lang.String);
+  public com.ibm.mm.sdk.logtool.DKLogException(java.lang.String, int);
+  public com.ibm.mm.sdk.logtool.DKLogException(java.lang.String, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public com.ibm.mm.sdk.logtool.DKLogException(java.lang.String, int, com.ibm.mm.sdk.logtool.DKLogMessageInserts);
+  public java.lang.String getErrorEventIdString();
+}
+Compiled from "DKLogMessageInserts.java"
+public class com.ibm.mm.sdk.logtool.DKLogMessageInserts {
+  public com.ibm.mm.sdk.logtool.DKLogMessageInserts();
+  public void clear();
+  public void insert(java.lang.String);
+  public void addFirst(java.lang.String);
+  public int size();
+  public java.lang.String get(int);
+}
+Compiled from "DKDatastoreICM.java"
+public class com.ibm.mm.sdk.server.DKDatastoreICM extends com.ibm.mm.sdk.server.dkAbstractDatastore implements com.ibm.mm.sdk.common.dkDatastoreIntICM {
+  public com.ibm.mm.sdk.server.DKDatastoreICM() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.server.DKDatastoreICM(java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public void connect(java.lang.String, java.lang.String, java.lang.String, java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public void disconnect() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public void destroy() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public boolean isConnected();
+  public com.ibm.mm.sdk.common.dkDatastoreDef datastoreDef() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkCollection listEntities() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public java.lang.String[] listEntityNames() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public short validateConnection() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public static java.lang.String getAPIVer();
+  public static java.lang.String getAPILSVer();
+}
+Compiled from "dkAbstractDatastore.java"
+public class com.ibm.mm.sdk.server.dkAbstractDatastore implements com.ibm.mm.sdk.common.dkDatastore,com.ibm.mm.sdk.common.DKConstant,com.ibm.mm.sdk.common.DKMessageId {
+  public com.ibm.mm.sdk.server.dkAbstractDatastore() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public void connect(java.lang.String, java.lang.String, java.lang.String, java.lang.String) throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public void disconnect() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public void destroy() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public boolean isConnected() throws java.lang.Exception;
+  public com.ibm.mm.sdk.common.dkDatastoreDef datastoreDef() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+  public short validateConnection() throws com.ibm.mm.sdk.common.DKException, java.lang.Exception;
+}
