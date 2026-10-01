@@ -334,13 +334,15 @@ text - so the earlier "no third-party consumer has opened it" gap is closed.
 | Commit | push run | pull_request run |
 | --- | --- | --- |
 | `c8a871d` (implementation) | `36791517987` **success** | `36791523587` **success** |
-| `212656c` (final head: STATUS + architecture/security/data-model/requirements docs) | `36793280634` **success** | `36793284554` **success** |
+| `212656c` (STATUS + architecture/security/data-model/requirements docs) | `36793280634` **success** | `36793284554` **success** |
+| `ad99177`, `8f2fb8f` (the verification verdict and its coverage limits) | docs-only, so CI exercises the same code as `212656c` | same |
 
 Both events were verified **for the same exact SHA** in each case, by reading the workflow
 runs for that `head_sha` from the GitHub API rather than by trusting the branch's latest
-status. `212656c` is documentation-only - it touches no file under `src/` or `tests/`, and
-`c8a871d` remains an ancestor - so the verified code revision and the delivered head are
-separated by documentation alone. **PR #1 is OPEN, draft and unmerged** at `212656c`.
+status. Every commit after `c8a871d` touches **no file under `src/` or `tests/`**, and
+`c8a871d` remains an ancestor of the final head - so the verified code revision and the
+delivered head are separated by documentation alone, which is why the last two rows carry no
+separate run ids. **PR #1 is OPEN, draft and unmerged.**
 
 ### Unresolved risks
 
