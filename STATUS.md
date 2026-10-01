@@ -230,52 +230,122 @@ a fresh reader, the one-connection witness and the version-mismatch refusal all 
 the real database; the **same** suite passes with **no** H2 present via the documented
 absent-driver contract.
 
-**Independent verification:** see the table below; the verdict and its evidence are stated
-there and in the handoff report. The work was committed as `c8a871d` **before** verification,
-so the verification ran against a frozen revision.
+**Independent verification:** see the subsection below; the verdict and its evidence are stated
+there and in the handoff report. The work was committed as `c8a871d` **before** verification, so
+the verification ran against a frozen revision.
+
+### Independent adversarial verification (t6) - verdict PASS
+
+Performed by a member who wrote **none** of the Goal 04 code, against the frozen revision
+`c8a871d` (still an ancestor of the final head; the commits above it are documentation only,
+touching no file under `src/` or `tests/`). Seven probes were written and run by the verifier
+itself, outside the committed tree:
+
+| Probe | Result | What it attacked |
+| --- | --- | --- |
+| `T6ApiProbe` | **119 / 0** | Real loopback socket: all six routes `401` anonymously with every witness counter `0`; exact action header required (missing, wrong, empty, wrong case, all four form-sendable content types -> `403`, zero side effects, no file written); positive controls `200`/`201`; limits clamped at the port; 12 malformed history ids, 4 report ids and 6 ItemType ids refused; leak sweep clean |
+| `T6HistoryProbe` | **78 / 0** | **Real H2 2.2.224**: with TTL=0 a stale read kept the snapshot **visible** and performed **ZERO** engine/JDBC calls across 50 iterations; a real cancel and a real expired deadline each created **zero** history rows; a normal scan created exactly one row with exact coverage; a partial-failure completed scan persisted **exact** coverage with the failed metric stored ABSENT; isolation, retention (oldest of the same repository only, other repository untouched), and a commit-failing write leaving the previous state readable by a **fresh reader** |
+| `T6TargetedSwitchProbe` | **20 / 0** | A targeted refresh left the published snapshot the **same instance**, with equal totals, the same per-ItemType list object and the same anchor; exactly **one** anchor; distinct-ItemID count; **zero** history rows; no overlap with a full scan or a second targeted refresh; a repository switch **drains** a cooperating refresh and **fails closed** when it cannot; a replaced context publishes nothing |
+| `T6ReportProbe` | **79 / 0** | HTML escaped; CSV neutralised all six formula prefixes and round-tripped the hostile value through the verifier's own RFC4180 parser; XLSX is a real 7-part package with no `<f>`, no macro and no external relationship; traversal and id abuse refused; a failed export leaves no artifact; **0 JDBC connects** for a stored-history report |
+| `T6LeakProbe` | **34 / 0** | A real `FakeJdbc` failure swept across 7 surfaces: no raw driver text, user, credential, JDBC URL, raw SQL or `SQLException` text, while the sanitised SQLSTATE still reaches the operator |
+| `T6UiProbe` | **22 / 0** | CSP self-only, no external origin in any served asset, `innerHTML` assignments **0** against `textContent` **11** |
+| `T6GuardProbe` | **6 / 0** | The read-only guard rules re-run by the verifier, plus its **own** boundary plant: the same local-store write is accepted inside `history/` and **refused (`exit 1`, 3 violations) in `statistics/`** |
+
+**Mutation controls, run in a copy with the same probes:** neutralising the action guard
+produced **20** failures; disabling the CSV formula fence produced **5**; disabling history-id
+resolution, `ReportId.parse` and report containment produced **6 + 10**. A probe that passes on
+both the correct and the broken implementation is not evidence, and these discriminate.
+
+**The XLSX gap is CLOSED, and this is the strongest single piece of Goal 04 evidence.**
+Earlier the risk list said no spreadsheet application was available, so no third-party consumer
+had opened the workbook. The verifier obtained **Microsoft Excel 16.0**, which opened the
+produced file **with no repair prompt**, showed **2 sheets and 0 formula cells**, treated the
+hostile `=SUM(A1:A9)` value as **TEXT**, and read the metric cell as a **Double**. A
+comma-delimited import of the CSV produced **12 columns with 0 formula cells**, with the
+hostile value arriving as the literal text `'=SUM(A1:A9)`. The defence is therefore confirmed by
+the exact consumer it exists to protect against, not only by our own parsers.
+
+**Official commands:** `./build.sh` (423/0 core, 51/0 IBM), `./tests/selftest.sh`,
+`./tests/shell/run.sh`, `./bin/doctor.sh`, `./build.sh --check-ibm-isolation`,
+`bash tests/shell/analytics_guard.sh` and `bash tests/shell/analytics_source_guard_test.sh` all
+**exit 0**. `./build.sh --require-ibm` exited **1** with the documented "no IBM SDK jar was found
+in `lib/ibm`" refusal, which is correct behaviour for an empty `lib/ibm` and is therefore
+**NOT APPLICABLE**, not a failure - the real-SDK run recorded above is the applicable one.
+
+**After removing the H2 jar the verifier re-ran the build:** 423 core and 51 IBM tests green
+with **zero** jars anywhere, and the only `org.h2` occurrence in `src/main/java` is the
+`HistoryStores.H2_DRIVER_CLASS` name constant - which is the point of the class-name discovery
+design, since an `import org.h2.*` would compile locally and fail only on a clean CI checkout.
 
 ### Live environment status - honest
 
 **NO LIVE DB2/ORACLE SQL VALIDATION WAS PERFORMED** and **no live IBM CM validation was
 performed**: neither a database nor a CM server is reachable from the execution host. A
-loadable driver is not live database validation and is not presented as it. The XLSX
-workbook was verified by parsing the produced package with the JDK **and** with an
-independent Python reader; **no spreadsheet application is installed locally**, so no
-third-party consumer opened it and that limitation is stated rather than implied away.
+loadable driver is not live database validation and is not presented as it. Real **H2** and
+real **IBM CM 8.7 SDK** evidence both exist and are reported separately above.
+
+The XLSX workbook was verified by two independent parsers **and** by Microsoft Excel 16.0,
+which opened it without a repair prompt, found 0 formula cells and read the hostile value as
+text - so the earlier "no third-party consumer has opened it" gap is closed.
 
 ### GitHub Actions - both events, same SHA
 
 | Commit | push run | pull_request run |
 | --- | --- | --- |
 | `c8a871d` (implementation) | `36791517987` **success** | `36791523587` **success** |
+| `212656c` (final head: STATUS + architecture/security/data-model/requirements docs) | `36793280634` **success** | `36793284554` **success** |
+
+Both events were verified **for the same exact SHA** in each case, by reading the workflow
+runs for that `head_sha` from the GitHub API rather than by trusting the branch's latest
+status. `212656c` is documentation-only - it touches no file under `src/` or `tests/`, and
+`c8a871d` remains an ancestor - so the verified code revision and the delivered head are
+separated by documentation alone. **PR #1 is OPEN, draft and unmerged** at `212656c`.
 
 ### Unresolved risks
 
 1. **No live DB2/Oracle SQL validation and no live IBM CM validation** - unchanged, and still
    the largest gap.
-2. **No spreadsheet application opened the XLSX output.** It is verified by two independent
-   parsers, not by Excel; a hostile value is asserted to be a text cell and a metric a
-   numeric cell, but a real consumer has not been exercised.
-3. **No browser or JS engine exists in this build**, so the UI's DOM behaviour is asserted on
-   the served asset bytes plus mutated-source controls rather than by rendering it. That is
-   the honest maximum here.
-4. **"No CM/JDBC lease held while rendering" is not directly observable.** It is covered by a
-   fake-driver call counter showing zero across all formats plus a structural check that the
-   report model and renderers cannot hold a `java.sql` or `com.ibm` type.
-5. **A genuinely interrupted mid-write export has no injectable seam**, so the reachable
-   failure modes were tested (oversized content, unusable output directory) rather than a
-   kill in the middle of a write.
-6. **The H2 storage cases need the local jar.** Without it the suite asserts the
+2. **CLOSED by verification: a real spreadsheet consumer has now opened the XLSX output.**
+   Microsoft Excel 16.0 opened it with no repair prompt, reported 0 formula cells, read the
+   hostile `=SUM(...)` value as TEXT and the metric as a Double; a CSV import gave 12 columns
+   with 0 formula cells. This item was previously listed as an open gap.
+3. **A symlink inside `reports.dir` could not be exercised.** Windows refused symlink creation
+   on this host, so "a symlinked report is never served" is enforced and covered by the
+   containment mutation control rather than demonstrated end to end. Junctions do not apply,
+   because `find()` requires a regular file. Unresolved rather than verified.
+4. **`GET /api/history` accepts any shape-valid repository id.** Lists and the targeted detail
+   cache **are** per repository, but a stored aggregate from another repository can be
+   addressed by id, and the `400` text says "configured repository id" while only the shape is
+   checked. This is **not** an authorization boundary: this application has one operator
+   credential covering every configured repository, so no two repositories are isolated from
+   each other by authentication in the first place. Recorded because the message overstates
+   what is enforced, and because it is the seam that would matter if per-repository
+   authorization is ever added.
+5. **The action header is matched after trimming surrounding whitespace**, so
+   `" report-generate "` is accepted. This does not weaken the control - a cross-site HTML form
+   cannot set a header at all - and it matches the repository-select guard's existing
+   behaviour. Recorded so it is a decision rather than an accident.
+6. **No browser or JS engine exists in this build**, so the UI's DOM behaviour is asserted on
+   the served asset bytes plus mutated-source controls rather than by rendering it. That is the
+   honest maximum here.
+7. **"No CM/JDBC lease held while rendering" is not directly observable.** It is covered by a
+   fake-driver call counter showing zero across all formats - independently reproduced by the
+   verifier's `T6ReportProbe` - plus a structural check that the report model and renderers
+   cannot hold a `java.sql` or `com.ibm` type.
+8. **A genuinely interrupted mid-write export has no injectable seam**, so the reachable
+   failure modes were tested (oversized content, unusable output directory) rather than a kill
+   in the middle of a write.
+9. **The H2 storage cases need the local jar.** Without it the suite asserts the
    absent-driver contract, which is not the same as verified storage; every assertion message
    names the branch so it cannot be misread.
-7. **`Files.isWritable` reports false on this host for directories that are plainly
-   writable**, so a readiness line can say UNAVAILABLE while the store opens. The doctor
-   checks both `Files.isWritable` and `File.canWrite()`.
-8. **Concurrent `./build.sh` runs corrupt `build/`** on this host (no `flock` in the MSYS
-   shell), producing misleading `NoClassDefFoundError` failures for classes that exist on
-   disk. Every count above is a **solo** run.
-9. **The IBM SDK needs its own logging configuration** (unchanged from Goal 02B).
-10. **`bin/clean.sh` does not remove `data/` or `reports/`**, so H2 state and generated
+10. **`Files.isWritable` reports false on this host for directories that are plainly
+    writable**, so a readiness line can say UNAVAILABLE while the store opens. The doctor
+    checks both `Files.isWritable` and `File.canWrite()`.
+11. **Concurrent `./build.sh` runs corrupt `build/`** on this host (no `flock` in the MSYS
+    shell), producing misleading `NoClassDefFoundError` failures for classes that exist on
+    disk. Every count above is a **solo** run.
+12. **The IBM SDK needs its own logging configuration** (unchanged from Goal 02B).
+13. **`bin/clean.sh` does not remove `data/` or `reports/`**, so H2 state and generated
     reports survive a clean. That is a stated decision, not an oversight.
 
 ### Architecture decisions and goal state
