@@ -230,9 +230,11 @@ Persistent history is optional and application-local. `feature.history` defaults
 `history.max.snapshots.per.repository` defaults to `1000` (range `1..100000`). History data is kept below
 `data.dir`; a missing local H2 driver makes history explicitly unavailable without failing repository
 activation or live statistics. H2 remains an optional runtime JAR under `lib/app` and is not a compile-time
-dependency. Generated HTML/CSV/XLSX artifacts are confined below `reports.dir`. Both paths use the same
-application-home resolution rule described above. `logs.dir` remains reserved until a Java logging owner
-actually consumes it.
+dependency. The history package is structurally restricted to its fixed local H2 path and may not depend on
+the repository JDBC/session/credential path. Generated HTML/CSV/XLSX artifacts are confined below
+`reports.dir`; downloads are opened by the report service with `NOFOLLOW_LINKS` and are read from that same
+opened handle rather than handing a checked path to the HTTP layer. Both paths use the same application-home
+resolution rule described above. `logs.dir` remains reserved until a Java logging owner actually consumes it.
 
 Unknown keys are reported at startup instead of being ignored, matched against an exact key list so
 that a typo such as `web.prt=8080` is caught rather than passing as part of the `web.` family.

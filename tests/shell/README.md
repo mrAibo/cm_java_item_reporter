@@ -65,15 +65,15 @@ A new regression test is picked up automatically when it follows this contract:
    `CM_INSIGHT_RUN_DIR`, `CM_INSIGHT_LOG_DIR` pointed into that temporary tree.
    Kill every process started and remove the temporary tree in a `trap ... EXIT` that
    also runs when an assertion fails.
-8. **Bounded**: whole file well under the runner's per-file limit (300s by default),
+8. **Bounded**: whole file well under the runner's per-file limit (900s by default),
    every wait loop with a hard iteration/time bound, no unbounded `sleep`.
 
 ## Bounds and ports
 
 | Knob | Default | Meaning |
 | --- | --- | --- |
-| `CM_INSIGHT_TEST_TIMEOUT` | `300` | per-file timeout (the runner enforces it) |
-| `CM_INSIGHT_TEST_TOTAL_BUDGET` | `600` | whole-suite budget; tests that cannot start inside it are reported `NOT RUN` and fail the suite |
+| `CM_INSIGHT_TEST_TIMEOUT` | `900` | per-file timeout (the runner enforces it) |
+| `CM_INSIGHT_TEST_TOTAL_BUDGET` | `1800` | whole-suite budget; tests that cannot start inside it are reported `NOT RUN` and fail the suite |
 | `CM_INSIGHT_SOAK_CYCLES` | `10` | lifecycle cycles in `lifecycle_identity_race_test.sh` |
 | `CM_INSIGHT_SOAK_TIMEOUT` | script default | per-`start.sh` timeout in the lifecycle test |
 
@@ -81,15 +81,16 @@ Ports are never hard-coded to a fixed number a shared runner might already use: 
 test asks for a free loopback port (scanning upwards from a random base) and passes it
 through an isolated configuration file.
 
-Measured on this revision, on the local equivalent of `ubuntu-latest` (WSL2 Ubuntu
-24.04, Temurin 17.0.20.1, `CI=true`):
+Historical pre-Goal-04 measurements on the local equivalent of `ubuntu-latest` (WSL2 Ubuntu
+24.04, Temurin 17.0.20.1, `CI=true`) are kept only as timing context; they are **not** a claim about the
+current expanded suite. The enforced current bounds are the 900/1800 values above.
 
-| What | Observed | Bound |
+| What | Historical observation | Current bound |
 | --- | --- | --- |
-| whole suite (`./tests/shell/run.sh`) | 48s, 3/3 passed (exit 0) | total budget 600s |
-| `addr_socket_class_test.sh` | 1s | 300s |
-| `lifecycle_identity_race_test.sh` (10 cycles) | 40s | 300s |
-| `marker_identity_safety_test.sh` | 7s | 300s |
+| whole suite (`./tests/shell/run.sh`) | 48s when the suite still contained 3 tests | total budget 1800s |
+| `addr_socket_class_test.sh` | 1s | 900s |
+| `lifecycle_identity_race_test.sh` (10 cycles) | 40s | 900s |
+| `marker_identity_safety_test.sh` | 7s | 900s |
 | CI lifecycle step (3 cycles, extracted from the workflow and run verbatim) | 12s | ~95s per cycle, job ceiling 20 min |
 
 Ports actually used by those runs: 25630 (lifecycle soak), 31764 (closed-port probe) and

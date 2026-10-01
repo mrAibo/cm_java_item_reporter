@@ -409,8 +409,10 @@ Three formats: HTML and CSV are mandatory and JDK-only; XLSX is a **real** minim
 with the JDK zip support, never a renamed CSV, with no formula cell, no macro and no external relationship.
 Output is confined below `reports.dir` by resolving, normalising and containment-checking rather than by
 trusting concatenation, the temporary file is created inside the same directory so the final move is
-atomic, and no HTTP parameter ever becomes a filesystem path. `SECURITY.md` records the escaping and
-formula-fence rules and their mutation controls.
+atomic, and no HTTP parameter ever becomes a filesystem path. Download authority stays inside `ReportService`:
+the final artifact is opened with `READ + NOFOLLOW_LINKS`, the byte limit is enforced on that same open
+handle, and the web layer receives no filesystem `Path` to reopen after a check. `SECURITY.md` records the
+escaping, formula-fence and confinement rules and their mutation controls.
 
 ## Web UI
 

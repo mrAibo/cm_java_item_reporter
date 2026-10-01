@@ -152,6 +152,27 @@ public final class ScriptPermissionTest {
     }
 
     /**
+     * The shell runner's help text and execution defaults share the same variables.
+     *
+     * <p>This pins the accepted 900/1800 bounds and, more importantly, prevents a future edit from changing
+     * execution while leaving a duplicated number in --help.
+     */
+    public void theShellRunnerHelpCannotDriftFromItsTimeoutDefaults() throws Exception {
+        Path scriptPath = SourceGuard.repositoryRoot().resolve("tests/shell/run.sh");
+        String script = Files.readString(scriptPath, StandardCharsets.UTF_8);
+
+        Assert.assertTrue(script.contains("PER_FILE_TIMEOUT=\"${CM_INSIGHT_TEST_TIMEOUT:-900}\""),
+                "the accepted per-file default must remain 900 seconds");
+        Assert.assertTrue(script.contains("TOTAL_BUDGET=\"${CM_INSIGHT_TEST_TOTAL_BUDGET:-1800}\""),
+                "the accepted whole-suite default must remain 1800 seconds");
+        Assert.assertTrue(script.contains("(default ${PER_FILE_TIMEOUT})"),
+                "--help must render the actual per-file default variable rather than duplicate a number");
+        Assert.assertTrue(script.contains("(default ${TOTAL_BUDGET})"),
+                "--help must render the actual total-budget variable rather than duplicate a number");
+        Assert.assertFalse(script.contains("(default 300)") || script.contains("(default 600)"),
+                "the stale 300/600 help contract must not reappear");
+    }
+    /**
      * The committed path of each {@code git ls-files -s} index line.
      *
      * <p>An index line is {@code <mode> <hash> <stage>\t<path>}, so the path is the fourth whitespace-separated

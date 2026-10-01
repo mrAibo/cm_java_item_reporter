@@ -1,9 +1,13 @@
 package com.mraibo.cminsight.report;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -46,12 +50,13 @@ import java.util.stream.Stream;
  * <p>where {@code base} is {@code reportsDir.toAbsolutePath().normalize()}, computed once in the constructor.
  * Requiring the file to be a <em>direct child</em> of the base is deliberately stronger than a prefix test
  * alone: a report is never in a subdirectory, so a path that reaches one is refused even if it is still
- * inside the tree. {@link #find(ReportId, ReportFormat)} adds two further checks, because a lookup resolves a
- * name an operator did not type: it treats a symbolic link as "no such report" rather than following it
- * ({@code LinkOption.NOFOLLOW_LINKS}), and it re-checks the real path of the file it is about to serve against
- * the real base directory, which closes the window between the containment check and the read if the name was
- * replaced in the meantime. A symbolic link planted in the output directory is neither listed nor downloadable,
- * and a test proves it.
+ * inside the tree. Metadata lookup still refuses a symbolic-link leaf with
+ * {@code LinkOption.NOFOLLOW_LINKS}, but metadata is never download authority. {@link #readForDownload(ReportId,
+ * ReportFormat)} performs the decisive open itself with {@code READ + NOFOLLOW_LINKS}; the bytes are then read
+ * from that same already-open handle while the size bound is enforced. Replacing a previously described report
+ * with a symlink therefore cannot redirect the later read to the link target. A symbolic link planted in the
+ * output directory is neither listed nor downloadable, and a Linux-capable regression proves the old plain-open
+ * control would expose the target while this path refuses it.
  *
  * <h2>An interrupted export is never presented as complete</h2>
  *
@@ -77,6 +82,24 @@ public final class ReportService {
 
     /** The largest report list a caller may ask for in one request. */
     public static final int MAX_LIST_LIMIT = 200;
+
+    /**
+     * One download body after confinement has performed the decisive open. It deliberately carries no
+     * filesystem path: a web caller can label and send these bytes, but cannot reopen a checked name later.
+     */
+    public record DownloadedReport(ReportId id, ReportFormat format, String fileName, byte[] bytes) {
+        public DownloadedReport {
+            Objects.requireNonNull(id, "id");
+            Objects.requireNonNull(format, "format");
+            fileName = Objects.requireNonNull(fileName, "fileName");
+            bytes = Objects.requireNonNull(bytes, "bytes").clone();
+        }
+
+        @Override
+        public byte[] bytes() {
+            return bytes.clone();
+        }
+    }
 
     /** Every artifact name starts with this, so a name in the output directory is either ours or ignored. */
     private static final String FILE_PREFIX = "report-";
@@ -163,15 +186,69 @@ public final class ReportService {
             Path realBase = base.toRealPath();
             Path realArtifact = candidate.toRealPath();
             if (!realArtifact.startsWith(realBase) || !realBase.equals(realArtifact.getParent())) {
-                // A second look, this time on the resolved path: the containment check above ran on the name,
-                // and between that check and this read the name could have been replaced by a link to a file
-                // outside the output directory. Resolving and re-checking closes that window rather than
-                // trusting the name that was checked a moment ago.
+                // Metadata lookup resolves the path so a planted link is not described as one of our files.
+                // This check is deliberately NOT download authority: a later replacement can still happen.
+                // readForDownload() closes that later window by opening the final component with NOFOLLOW_LINKS.
                 throw new ReportException(ReportException.Reason.PATH_OUTSIDE_OUTPUT_DIRECTORY);
             }
             return Optional.of(new GeneratedReport(id, target, fileName, realArtifact,
                     Files.size(realArtifact), Files.getLastModifiedTime(realArtifact).toInstant()));
         } catch (IOException unreadable) {
+            throw new ReportException(ReportException.Reason.OUTPUT_UNREADABLE);
+        }
+    }
+
+    /**
+     * Opens and reads one report for HTTP download under the same confinement authority that owns the path.
+     *
+     * <p>The final component is opened with {@link LinkOption#NOFOLLOW_LINKS}; the returned bytes come from
+     * that exact already-open handle, never from a path that was checked earlier and reopened later. The size
+     * bound is enforced against the open channel and again while bytes are consumed, so a growing artifact
+     * cannot outrun an earlier attribute check.
+     */
+    public Optional<DownloadedReport> readForDownload(ReportId id, ReportFormat format) {
+        Objects.requireNonNull(id, "id");
+        ReportFormat target = Objects.requireNonNull(format, "format");
+        String fileName = fileNameFor(id, target);
+        Path candidate = confined(fileName);
+
+        // Cheap rejection only. This is NOT the security decision: the decisive operation is the
+        // NOFOLLOW_LINKS open below, which cannot be redirected by replacing this leaf with a symlink.
+        if (!Files.isDirectory(base) || !Files.isRegularFile(candidate, LinkOption.NOFOLLOW_LINKS)) {
+            return Optional.empty();
+        }
+
+        try (SeekableByteChannel channel = Files.newByteChannel(
+                candidate, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            long openedSize = channel.size();
+            if (openedSize > MAX_REPORT_BYTES) {
+                throw new ReportException(ReportException.Reason.CONTENT_TOO_LARGE);
+            }
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream(
+                    (int) Math.min(Math.max(0L, openedSize), MAX_REPORT_BYTES));
+            ByteBuffer buffer = ByteBuffer.allocate(16 * 1024);
+            long total = 0L;
+            while (true) {
+                int read = channel.read(buffer);
+                if (read < 0) {
+                    break;
+                }
+                if (read == 0) {
+                    buffer.clear();
+                    continue;
+                }
+                total += read;
+                if (total > MAX_REPORT_BYTES) {
+                    throw new ReportException(ReportException.Reason.CONTENT_TOO_LARGE);
+                }
+                out.write(buffer.array(), 0, read);
+                buffer.clear();
+            }
+            return Optional.of(new DownloadedReport(id, target, fileName, out.toByteArray()));
+        } catch (NoSuchFileException vanished) {
+            return Optional.empty();
+        } catch (IOException | SecurityException | UnsupportedOperationException unreadable) {
             throw new ReportException(ReportException.Reason.OUTPUT_UNREADABLE);
         }
     }

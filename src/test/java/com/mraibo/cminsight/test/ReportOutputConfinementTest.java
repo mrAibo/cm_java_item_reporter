@@ -292,6 +292,90 @@ public class ReportOutputConfinementTest {
                         + visited.size() + " type(s)");
     }
 
+    /** The HTTP-facing download value cannot carry a filesystem path that a caller might reopen later. */
+    public void downloadTransportCarriesNoFilesystemPath() {
+        List<Class<?>> components = new ArrayList<>();
+        for (RecordComponent component : ReportService.DownloadedReport.class.getRecordComponents()) {
+            components.add(component.getType());
+        }
+        Assert.assertFalse(components.contains(Path.class),
+                "the download transport must carry bytes and metadata only; a Path would recreate check/use authority");
+        Assert.assertTrue(components.contains(byte[].class),
+                "the confinement owner must hand the web layer already-read bytes");
+    }
+    /**
+     * The download read is the confinement operation: a stale description must never authorise a later open.
+     *
+     * <p>The symlink part is mandatory on Linux/CI. Windows developer filesystems can deny symbolic-link
+     * creation to an unprivileged process; in that case the non-symlink assertions still run and CI supplies
+     * the primitive-specific proof.
+     */
+    public void downloadOwnsTheNoFollowOpenAndOpenedHandleSizeBound() throws Exception {
+        // Use the platform temp filesystem rather than the repository checkout. On Linux/CI this gives the
+        // regression a filesystem with real symlink semantics even when the checkout itself is a mounted drive.
+        Path base = Files.createTempDirectory("reports-download-");
+        Path outsideDir = Files.createTempDirectory("reports-outside-");
+        try {
+            ReportService service = new ReportService(base);
+
+            GeneratedReport normal = service.generate(sampleModel("normal"), ReportFormat.CSV);
+            byte[] expected = Files.readAllBytes(normal.path());
+            ReportService.DownloadedReport opened = service.readForDownload(normal.id(), normal.format())
+                    .orElseThrow(() -> new AssertionError("a normal completed artifact must be downloadable"));
+            Assert.assertTrue(java.util.Arrays.equals(expected, opened.bytes()),
+                    "the confined read must return exactly the normal artifact bytes");
+
+            GeneratedReport oversized = service.generate(sampleModel("oversized"), ReportFormat.CSV);
+            Files.write(oversized.path(), new byte[(int) ReportService.MAX_REPORT_BYTES + 1]);
+            ReportException tooLarge = Assert.assertThrows(ReportException.class,
+                    () -> service.readForDownload(oversized.id(), oversized.format()),
+                    "the download bound must be enforced by the component that owns the opened handle");
+            Assert.assertEquals(ReportException.Reason.CONTENT_TOO_LARGE, tooLarge.reason(),
+                    "an oversized opened artifact must be refused as CONTENT_TOO_LARGE");
+
+            GeneratedReport raced = service.generate(sampleModel("race"), ReportFormat.CSV);
+            GeneratedReport discovered = service.find(raced.id(), raced.format())
+                    .orElseThrow(() -> new AssertionError("the control needs a metadata result before the swap"));
+            Path outside = outsideDir.resolve("outside-secret.txt");
+            byte[] secret = "OUTSIDE_SECRET".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            Files.write(outside, secret);
+
+            Files.delete(raced.path());
+            try {
+                Files.createSymbolicLink(raced.path(), outside.toAbsolutePath());
+            } catch (UnsupportedOperationException | java.io.IOException | SecurityException unavailable) {
+                if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win")) {
+                    throw new AssertionError("the Linux-capable symlink regression could not create its link",
+                            unavailable);
+                }
+                return;
+            }
+
+            Assert.assertTrue(service.find(raced.id(), raced.format()).isEmpty(),
+                    "a report whose current final component is a symlink must not even be described as an artifact");
+
+            // Mutation control: this is the old check/use design. The metadata Path was safe when find()
+            // returned, but a plain later open follows the replacement and exposes the outside target.
+            byte[] leakedByPlainOpen = Files.readAllBytes(discovered.path());
+            Assert.assertTrue(java.util.Arrays.equals(secret, leakedByPlainOpen),
+                    "the control must prove a normal following open WOULD expose the outside target");
+
+            Optional<ReportService.DownloadedReport> secured;
+            try {
+                secured = service.readForDownload(raced.id(), raced.format());
+            } catch (ReportException refused) {
+                Assert.assertEquals(ReportException.Reason.OUTPUT_UNREADABLE, refused.reason(),
+                        "a raced symlink may be reported as unreadable, but must never be followed");
+                secured = Optional.empty();
+            }
+            Assert.assertTrue(secured.isEmpty(),
+                    "a symlink leaf, including one swapped in after metadata discovery, must be refused");
+        } finally {
+            TestSupport.deleteRecursively(base);
+            TestSupport.deleteRecursively(outsideDir);
+        }
+    }
+
     // ------------------------------------------------------------------ fixtures
 
     private static List<Class<?>> componentsOf(Class<?> type) {

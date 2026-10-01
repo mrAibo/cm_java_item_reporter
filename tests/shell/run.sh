@@ -53,7 +53,7 @@ ONLY=""
 LIST_ONLY=false
 
 usage() {
-  cat <<'USAGE'
+  cat <<USAGE
 Usage: ./tests/shell/run.sh [--list] [--only PATTERN] [--help]
 
 Runs every committed shell regression test under tests/shell/ (discovery patterns:
@@ -66,8 +66,8 @@ Options:
   --help            show this help
 
 Environment:
-  CM_INSIGHT_TEST_TIMEOUT       per-file timeout in seconds (default 300)
-  CM_INSIGHT_TEST_TOTAL_BUDGET  whole-suite budget in seconds (default 600)
+  CM_INSIGHT_TEST_TIMEOUT       per-file timeout in seconds (default ${PER_FILE_TIMEOUT})
+  CM_INSIGHT_TEST_TOTAL_BUDGET  whole-suite budget in seconds (default ${TOTAL_BUDGET})
 
 Conventions the runner relies on:
   * each test is executable, accepts no arguments, and needs no environment;

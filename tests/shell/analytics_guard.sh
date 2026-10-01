@@ -167,6 +167,27 @@ SECONDARY_RELS=('src/main/java/com/mraibo/cminsight/statistics')
 # decoration.
 HISTORY_EXEMPT_REL='src/main/java/com/mraibo/cminsight/history'
 
+# Goal 04A closes the negative half of that exemption: history may use JDBC only for the
+# fixed application-local H2 file. These code-reference patterns are applied to non-comment
+# source lines under history/ and intentionally forbid every repository-JDBC entry point.
+HISTORY_LOCAL_DRIVER='org.h2.Driver'
+HISTORY_LOCAL_URL_PREFIX='jdbc:h2:file:'
+HISTORY_FORBIDDEN_BOUNDARY_PATTERNS=(
+  'java[.]sql[.]DriverManager'
+  '(^|[^[:alnum:]_])DriverManager[[:space:]]*[.]'
+  'com[.]mraibo[.]cminsight[.]db[.]'
+  'com[.]mraibo[.]cminsight[.]config[.]RepositoryProfile'
+  '(^|[^[:alnum:]_])RepositoryProfile([^[:alnum:]_]|$)'
+  '(^|[^[:alnum:]_])JdbcCredentials([^[:alnum:]_]|$)'
+  'resolveJdbcCredentials[[:space:]]*[(]'
+  'resolveCredentials[[:space:]]*[(]'
+  'repository[.]jdbc[.](url|user|password)'
+  'jdbc:db2:'
+  'jdbc:oracle:'
+  'com[.]ibm[.]db2[.]jcc[.]DB2Driver'
+  'oracle[.]jdbc[.]'
+)
+
 # The ONE exempt file, named by its exact repository-relative path rather than by
 # basename or pattern. It is the admission rule itself: its string literals ARE the
 # forbidden vocabulary, so only the statement-literal sub-rule may skip this exact file.
@@ -264,8 +285,10 @@ if [ "${LIST_ONLY}" = true ]; then
   printf 'scanned trees (root %s):\n' "${ROOT}"
   printf '  %s   (required, must be non-empty)\n' "${PRIMARY_REL}"
   for rel in "${SECONDARY_RELS[@]}"; do printf '  %s   (scanned when present)\n' "${rel}"; done
-  printf 'exempt tree (application-local history storage; it owns its own local file and never\n'
-  printf 'touches IBM CM or the repository database):\n  %s\n' "${HISTORY_EXEMPT_REL}"
+  printf 'exempt tree from repository-SQL rules (application-local history storage):\n  %s\n' "${HISTORY_EXEMPT_REL}"
+  printf 'history local-only boundary (the exemption is NOT a repository-JDBC escape hatch):\n'
+  printf '  allowed driver: %s\n  allowed URL prefix: %s\n' "${HISTORY_LOCAL_DRIVER}" "${HISTORY_LOCAL_URL_PREFIX}"
+  for pattern in "${HISTORY_FORBIDDEN_BOUNDARY_PATTERNS[@]}"; do printf '  refuse: %s\n' "${pattern}"; done
   printf 'forbidden JDBC write/control calls:\n'
   for pattern in "${FORBIDDEN_CALL_PATTERNS[@]}"; do printf '  %s\n' "${pattern}"; done
   printf 'forbidden statement literals:\n'
@@ -381,14 +404,72 @@ scan_tree() {
   return 0
 }
 
+scan_history_boundary() {
+  # history/ is exempt from repository-SQL write rules ONLY because it owns an application-local H2 file.
+  # This second guard makes that exemption one-way: repository JDBC dependencies remain forbidden here.
+  local directory="${ROOT}/${HISTORY_EXEMPT_REL}" count=0 file line trimmed line_no pattern relative
+  if [ ! -d "${directory}" ]; then
+    printf 'ERROR: %s is missing; the named history exemption has no local-only boundary subject\n' \
+      "${HISTORY_EXEMPT_REL}" >&2
+    violations=$((violations + 1))
+    return 0
+  fi
+  while IFS= read -r -d '' _file; do count=$((count + 1)); done \
+    < <(find "${directory}" -type f -name '*.java' -print0 2>/dev/null)
+  if [ "${count}" -eq 0 ]; then
+    printf 'ERROR: %s contains no .java file; the history local-only guard would scan nothing\n' \
+      "${HISTORY_EXEMPT_REL}" >&2
+    violations=$((violations + 1))
+    return 0
+  fi
+
+  # One combined ERE and one grep per file: the earlier per-line/per-pattern implementation spawned
+  # thousands of grep processes on mounted Windows filesystems and made a structural check needlessly slow.
+  local combined=''
+  for pattern in "${HISTORY_FORBIDDEN_BOUNDARY_PATTERNS[@]}"; do
+    if [ -z "${combined}" ]; then combined="(${pattern})"; else combined="${combined}|(${pattern})"; fi
+  done
+
+  while IFS= read -r -d '' file; do
+    relative="${file#"${ROOT}/"}"
+    while IFS= read -r match; do
+      [ -n "${match}" ] || continue
+      line_no="${match%%:*}"
+      line="${match#*:}"
+      trimmed="${line#"${line%%[![:space:]]*}"}"
+      case "${trimmed}" in
+        '//'*) continue ;;
+        '/*'*) continue ;;
+        '*'*) continue ;;
+      esac
+      printf 'ERROR: history local-only boundary: %s:%s: forbidden repository-JDBC dependency: %s\n' \
+        "${relative}" "${line_no}" "${line}" >&2
+      violations=$((violations + 1))
+    done < <(grep -En "(${combined})" "${file}" 2>/dev/null || true)
+  done < <(find "${directory}" -type f -name '*.java' -print0 2>/dev/null)
+
+  if ! grep -RqsF --include='*.java' "${HISTORY_LOCAL_DRIVER}" "${directory}"; then
+    printf 'ERROR: history local-only boundary lost its fixed H2 driver identity %s\n' \
+      "${HISTORY_LOCAL_DRIVER}" >&2
+    violations=$((violations + 1))
+  fi
+  if ! grep -RqsF --include='*.java' "${HISTORY_LOCAL_URL_PREFIX}" "${directory}"; then
+    printf 'ERROR: history local-only boundary lost its fixed file-backed H2 URL prefix %s\n' \
+      "${HISTORY_LOCAL_URL_PREFIX}" >&2
+    violations=$((violations + 1))
+  fi
+  printf 'OK: history local-only boundary scanned %s .java file(s); repository JDBC dependencies are absent\n' \
+    "${count}"
+}
 scan_tree "${PRIMARY_DIR}" required
 for rel in "${SECONDARY_RELS[@]}"; do
   scan_tree "${ROOT}/${rel}" optional
 done
+scan_history_boundary
 
 if [ "${violations}" -gt 0 ]; then
-  fail "${violations} Goal 03 analytics read-only violation(s) above. Direct SQL in V1/V2 is SELECT-only: the database account may have SELECT-only privileges, but application safety must not depend on the operator having set that up."
+  fail "${violations} Goal 03 analytics read-only violation(s) / Goal 04A history-boundary violation(s) above. Repository SQL remains SELECT-only, and the history exemption is limited to its own application-local H2 file."
 fi
 
 printf 'OK: the analytics source tree was scanned (%s .java file(s)) and holds no JDBC write/control call\n' "${scanned_files}"
-printf 'OK: all Goal 03 analytics read-only guards hold\n'
+printf 'OK: Goal 03 analytics read-only and Goal 04A history local-only guards hold\n'

@@ -69,6 +69,7 @@ ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd)" || { printf 'ERROR: cannot 
 GUARD="${ROOT}/tests/shell/analytics_guard.sh"
 PRIMARY_REL='src/main/java/com/mraibo/cminsight/db'
 SECONDARY_REL='src/main/java/com/mraibo/cminsight/statistics'
+HISTORY_REL='src/main/java/com/mraibo/cminsight/history'
 SCRATCH_PREFIX='analytics-guard-test.'
 
 ROOT_POSIX="$(printf '%s' "${ROOT}" | sed -E 's#^([A-Za-z]):[\\/]#/\L\1/#; s#\\#/#g')"
@@ -169,7 +170,7 @@ new_mirror() {
   [ -d "${dir}" ] || { printf 'FAIL: the scratch tree %s was not created\n' "${dir}" >&2; exit 1; }
   TEMPS="${TEMPS} ${dir}"
   MIRRORS=$((MIRRORS + 1))
-  mkdir -p "${dir}/${PRIMARY_REL}" "${dir}/${SECONDARY_REL}" || {
+  mkdir -p "${dir}/${PRIMARY_REL}" "${dir}/${SECONDARY_REL}" "${dir}/${HISTORY_REL}" || {
     printf 'FAIL: cannot lay out the scratch tree %s\n' "${dir}" >&2; exit 1; }
   printf '%s\n' \
     'package com.mraibo.cminsight.db;' \
@@ -196,6 +197,17 @@ new_mirror() {
     'final class StatsProbe {' \
     '  private StatsProbe() { }' \
     '}' > "${dir}/${SECONDARY_REL}/StatsProbe.java"
+
+  # Every mirror also carries the positive control for Goal 04A's local-history boundary: the fixed H2
+  # driver identity and file-backed URL are allowed, while repository JDBC references planted later are not.
+  printf '%s\n' \
+    'package com.mraibo.cminsight.history;' \
+    '' \
+    '/** Scratch fixture: application-local H2 history only. */' \
+    'final class LocalHistoryProbe {' \
+    '  static final String DRIVER = "org.h2.Driver";' \
+    '  static final String URL = "jdbc:h2:file:";' \
+    '}' > "${dir}/${HISTORY_REL}/LocalHistoryProbe.java"
   MIRROR="${dir}"
 }
 
@@ -872,6 +884,37 @@ plant "${T7B}" "${rel}" 'void write() throws Exception { connection.commit(); }'
 TREE="${T7B}"
 run_guard
 assert_refused "a planted write call in ${SECONDARY_REL}" nonzero "${T7B}/${rel}" 'Goal 03 analytics read-only violation'
+
+# Goal 04A: the history tree is exempt from repository-SQL write rules ONLY for its own local H2 file.
+# The clean H2 fixture in every mirror is the positive control; repository JDBC references planted here
+# must still fail even though they live under the exempt history/ tree.
+new_mirror
+T7C="${MIRROR}"
+rel="${HISTORY_REL}/RepositoryJdbcEscape.java"
+printf '%s\n' \
+  'package com.mraibo.cminsight.history;' \
+  'import com.mraibo.cminsight.db.JdbcSession;' \
+  'final class RepositoryJdbcEscape {' \
+  '  String repositoryUrl() { return "jdbc:db2://repository"; }' \
+  '}' > "${T7C}/${rel}"
+TREE="${T7C}"
+run_guard
+assert_refused "a repository JDBC dependency planted inside the history exemption" nonzero \
+  "${rel}" 'history local-only boundary'
+
+new_mirror
+T7D="${MIRROR}"
+rel="${HISTORY_REL}/DriverManagerEscape.java"
+printf '%s\n' \
+  'package com.mraibo.cminsight.history;' \
+  'import java.sql.DriverManager;' \
+  'final class DriverManagerEscape {' \
+  '  Object connect() throws Exception { return DriverManager.getConnection("jdbc:oracle:thin:@repository"); }' \
+  '}' > "${T7D}/${rel}"
+TREE="${T7D}"
+run_guard
+assert_refused "DriverManager/Oracle planted inside the history exemption" nonzero \
+  "${rel}" 'history local-only boundary'
 
 # ---------------------------------------------------------------------------
 # Case 8: every call pattern the guard still declares must still bite. The

@@ -20,9 +20,6 @@ import com.mraibo.cminsight.web.http.HttpStatus;
 import com.mraibo.cminsight.web.http.JsonWriter;
 import com.mraibo.cminsight.web.http.RequestContext;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -434,38 +431,27 @@ public final class ReportApiRoutes {
         if (format == null) {
             return;
         }
-        Optional<GeneratedReport> found;
+        Optional<ReportService.DownloadedReport> opened;
         try {
-            found = reports.find(id, format);
+            opened = reports.readForDownload(id, format);
         } catch (ReportException refused) {
             reportRefused(ctx, refused);
             return;
         } catch (RuntimeException failure) {
-            ctx.sendError(REPORT_UNAVAILABLE, "report_failed", GENERATE_FAILED);
-            return;
-        }
-        if (found == null || found.isEmpty()) {
-            ctx.sendError(NOT_FOUND, "not_found", "No report has that identity");
-            return;
-        }
-        GeneratedReport report = found.get();
-        byte[] body;
-        try {
-            Path path = report.path();
-            if (path == null || !Files.isRegularFile(path)
-                    || Files.size(path) > ReportService.MAX_REPORT_BYTES) {
-                ctx.sendError(REPORT_UNAVAILABLE, "report_unreadable",
-                        "The report artifact is not readable as a completed file");
-                return;
-            }
-            body = Files.readAllBytes(path);
-        } catch (IOException | RuntimeException failure) {
             ctx.sendError(REPORT_UNAVAILABLE, "report_unreadable",
                     "The report artifact is not readable as a completed file");
             return;
         }
+        if (opened == null || opened.isEmpty()) {
+            ctx.sendError(NOT_FOUND, "not_found", "No report has that identity");
+            return;
+        }
+        ReportService.DownloadedReport report = opened.get();
+        byte[] body = report.bytes();
+
         // Attachment + the server's own nosniff header: a report may describe operational data, so a browser
-        // must never render it in place or sniff a type for it.
+        // must never render it in place or sniff a type for it. The web layer receives no filesystem Path:
+        // ReportService already performed the decisive NOFOLLOW_LINKS open and read from that handle.
         ctx.setResponseHeader("Content-Disposition",
                 "attachment; filename=\"" + safeFileName(report.fileName()) + "\"");
         ctx.sendBytes(HttpStatus.OK, report.format().contentType(), body);

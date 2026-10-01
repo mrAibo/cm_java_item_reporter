@@ -147,6 +147,26 @@ public class AnalyticsSourceReadOnlyGuardTest {
     private static final Pattern DRIVER_HANDLE_TYPE = Pattern.compile(
             "java\\.sql\\.(Connection|Statement|PreparedStatement|CallableStatement|ResultSet)\\b");
 
+    /**
+     * Repository-JDBC identities that must never cross into the local history package.
+     *
+     * <p>The history tree is exempt from repository SQL write rules only because it owns its own embedded
+     * H2 file. This table makes the exemption one-way: H2/java.sql primitives are allowed, but the
+     * repository connection path, repository credentials and DB2/Oracle driver identities are not.
+     */
+    private static final List<Pattern> HISTORY_REPOSITORY_JDBC_PATTERNS = List.of(
+            Pattern.compile("\\bDriverManager\\b"),
+            Pattern.compile("com\\.mraibo\\.cminsight\\.db\\."),
+            Pattern.compile("\\bRepositoryProfile\\b"),
+            Pattern.compile("\\bJdbcCredentials\\b"),
+            Pattern.compile("\\bresolveJdbcCredentials\\s*\\("),
+            Pattern.compile("\\bresolveCredentials\\s*\\("),
+            Pattern.compile("repository\\.jdbc\\.(url|user|password)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("jdbc:db2:", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("jdbc:oracle:", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("com\\.ibm\\.db2\\.jcc\\.DB2Driver"),
+            Pattern.compile("oracle\\.jdbc\\.", Pattern.CASE_INSENSITIVE));
+
     // ------------------------------------------------------------------ acceptance
 
     /** The committed analytics source holds no forbidden write call, no write literal and no CALL escape. */
@@ -640,6 +660,49 @@ public class AnalyticsSourceReadOnlyGuardTest {
                         + " handle type, or the web layer could receive one: " + violations);
     }
 
+    /** The committed history package remains an application-local H2 boundary, not a repository-JDBC path. */
+    public void theHistoryExemptionIsStructurallyLocalH2Only() {
+        Path root = repositoryRoot();
+        List<String> violations = findHistoryRepositoryJdbcDependencies(root);
+        Assert.assertTrue(violations.isEmpty(),
+                "history/ may use JDBC only for its own local H2 file; repository-JDBC dependencies found: "
+                        + violations);
+
+        StringBuilder source = new StringBuilder();
+        for (Path file : javaFiles(root.resolve(HISTORY_PACKAGE))) {
+            source.append(readString(file)).append('\n');
+        }
+        Assert.assertTrue(source.indexOf("org.h2.Driver") >= 0,
+                "the local-history boundary must still name its fixed H2 driver identity");
+        Assert.assertTrue(source.indexOf("jdbc:h2:file:") >= 0,
+                "the local-history boundary must still construct the fixed file-backed H2 URL");
+    }
+
+    /** A repository-JDBC dependency planted inside the exempt history tree is still refused. */
+    public void aRepositoryJdbcPlantInsideHistoryIsRefused() throws IOException {
+        Path root = repositoryRoot();
+        Path copy = TestSupport.newTempDir("history-boundary-copy-");
+        try {
+            copyDirectory(root.resolve(HISTORY_PACKAGE), copy.resolve(HISTORY_PACKAGE));
+            Path planted = copy.resolve(HISTORY_PACKAGE).resolve("RepositoryJdbcEscape.java");
+            Files.writeString(planted, """
+                    package com.mraibo.cminsight.history;
+
+                    import com.mraibo.cminsight.db.JdbcSession;
+                    import java.sql.DriverManager;
+
+                    final class RepositoryJdbcEscape {
+                        String url() { return "jdbc:db2://repository"; }
+                    }
+                    """, StandardCharsets.UTF_8);
+
+            List<String> violations = findHistoryRepositoryJdbcDependencies(copy);
+            Assert.assertTrue(violations.stream().anyMatch(v -> v.contains("RepositoryJdbcEscape")),
+                    "a repository JDBC reference planted INSIDE history/ must be refused: " + violations);
+        } finally {
+            deleteRecursively(copy);
+        }
+    }
     /**
      * The history exemption is real, non-empty, and cannot be widened.
      *
@@ -709,6 +772,34 @@ public class AnalyticsSourceReadOnlyGuardTest {
         }
     }
 
+    /** Every repository-JDBC dependency found in executable history-package source. */
+    private static List<String> findHistoryRepositoryJdbcDependencies(Path root) {
+        Path history = root.resolve(HISTORY_PACKAGE);
+        Assert.assertTrue(Files.isDirectory(history),
+                "the history local-only guard must scan " + history + ", which does not exist");
+        List<Path> sources = javaFiles(history);
+        Assert.assertFalse(sources.isEmpty(),
+                "the history local-only guard must scan at least one .java file");
+
+        List<String> violations = new ArrayList<>();
+        for (Path file : sources) {
+            String relative = relative(root, file);
+            List<String> lines = readLines(file);
+            for (int index = 0; index < lines.size(); index++) {
+                String line = lines.get(index);
+                if (isCommentLine(line)) {
+                    continue;
+                }
+                for (Pattern pattern : HISTORY_REPOSITORY_JDBC_PATTERNS) {
+                    if (pattern.matcher(line).find()) {
+                        violations.add(relative + ":" + (index + 1) + ": " + line.trim());
+                        break;
+                    }
+                }
+            }
+        }
+        return violations;
+    }
     /** True for a line that is entirely a comment or javadoc continuation, which publishes no type. */
     private static boolean isCommentLine(String line) {
         String trimmed = line.stripLeading();
