@@ -333,21 +333,29 @@ text - so the earlier "no third-party consumer has opened it" gap is closed.
 
 | Commit | push run | pull_request run |
 | --- | --- | --- |
-| `c8a871d` (implementation) | `36791517987` **success** | `36791523587` **success** |
+| `c8a871d` (implementation - the revision the verification binds to) | `36791517987` **success** | `36791523587` **success** |
 | `212656c` (STATUS + architecture/security/data-model/requirements docs) | `36793280634` **success** | `36793284554` **success** |
-| `5a8cef4` (final delivered head: the verification verdict, its coverage limits, and this table) | `36794116088` **success** | `36794120766` **success** |
+| `5a8cef4` (the verification verdict, its coverage limits, and this table) | `36794116088` **success** | `36794120766` **success** |
+| `f52bd55` (final delivered head) | `36794785912` **success** | `36794791201` **success** |
 
-Both events were verified **for the same exact SHA** in every row, by reading the workflow runs
-for that `head_sha` from the GitHub API rather than by trusting the branch's latest status.
+Every run was verified **for the same exact SHA** in its row, by reading the workflow runs for
+that `head_sha` from the GitHub API rather than by trusting the branch's latest status. This
+table was written twice, because recording a run id necessarily produces a commit whose own
+run id does not exist yet; the last row is the delivered head.
 
 **The relationship between the verified revision and the delivered head:**
-`git merge-base --is-ancestor c8a871d HEAD` exits **0**, and every commit after `c8a871d`
-touches **no file under `src/` or `tests/`** - they are `STATUS.md`, `ARCHITECTURE.md`,
-`DATA_MODEL.md`, `SECURITY.md`, `REQUIREMENTS.md` and the two harness files. The verification
-therefore applies to the delivered code exactly; what changed after it is the record of the
-verification itself, which is the only place a verification verdict can honestly live.
+`git merge-base --is-ancestor c8a871d HEAD` exits **0**, and
+`git diff --name-only c8a871d HEAD -- src tests` lists **0 files** - every commit in between is
+`STATUS.md`, `ARCHITECTURE.md`, `DATA_MODEL.md`, `SECURITY.md`, `REQUIREMENTS.md` and the two
+harness files. The verification therefore applies to the delivered code **exactly**; what
+changed after it is the record of the verification itself, which is the only place such a
+verdict can honestly live.
 
-**PR #1 is OPEN, draft and unmerged**, at `5a8cef4`.
+**PR #1 is OPEN, draft and unmerged.**
+
+**Final delivered state, re-measured after the last commit:** `./build.sh` **exit 0**, core
+**"Tests run: 423, failures: 0"**, IBM **"Tests run: 51, failures: 0"**, jar packaged, working
+tree clean, `lib/` holds **0 jars** and **0 jars are tracked**.
 
 ### Unresolved risks
 
